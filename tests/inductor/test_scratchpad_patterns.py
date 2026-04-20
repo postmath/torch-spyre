@@ -4,7 +4,7 @@ from unittest import TestCase, expectedFailure
 # This appears to currently be necessary to make importing a torch_spyre module work.
 import torch  # noqa: F401
 
-from torch_spyre._inductor.scratchpad import scratchpad_planning
+from torch_spyre._inductor.scratchpad import scratchpad_planning, ScratchPadAllocator
 from torch_spyre._inductor import config
 
 # From scratchpad.py
@@ -45,15 +45,16 @@ class Buffer:
 all_buffers: dict[str, Buffer] = {}
 
 
-class ExampleBackend:
+class InstrumentedAllocator(ScratchPadAllocator):
     def __init__(self):
+        super().__init__()
         self.allocations = {}
 
     def should_consider_op(self, op: Operation) -> bool:
         return True
 
     def allocate(self, tensor_name: str, addr: int):
-        self.allocations[tensor_name] = addr
+        pass
 
     def mem_usage_by_op(self, op: Operation) -> dict[str, dict[str, bool | int]]:
         # Returns a dict mapping each buffer name to a dict with keys "is_input", "is_output", and "size".
@@ -133,23 +134,23 @@ class TestExamplePattern(TestCase):
         return hbm_usage
 
     def hbm_usage_current_run(
-        self, operations: list[Operation], backend: ExampleBackend
+        self, operations: list[Operation], alloc: InstrumentedAllocator
     ) -> int:
         hbm_usage = 0
 
         # Count all usage for buffers not allocated in the scratchpad.
         for i, op in enumerate(operations):
             for buffer_name in op.inputs:
-                if i == 0 or buffer_name not in backend.allocations:
+                if i == 0 or buffer_name not in alloc.allocations:
                     # This buffer is not allocated in the scratch pad before this operation, so it must be loaded from HBM.
                     hbm_usage += all_buffers[buffer_name].size
             for buffer_name in op.outputs:
-                if i == len(operations) - 1 or buffer_name not in backend.allocations:
+                if i == len(operations) - 1 or buffer_name not in alloc.allocations:
                     # This buffer is not allocated in the scratch pad after this operation, so it must be stored to HBM.
                     hbm_usage += all_buffers[buffer_name].size
 
         # All buffers allocated in the scratchpad are counted only once each.
-        for buffer_name in backend.allocations:
+        for buffer_name in alloc.allocations:
             hbm_usage += all_buffers[buffer_name].size
 
         return hbm_usage
@@ -161,16 +162,16 @@ class TestExamplePattern(TestCase):
         # Assert that the "good allocation" is indeed valid
         self.assertIsValidAllocation(test_case.good_allocation, test_case.operations)
 
-        backend = ExampleBackend()
+        alloc = InstrumentedAllocator()
 
-        scratchpad_planning(test_case.operations, backend)
+        scratchpad_planning(test_case.operations, alloc)
 
         # Verify that the currently implemented allocation is indeed valid
         # (not implemented yet)
 
         # Verify that the currently implemented allocation is at least as good as the "good
         # allocation" in terms of HBM usage.
-        current_hbm_usage = self.hbm_usage_current_run(test_case.operations, backend)
+        current_hbm_usage = self.hbm_usage_current_run(test_case.operations, alloc)
         good_hbm_usage = self.hbm_usage_test(
             test_case.good_allocation, test_case.operations
         )
