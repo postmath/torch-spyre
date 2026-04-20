@@ -23,16 +23,9 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from . import config
 
+from typing import Optional
 
 OPS_GOOD_FOR_LX_REUSE = {"input": {"sub", "div"}, "output": {"max", "sum"}}
-
-
-class DefaultBackend:
-    """Default backend for scratchpad allocation, separating the guts of the allocator from the
-    concrete inductor graph to improve testability. The backend decides whether an op is considered
-    for scratchpad allocation and what its buffers' memory usage is, and does the actual
-    allocation.
-    """
 
 
 class ScratchPadAllocator:
@@ -232,11 +225,13 @@ def buf_end_of_life_analysis(operations: list[Operation]):
 
 
 def scratchpad_planning(
-    operations: list[Operation], alloc: ScratchPadAllocator = ScratchPadAllocator()
+    operations: list[Operation], alloc: Optional[ScratchPadAllocator] = None
 ) -> None:
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts)
+    if alloc is None:
+        alloc = ScratchPadAllocator()
 
     op_idx_to_dealloc_bufs = buf_end_of_life_analysis(operations)
 
