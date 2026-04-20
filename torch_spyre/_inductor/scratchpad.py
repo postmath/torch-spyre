@@ -27,10 +27,50 @@ from . import config
 OPS_GOOD_FOR_LX_REUSE = {"input": {"sub", "div"}, "output": {"max", "sum"}}
 
 
+class DefaultBackend:
+    """Default backend for scratchpad allocation, separating the guts of the allocator from the
+    concrete inductor graph to improve testability. The backend decides whether an op is considered
+    for scratchpad allocation and what its buffers' memory usage is, and does the actual
+    allocation.
+    """
+
+    def should_consider_op(self, op: Operation) -> bool:
+        return isinstance(op, ComputedBuffer) and not isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        )
+
+    def allocate(self, tensor_name: str, addr: int):
+        buf = V.graph.get_buffer(tensor_name)
+        layout = buf.get_layout()
+        layout.allocation["lx"] = (
+            addr  # see ScratchPadAllocator.try_allocate doctring Note 3
+        )
+
+    def mem_usage_by_op(self, op: ComputedBuffer):
+        """Get a summary of memory usage of the input operation."""
+        rw = op.get_read_writes()
+        mem_usage = {}
+
+        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+            for dep in deps:
+                buf = V.graph.get_buffer(dep.name)
+                dev_layout = buf.layout.device_layout  # this is device layout
+                dev_size = (
+                    math.prod(dev_layout.device_size[:-1]) * 128
+                )  # num_sticks * bytes_per_stick
+                mem_usage[dep.name] = {
+                    "is_input": is_input,
+                    "size": dev_size,
+                }
+
+        return mem_usage
+
+
 class ScratchPadAllocator:
     """LX manager simplified version"""
 
-    def __init__(self, size: int = -1):
+    def __init__(self, backend: DefaultBackend, size: int = -1):
+        self.backend = backend
         # scratch pad is 2MB = 2<<20 bytes in total. preserve total * DXP_LX_FRAC_AVAIL
         # for backend usage unless specified otherwise
         if size == -1:
@@ -127,9 +167,7 @@ class ScratchPadAllocator:
             # Directly add the lx info into V.graph.buffers.layout for later codegen use.
             force_pinning = False  # DEBUG use only, e.g. idx==1
             if can_reuse or force_pinning:
-                buf = V.graph.get_buffer(tensor_name)
-                layout = buf.get_layout()
-                layout.allocation["lx"] = addr  # see doctring Note 3
+                self.backend.allocate(tensor_name, addr)
                 # Record usage history for debugging
                 self.lx_usage_hist.append(
                     {
@@ -157,33 +195,15 @@ class ScratchPadAllocator:
     # TODO add dealloc and defrag mechanism to allocator later
 
 
-def mem_usage_by_op(op: ComputedBuffer):
-    """Get a summary of memory usage of the input operation."""
-    rw = op.get_read_writes()
-    mem_usage = {}
-    for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
-        for dep in deps:
-            buf = V.graph.get_buffer(dep.name)
-            dev_layout = buf.layout.device_layout  # this is device layout
-            dev_size = (
-                math.prod(dev_layout.device_size[:-1]) * 128
-            )  # num_sticks * bytes_per_stick
-            mem_usage[dep.name] = {
-                "is_input": is_input,
-                "size": dev_size,
-            }
-
-    return mem_usage
-
-
 def consider_for_scratchpad(
     op: ComputedBuffer,
     alloc: ScratchPadAllocator,
     idx: int,
     is_last_op: bool,
+    backend: DefaultBackend,
 ):
     # 1. summarize both inputs and output sizes used by this operation.
-    mem_usage = mem_usage_by_op(op)
+    mem_usage = backend.mem_usage_by_op(op)
 
     # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
     # which will be used in generate_sdsc() later.
@@ -214,13 +234,13 @@ def buf_end_of_life_analysis(operations: list[Operation]):
 
 
 def scratchpad_planning(
-    operations: list[Operation],
+    operations: list[Operation], backend: DefaultBackend = DefaultBackend()
 ) -> None:
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts)
 
-    alloc = ScratchPadAllocator()
+    alloc = ScratchPadAllocator(backend)
 
     op_idx_to_dealloc_bufs = buf_end_of_life_analysis(operations)
 
@@ -229,7 +249,5 @@ def scratchpad_planning(
         alloc.deallocate(op_idx_to_dealloc_bufs.get(idx, []))
         is_last_op = idx == len(operations) - 1
 
-        if isinstance(op, ComputedBuffer):
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                continue
-            consider_for_scratchpad(op, alloc, idx, is_last_op)
+        if backend.should_consider_op(op):
+            consider_for_scratchpad(op, alloc, idx, is_last_op, backend)
