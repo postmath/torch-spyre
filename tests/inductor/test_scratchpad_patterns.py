@@ -183,7 +183,7 @@ class TestExamplePattern(TestCase):
         )
 
     @expectedFailure
-    def test_simple_pattern(self):
+    def test_simple_fragmentation_pattern(self):
         quarter_scratchpad_size = 1 << 19  # 512KB
         buffers = {}
         buffers["A"] = Buffer("A", quarter_scratchpad_size)
