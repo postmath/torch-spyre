@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass
 from unittest import TestCase, expectedFailure
 
@@ -52,12 +53,23 @@ class InstrumentedAllocator(ScratchPadAllocator):
         return True
 
     def allocate(self, tensor_name: str, addr: int):
-        pass
+        if tensor_name in self.allocations:
+            # TODO: support this. We need to store allocations differently, and then modify the
+            # logic for measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to
+            # account for this. Also update TestExamplePattern.verify_actual_run to account for
+            # this.
+            assert self.allocations[tensor_name] == addr, (
+                f"Buffer {tensor_name} was already allocated at address "
+                f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
+                f" That is probably a good improvement, but it means this test needs to be "
+                f"adjusted."
+            )
+        self.allocations[tensor_name] = addr
 
     def mem_usage_by_op(self, op: Operation) -> dict[str, dict[str, bool | int]]:
-        # Returns a dict mapping each buffer name to a dict with keys "is_input", "is_output", and "size".
-        # is_input is True if the buffer is an input to the op, and False otherwise. is_output is True
-        # if the buffer is an output of the op, and False otherwise. size is the size of the buffer.
+        # Returns a dict mapping each buffer name to a dict with keys "is_input" and "size".
+        # is_input is True if the buffer is an input to the op, and False otherwise. size is the
+        # size of the buffer.
         result = {}
         for tensor_name in op.inputs:
             result[tensor_name] = {
@@ -89,9 +101,10 @@ class AllocationTestCase:
 
 
 class TestExamplePattern(TestCase):
-    def assertIsValidAllocation(
-        self, allocation: AllocationResult, operations: list[Operation]
-    ):
+    def verify_test_case(self, test_case: AllocationTestCase):
+        allocation = test_case.good_allocation
+        operations = test_case.operations
+
         for i, op in enumerate(operations):
             # Check that each buffer that is used is allocated.
             for buffer_name in op.inputs + op.outputs:
@@ -117,6 +130,61 @@ class TestExamplePattern(TestCase):
                     AVAILABLE_LX_SIZE,
                     f"Buffer {sorted_allocations[-1][0]} exceeds scratch pad size during operation {op.name}",
                 )
+
+    def verify_actual_run(
+        self, test_case: AllocationTestCase, alloc: InstrumentedAllocator
+    ):
+        # Verify that the actual run's allocation is valid. We assume that any allocation is "live"
+        # during the entire liveness of the corresponding buffer.
+        liveness_start = {}
+        liveness_end = {}
+        for i, op in enumerate(test_case.operations):
+            for buffer_name in op.inputs + op.outputs:
+                if buffer_name not in liveness_start:
+                    liveness_start[buffer_name] = i
+                liveness_end[buffer_name] = i
+
+        # Sanity check -- every buffer should have a start and an end to its liveness.
+        self.assertTrue(set(liveness_start.keys()) == set(liveness_end.keys()))
+
+        allocate_at = defaultdict(list)
+        deallocate_at = defaultdict(list)
+        for buffer_name in liveness_start:
+            allocate_at[liveness_start[buffer_name]].append(buffer_name)
+            deallocate_at[liveness_end[buffer_name] + 1].append(buffer_name)
+
+        live_buffers = set()
+        for i, op in enumerate(test_case.operations):
+            live_buffers.update(allocate_at[i])
+            for buffer_name in op.inputs + op.outputs:
+                # Verify that buffer_name does not overlap with any allocated buffers at this point.
+                addr = alloc.allocations[buffer_name]
+                size = op._buffer_registry[buffer_name].size
+                self.assertLessEqual(
+                    addr + size,
+                    AVAILABLE_LX_SIZE,
+                    f"Buffer {buffer_name} exceeds scratch pad size during operation {op.name}",
+                )
+                for other_buffer_name in live_buffers:
+                    if other_buffer_name == buffer_name:
+                        continue
+                    other_addr = alloc.allocations[other_buffer_name]
+                    other_size = op._buffer_registry[other_buffer_name].size
+                    if addr <= other_addr:
+                        self.assertLessEqual(
+                            addr + size,
+                            other_addr,
+                            f"Buffers {buffer_name} and {other_buffer_name} overlap during "
+                            f"operation {op.name}",
+                        )
+                    else:
+                        self.assertLessEqual(
+                            other_addr + other_size,
+                            addr,
+                            f"Buffers {buffer_name} and {other_buffer_name} overlap during "
+                            f"operation {op.name}",
+                        )
+            live_buffers.difference_update(deallocate_at[i + 1])
 
     def hbm_usage_for_good_allocation(
         self, allocation: AllocationResult, operations: list[Operation]
@@ -158,16 +226,13 @@ class TestExamplePattern(TestCase):
 
         return hbm_usage
 
-    def verify_test_case(self, test_case: AllocationTestCase):
-        self.assertIsValidAllocation(test_case.good_allocation, test_case.operations)
-
     def run_test_case(self, test_case: AllocationTestCase):
         alloc = InstrumentedAllocator()
 
         scratchpad_planning(test_case.operations, alloc)
 
         # Verify that the currently implemented allocation is indeed valid
-        # (not implemented yet)
+        self.verify_actual_run(test_case, alloc)
 
         # Verify that the currently implemented allocation is at least as good as the "good
         # allocation" in terms of HBM usage.
