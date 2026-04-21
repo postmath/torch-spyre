@@ -22,6 +22,7 @@ class Operation:
     name: str
     inputs: list[str]
     outputs: list[str]
+    _buffer_registry: dict[str, "Buffer"]
 
     # To make scratchpad.py work, we add an origin_node field that points to the op itself.
     origin_node = None
@@ -31,8 +32,8 @@ class Operation:
 
     def get_read_writes(self) -> ReadWrites:
         # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
-        reads = [all_buffers[buffer_name] for buffer_name in self.inputs]
-        writes = [all_buffers[buffer_name] for buffer_name in self.outputs]
+        reads = [self._buffer_registry[buffer_name] for buffer_name in self.inputs]
+        writes = [self._buffer_registry[buffer_name] for buffer_name in self.outputs]
         return ReadWrites(reads=reads, writes=writes)
 
 
@@ -40,9 +41,6 @@ class Operation:
 class Buffer:
     name: str
     size: int
-
-
-all_buffers: dict[str, Buffer] = {}
 
 
 class InstrumentedAllocator(ScratchPadAllocator):
@@ -100,23 +98,25 @@ class TestExamplePattern(TestCase):
                 self.assertIn(buffer_name, allocation[i])
 
             # Check that buffers do not overlap.
-            sorted_allocations = sorted(
-                allocation[i].items(), key=lambda x: x[1]
-            )  # sort by address
-            for j in range(len(sorted_allocations) - 1):
-                buffer_name_j, addr_j = sorted_allocations[j]
-                buffer_name_next, addr_next = sorted_allocations[j + 1]
-                size_j = all_buffers[buffer_name_j].size
+            if allocation[i]:
+                # Sort by address:
+                sorted_allocations = sorted(allocation[i].items(), key=lambda x: x[1])
+                for j in range(len(sorted_allocations) - 1):
+                    buffer_name_j, addr_j = sorted_allocations[j]
+                    buffer_name_next, addr_next = sorted_allocations[j + 1]
+                    size_j = all_buffers[buffer_name_j].size
+                    self.assertLessEqual(
+                        addr_j + size_j,
+                        addr_next,
+                        f"Buffers {buffer_name_j} and {buffer_name_next} overlap during operation {op.name}",
+                    )
+
                 self.assertLessEqual(
-                    addr_j + size_j,
-                    addr_next,
-                    f"Buffers {buffer_name_j} and {buffer_name_next} overlap during operation {op.name}",
+                    sorted_allocations[-1][1]
+                    + all_buffers[sorted_allocations[-1][0]].size,
+                    AVAILABLE_LX_SIZE,
+                    f"Buffer {sorted_allocations[-1][0]} exceeds scratch pad size during operation {op.name}",
                 )
-            self.assertLessEqual(
-                sorted_allocations[-1][1] + all_buffers[sorted_allocations[-1][0]].size,
-                AVAILABLE_LX_SIZE,
-                f"Buffer {sorted_allocations[-1][0]} exceeds scratch pad size during operation {op.name}",
-            )
 
     def hbm_usage_test(
         self, allocation: AllocationResult, operations: list[Operation]
@@ -192,9 +192,9 @@ class TestExamplePattern(TestCase):
         # We can fit A and C together, or B and C together, but not all three, because of the space
         # reserved for the compiler.
 
-        op1 = Operation("op1", inputs=["A"], outputs=["B"])
-        op2 = Operation("op2", inputs=["B"], outputs=["A"])
-        op3 = Operation("op3", inputs=["B"], outputs=["C"])
+        op1 = Operation("op1", inputs=["A"], outputs=["B"], _buffer_registry=buffers)
+        op2 = Operation("op2", inputs=["B"], outputs=["A"], _buffer_registry=buffers)
+        op3 = Operation("op3", inputs=["B"], outputs=["C"], _buffer_registry=buffers)
 
         testcase = AllocationTestCase(
             buffers,
