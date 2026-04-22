@@ -1,5 +1,6 @@
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Callable, Optional
 from unittest import TestCase, expectedFailure
 
 # This appears to currently be necessary to make importing a torch_spyre module work.
@@ -101,16 +102,77 @@ class AllocationTestCase:
 
 
 class TestExamplePattern(TestCase):
-    def verify_test_case(self, test_case: AllocationTestCase):
+    def find_single_use_buffers(
+        self,
+        operations: list[Operation],
+        *,
+        see_later: Optional[Callable[[Operation, str], None]] = None,
+        see_first: Optional[Callable[[Operation, str], None]] = None,
+    ) -> set[str]:
+        """Returns the set of buffers that are used only once in the list of operations. see_first
+        is called the first time any buffer is seen, and see_later is called any other time any
+        buffer is seen."""
+        single_use_buffers = set()
+        seen_buffers = set()
+        for op in operations:
+            for buffer_name in op.inputs + op.outputs:
+                if buffer_name in seen_buffers:
+                    if see_later is not None:
+                        see_later(op, buffer_name)
+                    single_use_buffers.discard(buffer_name)
+                else:
+                    if see_first is not None:
+                        see_first(op, buffer_name)
+                    single_use_buffers.add(buffer_name)
+                    seen_buffers.add(buffer_name)
+
+        return single_use_buffers
+
+    def verify_test_case(self, test_case: AllocationTestCase, *, inplace: bool = False):
         allocation = test_case.good_allocation
         operations = test_case.operations
+        self.assertEqual(
+            len(allocation),
+            len(operations),
+            f"Good allocation should have the same number of entries as the number of operations, "
+            f"but found {len(allocation)} allocations and {len(operations)} operations.",
+        )
+
+        # Buffers that are used only once need not be allocated in the scratchpad, because it
+        # doesn't help reduce HBM transfers. In the meantime, verify that we didn't write any
+        # operations that write to a buffer, except possibly the first time we see that buffer.
+        def no_output(op: Operation, buffer_name: str):
+            self.assertNotIn(
+                buffer_name,
+                op.outputs,
+                f"Buffer {buffer_name} is written to in operation {op.name}, but accessed before "
+                f"that operation. However, this test is case is not marked as in-place, so we "
+                f"avoid in-place operations.",
+            )
+
+        single_use_buffers = self.find_single_use_buffers(
+            operations, see_later=None if inplace else no_output
+        )
 
         for i, op in enumerate(operations):
             # Check that each buffer that is used is allocated.
             for buffer_name in op.inputs + op.outputs:
-                self.assertIn(buffer_name, allocation[i])
+                if buffer_name not in single_use_buffers:
+                    self.assertIn(
+                        buffer_name,
+                        allocation[i],
+                        f"Buffer {buffer_name} used by operation {op.name} is not allocated at "
+                        f"this point in the good allocation pattern, but it is used more than once.",
+                    )
 
-            # Check that buffers do not overlap.
+            # Check that there is at least one output.
+            self.assertGreater(
+                len(op.outputs),
+                0,
+                f"Operation {op.name} should have at least one output.",
+            )
+
+            # Check that allocated buffers do not overlap.
             if allocation[i]:
                 # Sort by address:
                 sorted_allocations = sorted(allocation[i].items(), key=lambda x: x[1])
@@ -189,16 +251,28 @@ class TestExamplePattern(TestCase):
     def hbm_usage_for_good_allocation(
         self, allocation: AllocationResult, operations: list[Operation]
     ) -> int:
-        hbm_usage = 0
+        if not operations:
+            return 0
+        registry = operations[0]._buffer_registry
+
+        single_use_buffers = self.find_single_use_buffers(operations)
+        hbm_usage = sum(
+            registry[buffer_name].size for buffer_name in single_use_buffers
+        )
+
         for i, op in enumerate(operations):
             for buffer_name in op.inputs:
-                if i == 0 or buffer_name not in allocation[i - 1]:
+                if buffer_name not in single_use_buffers and (
+                    i == 0 or buffer_name not in allocation[i - 1]
+                ):
                     # This buffer is not allocated in the scratch pad before this operation, so it must be loaded from HBM.
-                    hbm_usage += op._buffer_registry[buffer_name].size
+                    hbm_usage += registry[buffer_name].size
             for buffer_name in op.outputs:
-                if i == len(operations) - 1 or buffer_name not in allocation[i + 1]:
+                if buffer_name not in single_use_buffers and (
+                    i == len(operations) - 1 or buffer_name not in allocation[i + 1]
+                ):
                     # This buffer is not allocated in the scratch pad after this operation, so it must be stored to HBM.
-                    hbm_usage += op._buffer_registry[buffer_name].size
+                    hbm_usage += registry[buffer_name].size
         return hbm_usage
 
     def hbm_usage_for_actual_run(
@@ -248,31 +322,44 @@ class TestExamplePattern(TestCase):
         )
 
     def make_simple_fragmentation_pattern_test_case(self) -> AllocationTestCase:
-        """Allocate two buffers A and B that are each a quarter of the scratchpad size, where the
-        first buffer can be freed after the second operation. Then allocate a third buffer that is
-        half the scratchpad size. This can only fit if B was allocated at the start or end of the
-        scratchpad, leaving a contiguous region for C."""
-        quarter_scratchpad_size = 1 << 19  # 512KB
+        """Allocate two buffers A and B that are each a third of the available scratchpad size,
+        where the first buffer can be freed after the second operation. Then allocate a third buffer
+        that is two thirds of the scratchpad size. This can only fit if B was allocated at the start
+        or end of the scratchpad, leaving a contiguous region for C."""
+        third_scratchpad_size = AVAILABLE_LX_SIZE // 3
+        third_scratchpad_size = (
+            third_scratchpad_size // 128
+        ) * 128  # round down to a multiple of the stick size
         buffers = {}
-        buffers["A"] = Buffer("A", quarter_scratchpad_size)
-        buffers["B"] = Buffer("B", quarter_scratchpad_size)
-        buffers["C"] = Buffer("C", 2 * quarter_scratchpad_size)
-        # We can fit A and C together, or B and C together, but not all three, because of the space
-        # reserved for the compiler.
+        buffers["A"] = Buffer("A", third_scratchpad_size)
+        buffers["B"] = Buffer("B", third_scratchpad_size)
+        buffers["C"] = Buffer("C", 2 * third_scratchpad_size)
+        for i in range(1, 5):
+            buffers[f"sink_{i}"] = Buffer(f"sink_{i}", 128)
 
-        op1 = Operation("op1", inputs=["A"], outputs=["B"], _buffer_registry=buffers)
-        op2 = Operation("op2", inputs=["B"], outputs=["A"], _buffer_registry=buffers)
-        op3 = Operation("op3", inputs=["B"], outputs=["C"], _buffer_registry=buffers)
+        op1 = Operation(
+            "op1", inputs=["A", "B"], outputs=["sink_1"], _buffer_registry=buffers
+        )
+        op2 = Operation(
+            "op2", inputs=["A", "B"], outputs=["sink_2"], _buffer_registry=buffers
+        )
+        op3 = Operation(
+            "op3", inputs=["B", "C"], outputs=["sink_3"], _buffer_registry=buffers
+        )
+        op4 = Operation(
+            "op4", inputs=["B", "C"], outputs=["sink_4"], _buffer_registry=buffers
+        )
 
         return AllocationTestCase(
             buffers,
-            [op1, op2, op3],
+            [op1, op2, op3, op4],
             good_allocation=[
                 # A is used only during op1 and op2, so we allocate it after B. This way we can
                 # evict it after op2 and have enough space for C during op3.
-                {"A": quarter_scratchpad_size, "B": 0},
-                {"A": quarter_scratchpad_size, "B": 0},
-                {"B": 0, "C": quarter_scratchpad_size},
+                {"A": third_scratchpad_size, "B": 0},
+                {"A": third_scratchpad_size, "B": 0},
+                {"B": 0, "C": third_scratchpad_size},
+                {"B": 0, "C": third_scratchpad_size},
             ],
         )
 
@@ -306,7 +393,7 @@ class TestExamplePattern(TestCase):
             f"{letter}{i}": Buffer(f"{letter}{i}", i * k)
             for i in range(1, N + 1)
             for letter in ["A", "B"]
-        }
+        } | {f"sink_{i}": Buffer(f"sink_{i}", 128) for i in range(1, N + 2)}
 
         def op_pair(i: int) -> tuple[Operation, Operation]:
             return (
@@ -318,8 +405,8 @@ class TestExamplePattern(TestCase):
                 ),
                 Operation(
                     f"op{i}_1",
-                    inputs=[f"B{i}"],
-                    outputs=[f"A{i}"],
+                    inputs=[f"A{i}", f"B{i}"],
+                    outputs=[f"sink_{i}"],
                     _buffer_registry=buffers,
                 ),
             )
@@ -328,7 +415,7 @@ class TestExamplePattern(TestCase):
             Operation(
                 "op_final",
                 inputs=[f"B{i}" for i in range(1, N + 1)],
-                outputs=[],
+                outputs=[f"sink_{N + 1}"],
                 _buffer_registry=buffers,
             )
         ]
@@ -380,6 +467,8 @@ class TestExamplePattern(TestCase):
             for letter in ["A", "B"]
         }
         buffers["Z"] = Buffer("Z", k)
+        for i in range(0, N + 2):
+            buffers[f"sink_{i}"] = Buffer(f"sink_{i}", 128)
 
         def op_pair(i: int) -> tuple[Operation, Operation]:
             return (
@@ -391,20 +480,27 @@ class TestExamplePattern(TestCase):
                 ),
                 Operation(
                     f"op{i}_1",
-                    inputs=[f"B{i}"],
-                    outputs=[f"A{i}"],
+                    inputs=[f"A{i}", f"B{i}"],
+                    outputs=[f"sink_{i}"],
                     _buffer_registry=buffers,
                 ),
             )
 
         ops = (
-            [Operation("op_start", inputs=["Z"], outputs=[], _buffer_registry=buffers)]
+            [
+                Operation(
+                    "op_start",
+                    inputs=["Z"],
+                    outputs=["sink_0"],
+                    _buffer_registry=buffers,
+                )
+            ]
             + [op for i in range(1, N + 1) for op in op_pair(i)]
             + [
                 Operation(
                     "op_final",
-                    inputs=[f"B{i}" for i in range(1, N + 1)],
-                    outputs=["Z"],
+                    inputs=[f"B{i}" for i in range(1, N + 1)] + ["Z"],
+                    outputs=[f"sink_{N + 1}"],
                     _buffer_registry=buffers,
                 )
             ]
@@ -447,14 +543,26 @@ class TestExamplePattern(TestCase):
         buffers = {
             "A": Buffer("A", AVAILABLE_LX_SIZE),
             "B": Buffer("B", AVAILABLE_LX_SIZE),
-        }
+        } | {f"sink_{i}": Buffer(f"sink_{i}", 128) for i in range(1, 7)}
         ops = [
-            Operation("op1", inputs=["A"], outputs=[], _buffer_registry=buffers),
-            Operation("op2", inputs=["A"], outputs=[], _buffer_registry=buffers),
-            Operation("op3", inputs=["B"], outputs=[], _buffer_registry=buffers),
-            Operation("op4", inputs=["B"], outputs=[], _buffer_registry=buffers),
-            Operation("op5", inputs=["A"], outputs=[], _buffer_registry=buffers),
-            Operation("op6", inputs=["A"], outputs=[], _buffer_registry=buffers),
+            Operation(
+                "op1", inputs=["A"], outputs=["sink_1"], _buffer_registry=buffers
+            ),
+            Operation(
+                "op2", inputs=["A"], outputs=["sink_2"], _buffer_registry=buffers
+            ),
+            Operation(
+                "op3", inputs=["B"], outputs=["sink_3"], _buffer_registry=buffers
+            ),
+            Operation(
+                "op4", inputs=["B"], outputs=["sink_4"], _buffer_registry=buffers
+            ),
+            Operation(
+                "op5", inputs=["A"], outputs=["sink_5"], _buffer_registry=buffers
+            ),
+            Operation(
+                "op6", inputs=["A"], outputs=["sink_6"], _buffer_registry=buffers
+            ),
         ]
 
         good_allocation = [{"A": 0}] * 2 + [{"B": 0}] * 2 + [{"A": 0}] * 2
@@ -493,10 +601,18 @@ class TestExamplePattern(TestCase):
 
         buffers = {f"A{i}": Buffer(f"A{i}", A_size) for i in range(3)}
         buffers["B"] = Buffer("B", B_size)
+        for i in range(4):
+            for j in range(4):
+                buffers[f"sink_{i}_{j}"] = Buffer(f"sink_{i}_{j}", 128)
 
         pattern = [["A0", "A1", "A2"], ["A0", "B"], ["A1", "B"], ["A2", "B"]]
         ops = [
-            Operation(f"op{i}_{j}", inputs=group, outputs=[], _buffer_registry=buffers)
+            Operation(
+                f"op{i}_{j}",
+                inputs=group,
+                outputs=[f"sink_{i}_{j}"],
+                _buffer_registry=buffers,
+            )
             for i, group in enumerate(pattern)
             for j in range(4)
         ]
