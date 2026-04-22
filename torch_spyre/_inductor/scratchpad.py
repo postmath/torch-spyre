@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -130,10 +130,7 @@ class ScratchPadAllocator:
             if addr != -1:
                 self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
 
-                buf = V.graph.get_buffer(tensor_name)
-                layout = buf.get_layout()
-                layout.allocation["lx"] = addr
-                # NOTE assume same addr for same buf, no realloc needed/allowed
+                self.allocate(tensor_name, addr)
                 # Record usage history for debugging
                 self.lx_usage_hist.append(
                     {
@@ -144,6 +141,12 @@ class ScratchPadAllocator:
                         "size": needed["size"],
                     }
                 )
+
+    def allocate(self, tensor_name: str, addr: int):
+        buf = V.graph.get_buffer(tensor_name)
+        layout = buf.get_layout()
+        layout.allocation["lx"] = addr
+        # NOTE assume same addr for same buf, no realloc needed/allowed
 
     def deallocate(self, bufs: list[str]):
         """Try to deallocate each of the buffers in a list, if exists."""
@@ -156,24 +159,29 @@ class ScratchPadAllocator:
 
     # TODO add dealloc and defrag mechanism to allocator later
 
+    def should_consider_op(self, op: Operation) -> bool:
+        return isinstance(op, ComputedBuffer) and not isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        )
 
-def mem_usage_by_op(op: ComputedBuffer):
-    """Get a summary of memory usage of the input operation."""
-    rw = op.get_read_writes()
-    mem_usage = {}
-    for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
-        for dep in deps:
-            buf = V.graph.get_buffer(dep.name)
-            dev_layout = buf.layout.device_layout  # this is device layout
-            dev_size = (
-                math.prod(dev_layout.device_size[:-1]) * 128
-            )  # num_sticks * bytes_per_stick
-            mem_usage[dep.name] = {
-                "is_input": is_input,
-                "size": dev_size,
-            }
+    def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
+        """Get a summary of memory usage of the input operation."""
+        rw = op.get_read_writes()
+        mem_usage = {}
 
-    return mem_usage
+        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+            for dep in deps:
+                buf = V.graph.get_buffer(dep.name)
+                dev_layout = buf.layout.device_layout
+                dev_size = (
+                    math.prod(dev_layout.device_size[:-1]) * 128
+                )  # num_sticks * bytes_per_stick
+                mem_usage[dep.name] = {
+                    "is_input": is_input,
+                    "size": dev_size,
+                }
+
+        return mem_usage
 
 
 def consider_for_scratchpad(
@@ -189,7 +197,7 @@ def consider_for_scratchpad(
     incorrect results.
     """
     # 1. summarize both inputs and output sizes used by this node.
-    mem_usage = mem_usage_by_op(op)
+    mem_usage = alloc.mem_usage_by_op(op)
     for buf in mem_usage:
         mem_usage[buf]["core_div_mismatch"] = core_div_mismatch.get(buf, False)
         # if a buf is not in core_div_mismatch => it has no users => graph output
@@ -409,13 +417,13 @@ def try_insert_clone_op_for_inputs(
 
 
 def scratchpad_planning(
-    operations: list[Operation],
+    operations: list[Operation], alloc: Optional[ScratchPadAllocator] = None
 ) -> None:
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts)
-
-    alloc = ScratchPadAllocator()
+    if alloc is None:
+        alloc = ScratchPadAllocator()
 
     idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
@@ -434,8 +442,6 @@ def scratchpad_planning(
         # release unneeded LX allocations before actual planning
         alloc.deallocate(idx_to_dealloc_bufs.get(idx, []))
 
-        if isinstance(op, ComputedBuffer):
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                continue
-            consider_for_scratchpad(op, alloc, idx, core_div_mismatch)
+        if alloc.should_consider_op(op):
+            consider_for_scratchpad(op, alloc, idx)
     # logger.info(alloc.lx_usage_hist)
