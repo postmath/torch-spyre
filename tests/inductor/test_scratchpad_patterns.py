@@ -2,6 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional
 from unittest import TestCase, expectedFailure
+from enum import Enum
 
 # This appears to currently be necessary to make importing a torch_spyre module work.
 import torch  # noqa: F401
@@ -85,10 +86,24 @@ class InstrumentedAllocator(ScratchPadAllocator):
         return result
 
 
+class Component(Enum):
+    LX = "LX"
+    HBM = "HBM"
+
+
+@dataclass
+class Allocation:
+    buffer: str
+    component: Component = Component.LX
+    # If the component is LX, then the address is meaningful. If the component is HBM, we ignore the
+    # address.
+    address: Optional[int] = None
+
+
 # A type alias for the result of an allocation. The ith entry in the list is the state during
 # the ith operation. It maps each allocated buffer to the scratch pad address where it is
 # allocated at that point in time.
-AllocationResult = list[dict[str, int]]
+AllocationResult = list[list[Allocation]]
 
 
 @dataclass
@@ -137,6 +152,13 @@ class TestExamplePattern(TestCase):
             f"Good allocation should have the same number of entries as the number of operations, "
             f"but found {len(allocation)} allocations and {len(operations)} operations.",
         )
+        for alloc in allocation:
+            for a in alloc:
+                self.assertEqual(
+                    a.address is not None,
+                    a.component == Component.LX,
+                    f"Buffers should have an address iff they are allocated in LX, but found {a}.",
+                )
 
         # Buffers that are used only once need not be allocated in the scratchpad, because it
         # doesn't help reduce HBM transfers. In the meantime, verify that we didn't write any
@@ -158,9 +180,8 @@ class TestExamplePattern(TestCase):
             # Check that each buffer that is used is allocated.
             for buffer_name in op.inputs + op.outputs:
                 if buffer_name not in single_use_buffers:
-                    self.assertIn(
-                        buffer_name,
-                        allocation[i],
+                    self.assertTrue(
+                        any(alloc.buffer == buffer_name for alloc in allocation[i]),
                         f"Buffer {buffer_name} used by operation {op.name} is not allocated at "
                         f"this point in the good allocation pattern, but it is used more than once.",
                     )
@@ -173,12 +194,20 @@ class TestExamplePattern(TestCase):
             )
 
             # Check that allocated buffers do not overlap.
-            if allocation[i]:
+            allocated_buffers = [
+                alloc for alloc in allocation[i] if alloc.address is not None
+            ]
+            if allocated_buffers:
                 # Sort by address:
-                sorted_allocations = sorted(allocation[i].items(), key=lambda x: x[1])
+                sorted_allocations = sorted(
+                    list(allocated_buffers),
+                    key=lambda x: x.address,  # pyright: ignore[reportCallIssue, reportArgumentType]
+                )
                 for j in range(len(sorted_allocations) - 1):
-                    buffer_name_j, addr_j = sorted_allocations[j]
-                    buffer_name_next, addr_next = sorted_allocations[j + 1]
+                    buffer_name_j = sorted_allocations[j].buffer
+                    addr_j = sorted_allocations[j].address
+                    buffer_name_next = sorted_allocations[j + 1].buffer
+                    addr_next = sorted_allocations[j + 1].address
                     size_j = op._buffer_registry[buffer_name_j].size
                     self.assertLessEqual(
                         addr_j + size_j,
@@ -187,10 +216,10 @@ class TestExamplePattern(TestCase):
                     )
 
                 self.assertLessEqual(
-                    sorted_allocations[-1][1]
-                    + op._buffer_registry[sorted_allocations[-1][0]].size,
+                    sorted_allocations[-1].address
+                    + op._buffer_registry[sorted_allocations[-1].buffer].size,
                     AVAILABLE_LX_SIZE,
-                    f"Buffer {sorted_allocations[-1][0]} exceeds scratch pad size during operation {op.name}",
+                    f"Buffer {sorted_allocations[-1].buffer} exceeds scratch pad size during operation {op.name}",
                 )
 
     def verify_actual_run(
@@ -323,7 +352,7 @@ class TestExamplePattern(TestCase):
 
     def make_simple_fragmentation_pattern_test_case(self) -> AllocationTestCase:
         """Allocate two buffers A and B that are each a third of the available scratchpad size,
-        where the first buffer can be freed after the second operation. Then allocate a third buffer
+        where A can be freed after the second operation. Then allocate a third buffer C
         that is two thirds of the scratchpad size. This can only fit if B was allocated at the start
         or end of the scratchpad, leaving a contiguous region for C."""
         third_scratchpad_size = AVAILABLE_LX_SIZE // 3
@@ -350,16 +379,19 @@ class TestExamplePattern(TestCase):
             "op4", inputs=["B", "C"], outputs=["sink_4"], _buffer_registry=buffers
         )
 
+        # A is used only during op1 and op2, so we allocate it after B. This way we can
+        # evict it after op2 and have enough space for C during op3.
+        alloc_A = Allocation(buffer="A", address=third_scratchpad_size)
+        alloc_B = Allocation(buffer="B", address=0)
+        alloc_C = Allocation(buffer="C", address=third_scratchpad_size)
         return AllocationTestCase(
             buffers,
             [op1, op2, op3, op4],
             good_allocation=[
-                # A is used only during op1 and op2, so we allocate it after B. This way we can
-                # evict it after op2 and have enough space for C during op3.
-                {"A": third_scratchpad_size, "B": 0},
-                {"A": third_scratchpad_size, "B": 0},
-                {"B": 0, "C": third_scratchpad_size},
-                {"B": 0, "C": third_scratchpad_size},
+                [alloc_A, alloc_B],
+                [alloc_A, alloc_B],
+                [alloc_B, alloc_C],
+                [alloc_B, alloc_C],
             ],
         )
 
@@ -420,18 +452,24 @@ class TestExamplePattern(TestCase):
             )
         ]
 
-        def good_allocation_pair(i: int) -> tuple[dict[str, int], dict[str, int]]:
+        def good_allocation_pair(i: int) -> tuple[list[Allocation], list[Allocation]]:
             # Allocate A{i} at 0 and B{j} for j <= i at N*k, (N+1)*k, (N+3)*k, (N+6)*k, ...,
             # (N+i*(i-1)/2)*k.
-            alloc = {f"B{j}": (N + j * (j - 1) // 2) * k for j in range(1, i + 1)}
-            alloc[f"A{i}"] = 0
+            alloc = [
+                Allocation(buffer=f"B{j}", address=(N + j * (j - 1) // 2) * k)
+                for j in range(1, i + 1)
+            ]
+            alloc.append(Allocation(buffer=f"A{i}", address=0))
             return (alloc, alloc)
 
         good_allocations = [
             alloc for i in range(1, N + 1) for alloc in good_allocation_pair(i)
         ]
         good_allocations.append(
-            {f"B{i}": (N + i * (i - 1) // 2) * k for i in range(1, N + 1)}
+            [
+                Allocation(buffer=f"B{i}", address=(N + i * (i - 1) // 2) * k)
+                for i in range(1, N + 1)
+            ]
         )
 
         testcase = AllocationTestCase(buffers, ops, good_allocation=good_allocations)
@@ -506,22 +544,25 @@ class TestExamplePattern(TestCase):
             ]
         )
 
-        def good_allocation_pair(i: int) -> tuple[dict[str, int], dict[str, int]]:
+        def good_allocation_pair(i: int) -> tuple[list[Allocation], list[Allocation]]:
             # Allocate Z at 0, A{i} at k, and B{j} for j <= i as follows: B{N} at 2*k, B{N-1} at
             # 3*k, B{N-2} at 5*k, B{N-3} at 8*k, ..., B{N-j} at (j*(j+1)/2 + 2)*k. The gap
             # between A{i} and B{i} = B{N+1-(N+1-i)} is (N+1-i)*(N+2-i)/2*k, which is big enough
             # for A{i+1} of size (N-i)*k.
-            alloc = {f"B{N - j}": (j * (j + 1) // 2 + 2) * k for j in range(N - i, N)}
-            alloc["Z"] = 0
-            alloc[f"A{i}"] = k
+            alloc = [
+                Allocation(buffer=f"B{N - j}", address=(j * (j + 1) // 2 + 2) * k)
+                for j in range(N - i, N)
+            ]
+            alloc.append(Allocation(buffer="Z", address=0))
+            alloc.append(Allocation(buffer=f"A{i}", address=k))
             return (alloc, alloc)
 
-        good_allocations = [{"Z": 0}]
+        good_allocations = [[Allocation(buffer="Z", address=0)]]
         good_allocations.extend(
             [alloc for i in range(1, N + 1) for alloc in good_allocation_pair(i)]
         )
         last_allocation = good_allocation_pair(N)[0]
-        del last_allocation[f"A{N}"]  # A{N} is not needed for the final op
+        del last_allocation[-1]  # A{N} is not needed for the final op
         good_allocations.append(last_allocation)
 
         testcase = AllocationTestCase(buffers, ops, good_allocation=good_allocations)
@@ -565,7 +606,11 @@ class TestExamplePattern(TestCase):
             ),
         ]
 
-        good_allocation = [{"A": 0}] * 2 + [{"B": 0}] * 2 + [{"A": 0}] * 2
+        good_allocation = (
+            [[Allocation(buffer="A", address=0)]] * 2
+            + [[Allocation(buffer="B", address=0)]] * 2
+            + [[Allocation(buffer="A", address=0)]] * 2
+        )
 
         testcase = AllocationTestCase(buffers, ops, good_allocation=good_allocation)
         return testcase
@@ -618,11 +663,37 @@ class TestExamplePattern(TestCase):
         ]
 
         good_allocations = (
-            [{"A0": 0, "A1": A_size, "A2": 2 * A_size}] * 4
-            + [{"A0": 0, "B": A_size}] * 4
-            + [{"A1": 0, "B": A_size}] * 4
-            + [{"A2": 0, "B": A_size}] * 4
+            [
+                [
+                    Allocation(buffer="A0", address=0),
+                    Allocation(buffer="A1", address=A_size),
+                    Allocation(buffer="A2", address=2 * A_size),
+                ]
+            ]
+            * 4
+            + [
+                [
+                    Allocation(buffer="A0", address=0),
+                    Allocation(buffer="B", address=A_size),
+                ]
+            ]
+            * 4
+            + [
+                [
+                    Allocation(buffer="A1", address=0),
+                    Allocation(buffer="B", address=A_size),
+                ]
+            ]
+            * 4
+            + [
+                [
+                    Allocation(buffer="A2", address=0),
+                    Allocation(buffer="B", address=A_size),
+                ]
+            ]
+            * 4
         )
+
         testcase = AllocationTestCase(buffers, ops, good_allocation=good_allocations)
         return testcase
 
