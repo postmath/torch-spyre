@@ -1,6 +1,6 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, Optional, Iterable
+from typing import Callable, Optional, Iterable, override
 from unittest import TestCase, expectedFailure
 from enum import Enum
 
@@ -50,14 +50,65 @@ def make_buffer_registry(names_sizes: Iterable[tuple[str, int]]) -> dict[str, Bu
     return {name: Buffer(name=name, size=size) for (name, size) in names_sizes}
 
 
+class Component(Enum):
+    LX = "LX"
+    HBM = "HBM"
+
+
+@dataclass
+class Allocation:
+    buffer: str
+    component: Component = Component.LX
+    # If the component is LX, then the address must be an integer. If the component is HBM, we don't
+    # care about the address; this is encoded by the address being None. (This is enforced in
+    # TestExamplePattern.verify_test_case.)
+    address: Optional[int] = None
+
+
+# A type alias for the result of a full allocation planning run. The ith entry in the list is the
+# state during the ith operation. It maps each buffer that is live at that time to the allocation
+# for that buffer at that point in time.
+AllocationPlanningResult = list[list[Allocation]]
+
+
+@dataclass
+class AllocationTestCase:
+    buffers: dict[str, Buffer]
+    operations: list[Operation]
+    # A "good" allocation pattern that we want to compare to. The test verifies that this pattern
+    # is valid and that the current result is at least as good -- that is, the HBM usage of the
+    # current result is no more than that of the good pattern.
+    good_allocation: AllocationPlanningResult
+
+    def determine_inputs_outputs(self) -> tuple[list[str], list[str]]:
+        # A buffer is an input if it is read before it is written. A buffer is an output if it is
+        # only written to.
+        bufs_written_to = set()
+        bufs_read_from = set()
+        inputs = set()
+
+        for op in self.operations:
+            bufs_read_from.update(op.inputs)
+            for buf in op.inputs:
+                if buf not in bufs_written_to:
+                    inputs.add(buf)
+            bufs_written_to.update(op.outputs)
+
+        outputs = list(bufs_written_to.difference(bufs_read_from))
+        return (list(inputs), outputs)
+
+
 class InstrumentedAllocator(ScratchPadAllocator):
-    def __init__(self):
+    def __init__(self, testcase: "AllocationTestCase"):
         super().__init__()
         self.allocations = {}
+        self.inputs, self.outputs = testcase.determine_inputs_outputs()
 
+    @override
     def should_consider_op(self, op: Operation) -> bool:
         return True
 
+    @override
     def allocate(self, tensor_name: str, addr: int):
         if tensor_name in self.allocations:
             # TODO: support this. We need to store allocations differently, and then modify the
@@ -72,6 +123,7 @@ class InstrumentedAllocator(ScratchPadAllocator):
             )
         self.allocations[tensor_name] = addr
 
+    @override
     def mem_usage_by_op(self, op: Operation) -> dict[str, dict[str, bool | int]]:
         # Returns a dict mapping each buffer name to a dict with keys "is_input" and "size".
         # is_input is True if the buffer is an input to the op, and False otherwise. size is the
@@ -89,36 +141,13 @@ class InstrumentedAllocator(ScratchPadAllocator):
             }
         return result
 
+    @override
+    def get_output_names(self) -> list[str]:
+        return self.outputs
 
-class Component(Enum):
-    LX = "LX"
-    HBM = "HBM"
-
-
-@dataclass
-class Allocation:
-    buffer: str
-    component: Component = Component.LX
-    # If the component is LX, then the address must be an integer. If the component is HBM, we don't
-    # care about the address; this is encoded by the address being None. (This is enforced in
-    # TestExamplePattern.verify_test_case.)
-    address: Optional[int] = None
-
-
-# A type alias for the result of an allocation. The ith entry in the list is the state during
-# the ith operation. It maps each allocated buffer to the scratch pad address where it is
-# allocated at that point in time.
-AllocationResult = list[list[Allocation]]
-
-
-@dataclass
-class AllocationTestCase:
-    buffers: dict[str, Buffer]
-    operations: list[Operation]
-    # A "good" allocation pattern that we want to compare to. The test verifies that this pattern
-    # is valid and that the current result is at least as good -- that is, the HBM usage of the
-    # current result is no more than that of the good pattern.
-    good_allocation: AllocationResult
+    @override
+    def is_graph_input(self, buffer: str) -> bool:
+        return buffer in self.inputs
 
 
 class TestExamplePattern(TestCase):
@@ -283,7 +312,7 @@ class TestExamplePattern(TestCase):
             live_buffers.difference_update(deallocate_at[i + 1])
 
     def hbm_usage_for_good_allocation(
-        self, allocation: AllocationResult, operations: list[Operation]
+        self, allocation: AllocationPlanningResult, operations: list[Operation]
     ) -> int:
         if not operations:
             return 0
@@ -335,7 +364,7 @@ class TestExamplePattern(TestCase):
         return hbm_usage
 
     def run_test_case(self, test_case: AllocationTestCase):
-        alloc = InstrumentedAllocator()
+        alloc = InstrumentedAllocator(test_case)
 
         scratchpad_planning(test_case.operations, alloc)
 

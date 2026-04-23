@@ -89,6 +89,12 @@ class ScratchPadAllocator:
             # cannot find any free blocks
             return -1
 
+    def get_output_names(self) -> list[str]:
+        return V.graph.get_output_names()
+
+    def is_graph_input(self, buffer: str) -> bool:
+        return buffer not in V.graph.name_to_buffer
+
     def try_allocate(self, mem_usage: dict, idx: int, org_op_name: str):
         """
         Simple reuse rule:
@@ -102,9 +108,9 @@ class ScratchPadAllocator:
               3. may be able to generalize this decision in buf end-of-life analysis
               4. greedy alloc may cause fragments, can further improve
         """
-        graph_output_buf_name = V.graph.get_output_names()
+        graph_output_buf_name = self.get_output_names()
         for tensor_name, needed in mem_usage.items():
-            is_graph_input = tensor_name not in V.graph.name_to_buffer
+            is_graph_input = self.is_graph_input(tensor_name)
             is_graph_output = tensor_name in graph_output_buf_name
             core_div_mismatch = (not needed["is_input"]) and needed["core_div_mismatch"]
             if is_graph_input or is_graph_output or core_div_mismatch:
