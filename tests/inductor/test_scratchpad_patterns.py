@@ -1,6 +1,6 @@
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Iterable
 from unittest import TestCase, expectedFailure
 from enum import Enum
 
@@ -44,6 +44,10 @@ class Operation:
 class Buffer:
     name: str
     size: int
+
+
+def make_buffer_registry(names_sizes: Iterable[tuple[str, int]]) -> dict[str, Buffer]:
+    return {name: Buffer(name=name, size=size) for (name, size) in names_sizes}
 
 
 class InstrumentedAllocator(ScratchPadAllocator):
@@ -95,8 +99,9 @@ class Component(Enum):
 class Allocation:
     buffer: str
     component: Component = Component.LX
-    # If the component is LX, then the address is meaningful. If the component is HBM, we ignore the
-    # address.
+    # If the component is LX, then the address must be an integer. If the component is HBM, we don't
+    # care about the address; this is encoded by the address being None. (This is enforced in
+    # TestExamplePattern.verify_test_case.)
     address: Optional[int] = None
 
 
@@ -359,24 +364,23 @@ class TestExamplePattern(TestCase):
         third_scratchpad_size = (
             third_scratchpad_size // 128
         ) * 128  # round down to a multiple of the stick size
-        buffers = {}
-        buffers["A"] = Buffer("A", third_scratchpad_size)
-        buffers["B"] = Buffer("B", third_scratchpad_size)
-        buffers["C"] = Buffer("C", 2 * third_scratchpad_size)
-        for i in range(1, 5):
-            buffers[f"sink_{i}"] = Buffer(f"sink_{i}", 128)
+        buffers = make_buffer_registry(
+            [
+                ("A", third_scratchpad_size),
+                ("B", third_scratchpad_size),
+                ("C", 2 * third_scratchpad_size),
+                ("D", third_scratchpad_size),
+                ("E", third_scratchpad_size),
+            ]
+        )
 
-        op1 = Operation(
-            "op1", inputs=["A", "B"], outputs=["sink_1"], _buffer_registry=buffers
-        )
+        op1 = Operation("op1", inputs=["A"], outputs=["B"], _buffer_registry=buffers)
         op2 = Operation(
-            "op2", inputs=["A", "B"], outputs=["sink_2"], _buffer_registry=buffers
+            "op2", inputs=["A", "B"], outputs=["D"], _buffer_registry=buffers
         )
-        op3 = Operation(
-            "op3", inputs=["B", "C"], outputs=["sink_3"], _buffer_registry=buffers
-        )
+        op3 = Operation("op3", inputs=["B"], outputs=["C"], _buffer_registry=buffers)
         op4 = Operation(
-            "op4", inputs=["B", "C"], outputs=["sink_4"], _buffer_registry=buffers
+            "op4", inputs=["B", "C"], outputs=["E"], _buffer_registry=buffers
         )
 
         # A is used only during op1 and op2, so we allocate it after B. This way we can
@@ -384,14 +388,16 @@ class TestExamplePattern(TestCase):
         alloc_A = Allocation(buffer="A", address=third_scratchpad_size)
         alloc_B = Allocation(buffer="B", address=0)
         alloc_C = Allocation(buffer="C", address=third_scratchpad_size)
+        alloc_D = Allocation(buffer="D", component=Component.HBM)
+        alloc_E = Allocation(buffer="E", component=Component.HBM)
         return AllocationTestCase(
             buffers,
             [op1, op2, op3, op4],
             good_allocation=[
                 [alloc_A, alloc_B],
-                [alloc_A, alloc_B],
+                [alloc_A, alloc_B, alloc_D],
                 [alloc_B, alloc_C],
-                [alloc_B, alloc_C],
+                [alloc_B, alloc_C, alloc_E],
             ],
         )
 
