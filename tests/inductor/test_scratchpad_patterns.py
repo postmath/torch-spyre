@@ -1,7 +1,7 @@
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
-from typing import Callable, Optional, override
+from typing import Callable, Optional, Iterable, override
 from unittest import TestCase, expectedFailure
 from enum import Enum
 import os
@@ -100,6 +100,20 @@ class Operation:
 
     def get_read_names(self):
         return self.inputs
+
+
+def make_operations(
+    names_inputs_outputs: Iterable[tuple[str, str | list[str], str | list[str]]],
+    buffers: dict[str, Buffer],
+) -> list[Operation]:
+    result = []
+    for name, ins, outs in names_inputs_outputs:
+        if isinstance(ins, str):
+            ins = [ins]
+        if isinstance(outs, str):
+            outs = [outs]
+        result.append(Operation(name, ins, outs, buffers))
+    return result
 
 
 class Component(Enum):
@@ -524,14 +538,15 @@ class TestExamplePattern(TestCase):
             }
         )
 
-        op0 = Operation("op0", inputs=["A"], outputs=["A_LX"], _buffer_registry=buffers)
-        op1 = Operation("op1", inputs=["A_LX"], outputs=["B"], _buffer_registry=buffers)
-        op2 = Operation(
-            "op2", inputs=["A_LX", "B"], outputs=["D"], _buffer_registry=buffers
-        )
-        op3 = Operation("op3", inputs=["B"], outputs=["C"], _buffer_registry=buffers)
-        op4 = Operation(
-            "op4", inputs=["B", "C"], outputs=["E"], _buffer_registry=buffers
+        ops = make_operations(
+            [
+                ("op0", "A", "A_LX"),
+                ("op1", "A_LX", "B"),
+                ("op2", ["A_LX", "B"], "D"),
+                ("op3", "B", "C"),
+                ("op4", ["B", "C"], "E"),
+            ],
+            buffers,
         )
 
         # A_LX is used only during op1 and op2, so we allocate it after B. This way we can
@@ -544,7 +559,7 @@ class TestExamplePattern(TestCase):
         alloc_E = Allocation(buffer="E", component=Component.HBM)
         return Pattern(
             buffers,
-            [op0, op1, op2, op3, op4],
+            ops,
             good_allocation=make_allocation_result(
                 [
                     [alloc_A, alloc_A_LX],
@@ -588,36 +603,18 @@ class TestExamplePattern(TestCase):
             | {f"C{i}": k for i in range(1, N + 2)}
         )
 
-        def op_tuple(i: int) -> tuple[Operation, Operation, Operation]:
-            return (
-                Operation(
-                    f"op{i}_load",
-                    inputs=[f"A{i}_HBM"],
-                    outputs=[f"A{i}"],
-                    _buffer_registry=buffers,
-                ),
-                Operation(
-                    f"op{i}_0",
-                    inputs=[f"A{i}"],
-                    outputs=[f"B{i}"],
-                    _buffer_registry=buffers,
-                ),
-                Operation(
-                    f"op{i}_1",
-                    inputs=[f"A{i}", f"B{i}"],
-                    outputs=[f"C{i}"],
-                    _buffer_registry=buffers,
-                ),
-            )
+        def op_tuples(i: int) -> list[tuple[str, str | list[str], str]]:
+            return [
+                (f"op{i}_load", f"A{i}_HBM", f"A{i}"),
+                (f"op{i}_0", f"A{i}", f"B{i}"),
+                (f"op{i}_1", [f"A{i}", f"B{i}"], f"C{i}"),
+            ]
 
-        ops = [op for i in range(1, N + 1) for op in op_tuple(i)] + [
-            Operation(
-                "op_final",
-                inputs=[f"B{i}" for i in range(1, N + 1)],
-                outputs=[f"C{N + 1}"],
-                _buffer_registry=buffers,
-            )
-        ]
+        ops = make_operations(
+            [op for i in range(1, N + 1) for op in op_tuples(i)]
+            + [("op_final", [f"B{i}" for i in range(1, N + 1)], f"C{N + 1}")],
+            buffers,
+        )
 
         def good_allocation_tuple(
             i: int,
@@ -688,52 +685,21 @@ class TestExamplePattern(TestCase):
             | {f"C{i}": k for i in range(N + 2)}
         )
 
-        def op_tuple(i: int) -> tuple[Operation, Operation, Operation]:
-            return (
-                Operation(
-                    f"op{i}_load",
-                    inputs=[f"A{i}_HBM"],
-                    outputs=[f"A{i}"],
-                    _buffer_registry=buffers,
-                ),
-                Operation(
-                    f"op{i}_0",
-                    inputs=[f"A{i}"],
-                    outputs=[f"B{i}"],
-                    _buffer_registry=buffers,
-                ),
-                Operation(
-                    f"op{i}_1",
-                    inputs=[f"A{i}", f"B{i}"],
-                    outputs=[f"C{i}"],
-                    _buffer_registry=buffers,
-                ),
-            )
+        def op_tuples(i: int) -> list[tuple[str, str | list[str], str]]:
+            return [
+                (f"op{i}_load", f"A{i}_HBM", f"A{i}"),
+                (f"op{i}_0", f"A{i}", f"B{i}"),
+                (f"op{i}_1", [f"A{i}", f"B{i}"], f"C{i}"),
+            ]
 
-        ops = (
+        ops = make_operations(
             [
-                Operation(
-                    "op_start_load",
-                    inputs=["Z_HBM"],
-                    outputs=["Z"],
-                    _buffer_registry=buffers,
-                ),
-                Operation(
-                    "op_start",
-                    inputs=["Z"],
-                    outputs=["C0"],
-                    _buffer_registry=buffers,
-                ),
+                ("op_start_load", "Z_HBM", "Z"),
+                ("op_start", "Z", "C0"),
             ]
-            + [op for i in range(1, N + 1) for op in op_tuple(i)]
-            + [
-                Operation(
-                    "op_final",
-                    inputs=["Z"] + [f"B{i}" for i in range(1, N + 1)],
-                    outputs=[f"C{N + 1}"],
-                    _buffer_registry=buffers,
-                )
-            ]
+            + [op for i in range(1, N + 1) for op in op_tuples(i)]
+            + [("op_final", ["Z"] + [f"B{i}" for i in range(1, N + 1)], f"C{N + 1}")],
+            buffers,
         )
 
         def good_allocation_tuple(
@@ -805,23 +771,20 @@ class TestExamplePattern(TestCase):
                 for buf in ["A", "B", "A_HBM", "B_HBM"] + [f"C{i}" for i in range(1, 7)]
             }
         )
-        ops = [
-            Operation(
-                "loadA_0", inputs=["A_HBM"], outputs=["A"], _buffer_registry=buffers
-            ),
-            Operation("op1", inputs=["A"], outputs=["C1"], _buffer_registry=buffers),
-            Operation("op2", inputs=["A"], outputs=["C2"], _buffer_registry=buffers),
-            Operation(
-                "loadB", inputs=["B_HBM"], outputs=["B"], _buffer_registry=buffers
-            ),
-            Operation("op3", inputs=["B"], outputs=["C3"], _buffer_registry=buffers),
-            Operation("op4", inputs=["B"], outputs=["C4"], _buffer_registry=buffers),
-            Operation(
-                "loadA_1", inputs=["A_HBM"], outputs=["A"], _buffer_registry=buffers
-            ),
-            Operation("op5", inputs=["A"], outputs=["C5"], _buffer_registry=buffers),
-            Operation("op6", inputs=["A"], outputs=["C6"], _buffer_registry=buffers),
-        ]
+        ops = make_operations(
+            [
+                ("loadA_0", "A_HBM", "A"),
+                ("op1", "A", "C1"),
+                ("op2", "A", "C2"),
+                ("loadB", "B_HBM", "B"),
+                ("op3", "B", "C3"),
+                ("op4", "B", "C4"),
+                ("loadA_1", "A_HBM", "A"),
+                ("op5", "A", "C5"),
+                ("op6", "A", "C6"),
+            ],
+            buffers,
+        )
 
         good_allocation = [
             [
@@ -905,25 +868,16 @@ class TestExamplePattern(TestCase):
             | {f"C{i}_{j}": A_size for i in range(4) for j in range(4)}
         )
 
-        ops = []
-        for i, group in enumerate(pattern):
-            ops.append(
-                Operation(
-                    f"op{i}_load",
-                    inputs=[f"S{i}_HBM"],
-                    outputs=group,
-                    _buffer_registry=buffers,
-                )
-            )
-            for j in range(4):
-                ops.append(
-                    Operation(
-                        f"op{i}_{j}",
-                        inputs=group,
-                        outputs=[f"C{i}_{j}"],
-                        _buffer_registry=buffers,
-                    )
-                )
+        op_spec = [
+            [
+                (f"op{i}_load", f"S{i}_HBM", group),
+                *[(f"op{i}_{j}", group, f"C{i}_{j}") for j in range(4)],
+            ]
+            for i, group in enumerate(pattern)
+        ]
+        ops = make_operations(
+            [tupl for tup_lst in op_spec for tupl in tup_lst], buffers
+        )
 
         addresses_per_group = [
             {"A0": 0, "A1": A_size, "A2": 2 * A_size},
@@ -1032,62 +986,22 @@ class TestExamplePattern(TestCase):
             }
         )
 
-        ops = [
-            Operation(
-                name="load_Q", inputs=["Q_HBM"], outputs=["Q"], _buffer_registry=buffers
-            ),
-            Operation(
-                name="load_K", inputs=["K_HBM"], outputs=["K"], _buffer_registry=buffers
-            ),
-            Operation(
-                name="matmul_t",
-                inputs=["Q", "K"],
-                outputs=["Q_K"],
-                _buffer_registry=buffers,
-            ),
-            Operation(
-                name="max", inputs=["Q_K"], outputs=["m"], _buffer_registry=buffers
-            ),
-            Operation(
-                name="exp_sub",
-                inputs=["Q_K", "m"],
-                outputs=["numerators"],
-                _buffer_registry=buffers,
-            ),
-            Operation(
-                name="sum",
-                inputs=["numerators"],
-                outputs=["denominators"],
-                _buffer_registry=buffers,
-            ),
-            Operation(
-                name="div",
-                inputs=["numerators", "denominators"],
-                outputs=["scores"],
-                _buffer_registry=buffers,
-            ),
-            Operation(
-                name="save_scores",
-                inputs=["scores"],
-                outputs=["scores_HBM"],
-                _buffer_registry=buffers,
-            ),
-            Operation(
-                name="load_V", inputs=["V_HBM"], outputs=["V"], _buffer_registry=buffers
-            ),
-            Operation(
-                name="matmul",
-                inputs=["scores", "V"],
-                outputs=["output"],
-                _buffer_registry=buffers,
-            ),
-            Operation(
-                name="save_output",
-                inputs=["output"],
-                outputs=["output_HBM"],
-                _buffer_registry=buffers,
-            ),
-        ]
+        ops = make_operations(
+            [
+                ("load_Q", "Q_HBM", "Q"),
+                ("load_K", "K_HBM", "K"),
+                ("matmul_t", ["Q", "K"], "Q_K"),
+                ("max", "Q_K", "m"),
+                ("exp_sub", ["Q_K", "m"], "numerators"),
+                ("sum", "numerators", "denominators"),
+                ("div", ["numerators", "denominators"], "scores"),
+                ("save_scores", "scores", "scores_HBM"),
+                ("load_V", "V_HBM", "V"),
+                ("matmul", ["scores", "V"], "output"),
+                ("save_output", "output", "output_HBM"),
+            ],
+            buffers,
+        )
 
         alloc_Q_HBM = Allocation("Q_HBM", component=Component.HBM)
         alloc_K_HBM = Allocation("K_HBM", component=Component.HBM)
