@@ -221,7 +221,7 @@ class MockGraphLowering:
 
 class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
     def __init__(self, pattern: Pattern, alloc: InstrumentedAllocator):
-        super().__init__(InstrumentedAllocator(pattern), MockGraphLowering(pattern))
+        super().__init__(alloc, MockGraphLowering(pattern))
         self.buffers = pattern.buffers
         self.operations = pattern.operations
 
@@ -964,6 +964,172 @@ class TestExamplePattern(TestCase):
     @usuallyExpectedFailure
     def test_eviction_reallocation_pattern(self):
         self.run_pattern(self.make_eviction_reallocation_pattern())
+
+    def make_gqattention_pattern(self) -> Pattern:
+        """We describe the GQA attention pattern. The "input" are three tensors, Q, K, and V. The
+        dimensions of Q are typically B x Hq x S x D; the dimensions of K and V are B x Hkv x S x D.
+        Here B is the batch size, Hq is the number of query heads, Hkv is the number of key/value
+        heads (typically 1/4 or 1/8 of Hq); S is the sequence length; and D is the head dimension.
+
+        The algorithm is essentially as follows, expanding the softmax to its constituent
+        operations, fused to reductions / pointwise operations / matmuls with scaling and
+        transposition and listing two broadcasts explicitly:
+
+        K_broadcast = broadcast(K, Hq // Hkv, dim=1)   # dim: B x Hq x S x D, though typically the
+                                                       # B x Hkv x S x D in memory
+        Q_K = Q @ K_broadcast.transpose(-2, -1) / scalar   # dim: B x Hq x S x S
+        m = max(Q_K, dim=-1)                           # dim: B x Hq x S
+        numerators = exp(Q_K - m)                      # dim: B x Hq x S x S
+        denominators = sum(numerators, dim=-1)         # dim: B x Hq x S
+        scores = numerators / denominators             # dim: B x Hq x S x S
+        V_broadcast = broadcast(V, Hq // Hkv, dim=1)   # dim: B x Hq x S x D, though typically the
+                                                       # B x Hkv x S x D in memory
+        output = scores @ V                            # dim: B x Hq x S x D
+
+        The scalar is sqrt(Hq).
+
+        Let's write G = Hq // Hkv (usually 4 or 8, as mentioned above) and write N = B x Hkv x S.
+        Then the buffer sizes in memory are:
+
+        N x G x D  (Q, output);
+        N x D      (K, V, K_broadcast, V_broadcast);
+        N x D x S  (Q_K, numerators, scores);
+        N x G      (m, denominators).
+
+        During the first matmul, we need buffers of total size N x D x (G + 1 + S); then when
+        computing numerators, we need buffers of total size N x (2 x D x S + G); same when computing
+        scores; and to compute output, we need N x D x (G + 1 + S) again. We choose the parameters
+        so that both N x D x (G + 1 + S) and N x (2 x D x S + G) fit into LX, but only just.
+
+        In the most general version, both 'scores' and 'output' are returned to the caller."""
+
+        G = 8
+        D = 64
+        S = 16
+        self.assertGreater(2 * D * S + G, G + 1 + S, "test is written assuming this")
+        N = AVAILABLE_LX_SIZE // (2 * D * S + G)
+
+        NGD, ND, NDS, NG = tuple(
+            (x // 128) * 128 for x in [N * G * D, N * D, N * D * S, N * G]
+        )
+
+        buffers = make_buffer_registry(
+            {
+                "Q_HBM": NGD,
+                "Q": NGD,
+                "K_HBM": ND,
+                "K": ND,
+                "Q_K": NDS,
+                "m": NG,
+                "numerators": NDS,
+                "denominators": NG,
+                "scores": NDS,
+                "scores_HBM": NDS,
+                "V_HBM": ND,
+                "V": ND,
+                "output": NGD,
+                "output_HBM": NGD,
+            }
+        )
+
+        ops = [
+            Operation(
+                name="load_Q", inputs=["Q_HBM"], outputs=["Q"], _buffer_registry=buffers
+            ),
+            Operation(
+                name="load_K", inputs=["K_HBM"], outputs=["K"], _buffer_registry=buffers
+            ),
+            Operation(
+                name="matmul_t",
+                inputs=["Q", "K"],
+                outputs=["Q_K"],
+                _buffer_registry=buffers,
+            ),
+            Operation(
+                name="max", inputs=["Q_K"], outputs=["m"], _buffer_registry=buffers
+            ),
+            Operation(
+                name="exp_sub",
+                inputs=["Q_K", "m"],
+                outputs=["numerators"],
+                _buffer_registry=buffers,
+            ),
+            Operation(
+                name="sum",
+                inputs=["numerators"],
+                outputs=["denominators"],
+                _buffer_registry=buffers,
+            ),
+            Operation(
+                name="div",
+                inputs=["numerators", "denominators"],
+                outputs=["scores"],
+                _buffer_registry=buffers,
+            ),
+            Operation(
+                name="save_scores",
+                inputs=["scores"],
+                outputs=["scores_HBM"],
+                _buffer_registry=buffers,
+            ),
+            Operation(
+                name="load_V", inputs=["V_HBM"], outputs=["V"], _buffer_registry=buffers
+            ),
+            Operation(
+                name="matmul",
+                inputs=["scores", "V"],
+                outputs=["output"],
+                _buffer_registry=buffers,
+            ),
+            Operation(
+                name="save_output",
+                inputs=["output"],
+                outputs=["output_HBM"],
+                _buffer_registry=buffers,
+            ),
+        ]
+
+        alloc_Q_HBM = Allocation("Q_HBM", component=Component.HBM)
+        alloc_K_HBM = Allocation("K_HBM", component=Component.HBM)
+        alloc_V_HBM = Allocation("V_HBM", component=Component.HBM)
+        alloc_scores_HBM = Allocation("scores_HBM", component=Component.HBM)
+        alloc_output_HBM = Allocation("output_HBM", component=Component.HBM)
+
+        alloc_Q = Allocation("Q", address=NDS)
+        alloc_K = Allocation("K", address=NDS + NGD)
+        alloc_Q_K = Allocation("Q_K", address=0)
+        alloc_m = Allocation("m", address=NDS)
+        alloc_numerators = Allocation("numerators", address=NDS + NG)
+        alloc_denominators = Allocation("denominators", address=NDS)
+        alloc_scores = Allocation("scores", address=0)
+        alloc_V = Allocation("V", address=NDS)
+        alloc_output = Allocation("output", address=NDS + ND)
+
+        good_allocations = [
+            [alloc_Q_HBM, alloc_Q],
+            [alloc_Q, alloc_K_HBM, alloc_K],
+            [alloc_Q, alloc_K, alloc_Q_K],
+            [alloc_Q_K, alloc_m],
+            [alloc_Q_K, alloc_m, alloc_numerators],
+            [alloc_numerators, alloc_denominators],
+            [alloc_numerators, alloc_denominators, alloc_scores],
+            [alloc_scores, alloc_scores_HBM],
+            [alloc_scores, alloc_V_HBM, alloc_V],
+            [alloc_scores, alloc_V, alloc_output],
+            [alloc_output, alloc_output_HBM],
+        ]
+
+        pattern = Pattern(
+            buffers, ops, good_allocation=make_allocation_result(good_allocations)
+        )
+        return pattern
+
+    def test_verify_gqattention_pattern(self):
+        self.verify_pattern(self.make_gqattention_pattern())
+
+    @usuallyExpectedFailure
+    def test_gqattention_pattern(self):
+        self.run_pattern(self.make_gqattention_pattern())
 
 
 if __name__ == "__main__":
