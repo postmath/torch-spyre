@@ -209,6 +209,7 @@ class InstrumentedAllocator(ScratchPadAllocator):
     def __init__(self, pattern: Pattern, lowering: "MockGraphLowering"):
         super().__init__()
         self.allocations: dict[str, int] = {}
+        # This overwrites the value set in the superclass constructor:
         self.graph_lowering = lowering
         self.inputs, self.outputs = pattern.determine_inputs_outputs()
 
@@ -1021,140 +1022,6 @@ class TestExamplePattern(TestCase):
     @usuallyExpectedFailure
     def test_gqattention_pattern(self):
         self.run_pattern(self.make_gqattention_pattern())
-
-    def make_moe_mlp_pattern(self) -> Pattern:
-        """This pattern is a (simplified) mixture of experts multi-layer perceptron.
-
-        We start with a hidden state, of dimension batch x seq_len x hidden_size. We matmul with a
-        selector matrix (of dimension hidden_size x num_experts) to obtain qualities of dimension
-        batch x seq_len x num_experts, indicating the quality of each expert for each token. We find
-        the top k indices for each subtensor in the last dimension (an integer tensor of dimension
-        batch x seq_len x k). We create a masked version of quality of the same dimension (replacing
-        the non-selected entries by -inf). We apply softmax to this to get the weights - we pretend
-        here that softmax is simply a pointwise operation.
-
-        We now determine the tokens for each expert from the top k indices. This is an integer
-        tensor of dimension num_experts x (batch * seq_len * 2), giving for each expert the batch
-        and seq_len index for each token that they need to process; there are at most batch *
-        seq_len such indices for any one expert.
-
-        Now, for each expert, we collect the n_tokens x hidden_size matrix of selected_tokens from
-        the hidden state (where n_tokens <= batch * seq_len), compute up = selected_tokens @ M1 +
-        bias_1 and gate = selected_tokens @ M2 + bias_2 where M1 and M2 are (expert-dependent)
-        matrices of dimension hidden_size x mlp_size and bias_1 and bias_2 are (expert-dependent)
-        vectors of dimension mlp_size. We define out = up * silu(gate), and down = out @ M3 +
-        bias_3, where M3 is an (expert-dependent) mlp_size x hidden_size matrix and bias_3 is an
-        (expert-dependent) hidden_size vector. Now we add the entries of out to the appropriate
-        entries of hidden state, scaled by the appropriate weight. After all experts are done, we
-        save the hidden state to HBM.
-
-        We assume that both integers and floats are 16 bits. This means that there are at most 65536
-        experts and that batch_size and seq_len are at most 32768, assuming we want to use -1 as a
-        special value in tokens_per_expert.
-        """
-        batch = 16
-        seq_len = 256
-        hidden_size = 1024
-        K = 2  # number of experts selected
-        selected_tokens_per_expert = [1600, 2400, 1300, 800]
-        selected_tokens_per_expert.append(
-            batch * seq_len * K - sum(selected_tokens_per_expert)
-        )
-        self.assertGreaterEqual(
-            selected_tokens_per_expert[-1],
-            0,
-            "increase batch * seq_len * K, or reduce the token counts per expert",
-        )
-        num_experts = len(selected_tokens_per_expert)  # 5 experts
-        mlp_size = 512
-
-        # The factor 2 is bytes per entry.
-        buffers = make_buffer_registry(
-            {
-                "hidden_HBM": batch * seq_len * hidden_size * 2,
-                "hidden": batch * seq_len * hidden_size * 2,
-                "selector_HBM": hidden_size * num_experts * 2,
-                "selector": hidden_size * num_experts * 2,
-                "qualities": batch * seq_len * num_experts * 2,
-                "top_k_idx": batch * seq_len * K * 2,
-                "masked_qualities": batch * seq_len * num_experts * 2,
-                "weights": batch * seq_len * num_experts * 2,
-                "tok_per_expert": num_experts * (batch * seq_len * 2) * 2,
-                "result_HBM": batch * seq_len * hidden_size * 2,
-            }
-            | {
-                f"{key}_{i}": value
-                for i in range(num_experts)
-                for key, value in {
-                    "selected_tokens": selected_tokens_per_expert[i] * hidden_size * 2,
-                    "M1_HBM": hidden_size * mlp_size * 2,
-                    "bias1_HBM": mlp_size * 2,
-                    "M2_HBM": hidden_size * mlp_size * 2,
-                    "bias2_HBM": mlp_size * 2,
-                    "up": selected_tokens_per_expert[i] * mlp_size * 2,
-                    "gate": selected_tokens_per_expert[i] * mlp_size * 2,
-                    "out": selected_tokens_per_expert[i] * mlp_size * 2,
-                    "M3_HBM": mlp_size * hidden_size * 2,
-                    "bias3_HBM": hidden_size * 2,
-                    "down": selected_tokens_per_expert[i] * hidden_size * 2,
-                }.items()
-            }
-        )
-
-        ops = make_operations(
-            [
-                ("load_hidden", "hidden_HBM", "hidden"),
-                ("load_selector", "selector_HBM", "selector"),
-                ("matmul_0", ["hidden", "selector"], "qualities"),
-                ("topk", "qualities", "top_k_idx"),
-                ("mask_qualities", ["qualities", "top_k_idx"], "masked_qualities"),
-                ("softmax", "masked_qualities", "weights"),
-                ("select_tokens", "top_k_idx", "tok_per_expert"),
-            ]
-            + [
-                (f"{tupl[0]}_{i}", tupl[1:])
-                for i in range(num_experts)
-                for tupl in [
-                    ("gather", ["hidden", "tok_per_expert"], f"selected_tokens_{i}"),
-                    (
-                        "matmul_add_1",
-                        [f"selected_tokens_{i}", f"M1_HBM_{i}", f"bias1_HBM_{i}"],
-                        f"up_{i}",
-                    ),
-                    (
-                        "matmul_add_2",
-                        [f"selected_tokens_{i}", f"M2_HBM_{i}", f"bias2_HBM_{i}"],
-                        f"gate_{i}",
-                    ),
-                    ("swiglu", ["up_{i}", "gate_{i}"], f"out_{i}"),
-                    (
-                        "matmul_add_3",
-                        [f"out_{i}", f"M3_HBM_{i}", f"bias3_HBM_{i}"],
-                        f"down_{i}",
-                    ),
-                    (
-                        "scatter",
-                        ["down_{i}", "weights", "hidden", "tok_per_expert"],
-                        "hidden",
-                    ),
-                ]
-            ]
-            + [("save_result", "hidden", "result_HBM")],
-            buffers,
-        )
-
-        good_allocation = make_nonevicting_allocation_result(
-            buffers,
-            {
-                "hidden": 0,
-                "selector": batch * seq_len * hidden_size * 2,
-                "qualities": batch * seq_len * num_experts * 2,
-            },
-            ops,
-        )
-
-        pattern = Pattern(buffers, ops, good_allocation=good_allocation)
-        return pattern
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ class ScratchPadAllocator:
         self.limit = size
         self.usage: dict = {}  # each record will be tensor_name:{"addr": yy, "size": zz}
         self.lx_usage_hist: list = []
+        self.graph_lowering = V.graph
 
     def get_lowest_addr_in_use(self):
         if len(self.usage) > 0:
@@ -92,10 +93,10 @@ class ScratchPadAllocator:
                 frag_end = sorted_rec[i + 1]["addr"]
                 if frag_end - frag_st >= size_needed:
                     return frag_st
-            return -1
+            return None
         else:
             # cannot find any free blocks
-            return -1
+            return None
 
     def get_output_names(self) -> list[str]:
         return V.graph.get_output_names()
