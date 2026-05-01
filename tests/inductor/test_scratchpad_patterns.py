@@ -1,6 +1,7 @@
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
+import itertools
 from typing import Callable, Optional, Iterable, override
 from unittest import TestCase, expectedFailure
 from enum import Enum
@@ -205,14 +206,25 @@ class Pattern:
 
 
 class InstrumentedAllocator(ScratchPadAllocator):
-    def __init__(self, pattern: Pattern):
+    def __init__(self, pattern: Pattern, lowering: "MockGraphLowering"):
         super().__init__()
         self.allocations: dict[str, int] = {}
+        self.graph_lowering = lowering
         self.inputs, self.outputs = pattern.determine_inputs_outputs()
 
     @override
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
         return True
+
+    @override
+    def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
+        return True
+
+    # @override
+    # def find_inplace_address(
+    #     self, tensor_name: str, mem_usage: dict, needed_size: int
+    # ) -> Optional[int]:
+    #     return None
 
     @override
     def allocate(self, tensor_name: str, addr: int):
@@ -232,21 +244,31 @@ class InstrumentedAllocator(ScratchPadAllocator):
         self.allocations[tensor_name] = addr
 
     @override
-    def mem_usage_by_op(self, op: Operation) -> dict[str, dict[str, bool | int]]:
+    def mem_usage_by_op(
+        self,
+        op: Operation,
+        core_div_mismatch: dict[str, bool] = {},
+        release_next: list = [],
+    ) -> dict[str, dict[str, bool | int] | list[str]]:
         # Returns a dict mapping each buffer name to a dict with keys "is_input" and "size".
         # is_input is True if the buffer is an input to the op, and False otherwise. size is the
         # size of the buffer.
         result = {}
-        for tensor_name in op.inputs:
+        for tensor_name, is_input in itertools.chain(
+            ((tensor_name, True) for tensor_name in op.inputs),
+            ((tensor_name, False) for tensor_name in op.outputs),
+        ):
             result[tensor_name] = {
-                "is_input": True,
+                "is_input": is_input,
                 "size": op._buffer_registry[tensor_name].size,
+                "core_div_mismatch": False,
+                "last_usage": tensor_name in release_next,
             }
-        for tensor_name in op.outputs:
-            result[tensor_name] = {
-                "is_input": False,
-                "size": op._buffer_registry[tensor_name].size,
-            }
+
+        result["all_inputs"] = op.inputs
+        result["all_outputs"] = op.outputs
+        result["all_buf_used"] = op.inputs + op.outputs
+
         return result
 
     @override
@@ -270,8 +292,13 @@ class MockGraphLowering:
 
 
 class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
-    def __init__(self, pattern: Pattern, alloc: InstrumentedAllocator):
-        super().__init__(alloc, MockGraphLowering(pattern))
+    def __init__(
+        self,
+        pattern: Pattern,
+        alloc: InstrumentedAllocator,
+        lowering: MockGraphLowering,
+    ):
+        super().__init__(alloc, lowering)
         self.buffers = pattern.buffers
         self.operations = pattern.operations
 
@@ -532,8 +559,9 @@ class TestExamplePattern(TestCase):
         # The scratchpad_planning operation may modify the pattern (adding operations), and then
         # examining the "good" allocation will run into trouble.
         pattern_copy = copy.deepcopy(pattern)
-        alloc = InstrumentedAllocator(pattern_copy)
-        strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc)
+        lowering = MockGraphLowering(pattern_copy)
+        alloc = InstrumentedAllocator(pattern_copy, lowering)
+        strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc, lowering)
 
         scratchpad_planning(pattern_copy.operations, strategy)
 

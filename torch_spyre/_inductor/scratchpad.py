@@ -103,6 +103,26 @@ class ScratchPadAllocator:
     def is_graph_input(self, buffer: str) -> bool:
         return buffer not in V.graph.name_to_buffer
 
+    def find_inplace_address(
+        self, tensor_name: str, mem_usage: dict, needed_size: int
+    ) -> Optional[int]:
+        found_matched_input = False
+        ten_dev_lay = self.graph_lowering.get_buffer(tensor_name).layout.device_layout
+        for inp_i in mem_usage["all_inputs"]:
+            inp_i_dev_lay = self.graph_lowering.get_buffer(inp_i).layout.device_layout
+            inp_i_on_lx = inp_i in self.usage
+            inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
+            inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
+            inp_i_eol = mem_usage[inp_i]["last_usage"]
+            if inp_i_on_lx and inp_i_size_match and inp_i_lay_match and inp_i_eol:
+                found_matched_input = True
+                break  # see TODO
+        if found_matched_input:
+            return self.usage[inp_i]["addr"]
+        else:
+            # NOTE allow_inplace also implies allow_output_to_lx
+            return None
+
     def try_allocate(self, mem_usage: dict, idx: int, org_op_name: str):
         """
         Simple reuse rule:
@@ -135,41 +155,25 @@ class ScratchPadAllocator:
                 continue
 
             # Decide whether to reuse/pin.
-            addr = -1
+            addr = None
             tensor_on_lx = self.usage.get(tensor_name, {})
             size_match = tensor_on_lx.get("size", 0) == needed_size
             allow_output_to_lx = self.op_output_good_for_lx_reuse(org_op_name)
-            allow_inplace = any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
+            allow_inplace = self.op_good_for_lx_inplace(org_op_name)
 
             if is_input and tensor_on_lx and size_match:
                 addr = self.usage[tensor_name]["addr"]
             elif not is_input and allow_inplace:
-                found_matched_input = False
-                ten_dev_lay = V.graph.get_buffer(tensor_name).layout.device_layout
-                for inp_i in mem_usage["all_inputs"]:
-                    inp_i_dev_lay = V.graph.get_buffer(inp_i).layout.device_layout
-                    inp_i_on_lx = inp_i in self.usage
-                    inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
-                    inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
-                    inp_i_eol = mem_usage[inp_i]["last_usage"]
-                    if (
-                        inp_i_on_lx
-                        and inp_i_size_match
-                        and inp_i_lay_match
-                        and inp_i_eol
-                    ):
-                        found_matched_input = True
-                        break  # see TODO
-                if found_matched_input:
-                    addr = self.usage[inp_i]["addr"]
-                else:
-                    # NOTE allow_inplace also implies allow_output_to_lx
+                addr = self.find_inplace_address(tensor_name, mem_usage, needed_size)
+                if (
+                    addr is None
+                ):  # NOTE 0 is a legitimate address, so we can't test "if not addr:"
                     addr = self.find_free_block(needed_size)
             elif not is_input and allow_output_to_lx:
                 addr = self.find_free_block(needed_size)
 
             # add lx info into V.graph.buffers.layout for later codegen use.
-            if addr != -1:
+            if addr is not None:
                 self.usage[tensor_name] = {"addr": addr, "size": needed_size}
 
                 self.allocate(tensor_name, addr)
@@ -204,6 +208,9 @@ class ScratchPadAllocator:
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
         return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
 
+    def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
+        return any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
+
     def mem_usage_by_op(
         self,
         op: ComputedBuffer,
@@ -214,7 +221,7 @@ class ScratchPadAllocator:
         Get a summary of memory usage of the given operation. Two types of info can be found
         1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
         2. Detailed info of individual buf, e.g. mem_usage[<buf_name>], which has
-            "is_input", "size", "core_div_mismatch" fields
+            "is_input", "size", "core_div_mismatch", "last_usage" fields
         NOTE:
         if a buf is not in core_div_mismatch => it has no users => graph output
         if a buf is on release_next => it's the last time it'll be used => allow inplace
