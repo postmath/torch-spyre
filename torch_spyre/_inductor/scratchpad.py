@@ -522,7 +522,7 @@ class GreedyAllocationStrategy(AllocationStrategy):
             self.alloc.deallocate(release_now)
 
             if self.should_consider_op(op):
-                self.consider_for_scratchpad(op, idx, release_next)
+                self.consider_for_scratchpad(op, idx, core_div_mismatch, release_next)
         # logger.info(alloc.lx_usage_hist)
 
 
