@@ -137,7 +137,43 @@ class Allocation:
 AllocationResult = list[dict[str, Allocation]]
 
 
-def make_allocation_result(lists: list[list[Allocation]]) -> AllocationResult:
+def make_nonevicting_allocation_result(
+    buffers: dict[str, Buffer], addresses: dict[str, int], ops: list[Operation]
+) -> AllocationResult:
+    """Simple way to create an allocation result if buffers don't move around and stay in memory
+    from their first to their last op."""
+    allocations = {}
+    for buffer_name in buffers:
+        if buffer_name in addresses:
+            allocations[buffer_name] = Allocation(
+                buffer=buffer_name, address=addresses[buffer_name]
+            )
+        else:
+            allocations[buffer_name] = Allocation(
+                buffer=buffer_name, component=Component.HBM
+            )
+
+    first_use = {}
+    last_use = {}
+    for i, op in enumerate(ops):
+        for buffer in op.inputs + op.outputs:
+            if buffer not in first_use:
+                first_use[buffer] = i
+            last_use[buffer] = i
+
+    return [
+        {
+            buffer_name: alloc
+            for buffer_name, alloc in allocations.items()
+            if first_use[buffer_name] <= i <= last_use[buffer_name]
+        }
+        for i in range(len(ops))
+    ]
+
+
+def make_general_allocation_result(lists: list[list[Allocation]]) -> AllocationResult:
+    """Fully general way to create an allocation result, when make_nonevicting_allocation_result is
+    not appropriate."""
     return [{alloc.buffer: alloc for alloc in lst} for lst in lists]
 
 
@@ -551,25 +587,12 @@ class TestExamplePattern(TestCase):
 
         # A_LX is used only during op1 and op2, so we allocate it after B. This way we can
         # evict it after op2 and have enough space for C during op3.
-        alloc_A = Allocation(buffer="A", component=Component.HBM)
-        alloc_A_LX = Allocation(buffer="A_LX", address=third_scratchpad_size)
-        alloc_B = Allocation(buffer="B", address=0)
-        alloc_C = Allocation(buffer="C", address=third_scratchpad_size)
-        alloc_D = Allocation(buffer="D", component=Component.HBM)
-        alloc_E = Allocation(buffer="E", component=Component.HBM)
-        return Pattern(
+        good_allocation = make_nonevicting_allocation_result(
             buffers,
+            {"A_LX": third_scratchpad_size, "B": 0, "C": third_scratchpad_size},
             ops,
-            good_allocation=make_allocation_result(
-                [
-                    [alloc_A, alloc_A_LX],
-                    [alloc_A_LX, alloc_B],
-                    [alloc_A_LX, alloc_B, alloc_D],
-                    [alloc_B, alloc_C],
-                    [alloc_B, alloc_C, alloc_E],
-                ]
-            ),
         )
+        return Pattern(buffers, ops, good_allocation=good_allocation)
 
     def test_verify_simple_fragmentation_pattern(self):
         self.verify_pattern(self.make_simple_fragmentation_pattern())
@@ -616,37 +639,14 @@ class TestExamplePattern(TestCase):
             buffers,
         )
 
-        def good_allocation_tuple(
-            i: int,
-        ) -> tuple[list[Allocation], list[Allocation], list[Allocation]]:
-            # Allocate A{i} at 0 and B{j} for j <= i at N*k, (N+1)*k, (N+3)*k, (N+6)*k, ...,
-            # (N+i*(i-1)/2)*k.
-            allocload = [
-                Allocation(buffer=f"B{j}", address=(N + j * (j - 1) // 2) * k)
-                for j in range(1, i)
-            ]
-            allocload.append(Allocation(buffer=f"A{i}_HBM", component=Component.HBM))
-            allocload.append(Allocation(buffer=f"A{i}", address=0))
-            alloc0 = allocload + [
-                Allocation(buffer=f"B{i}", address=(N + i * (i - 1) // 2) * k)
-            ]
-            alloc1 = alloc0 + [Allocation(buffer=f"C{i}", component=Component.HBM)]
-            return (allocload, alloc0, alloc1)
-
-        good_allocations = [
-            alloc for i in range(1, N + 1) for alloc in good_allocation_tuple(i)
-        ]
-        good_allocations.append(
-            [
-                Allocation(buffer=f"B{i}", address=(N + i * (i - 1) // 2) * k)
-                for i in range(1, N + 1)
-            ]
-            + [Allocation(buffer=f"C{N + 1}", component=Component.HBM)]
+        good_allocation = make_nonevicting_allocation_result(
+            buffers,
+            {f"A{i}": 0 for i in range(1, N + 1)}
+            | {f"B{i}": (N + i * (i - 1) // 2) * k for i in range(1, N + 1)},
+            ops,
         )
 
-        pattern = Pattern(
-            buffers, ops, good_allocation=make_allocation_result(good_allocations)
-        )
+        pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
 
     def test_verify_staircase_pattern(self):
@@ -702,54 +702,15 @@ class TestExamplePattern(TestCase):
             buffers,
         )
 
-        def good_allocation_tuple(
-            i: int,
-        ) -> tuple[list[Allocation], list[Allocation], list[Allocation]]:
-            # Allocate Z at 0, A{i} at k, and B{j} for j <= i as follows: B{N} at 2*k, B{N-1} at
-            # 3*k, B{N-2} at 5*k, B{N-3} at 8*k, ..., B{N-j} at (j*(j+1)/2 + 2)*k. The gap
-            # between A{i} and B{i} = B{N+1-(N+1-i)} is (N+1-i)*(N+2-i)/2*k, which is big enough
-            # for A{i+1} of size (N-i)*k.
-            allocload = [
-                Allocation(buffer=f"B{N - j}", address=(j * (j + 1) // 2 + 2) * k)
-                for j in range(N - i + 1, N)
-            ] + [
-                Allocation(buffer="Z", address=0),
-                Allocation(buffer=f"A{i}_HBM", component=Component.HBM),
-                Allocation(buffer=f"A{i}", address=k),
-            ]
-            alloc0 = allocload + [
-                Allocation(buffer=f"B{i}", address=((N - i) * (N - i + 1) // 2 + 2) * k)
-            ]
-            alloc1 = alloc0 + [Allocation(buffer=f"C{i}", component=Component.HBM)]
-            return (allocload, alloc0, alloc1)
-
-        good_allocations = [
-            [
-                Allocation(buffer="Z_HBM", component=Component.HBM),
-                Allocation(buffer="Z", address=0),
-            ],
-            [
-                Allocation(buffer="Z", address=0),
-                Allocation(buffer="C0", component=Component.HBM),
-            ],
-        ]
-
-        good_allocations.extend(
-            [alloc for i in range(1, N + 1) for alloc in good_allocation_tuple(i)]
+        good_allocation = make_nonevicting_allocation_result(
+            buffers,
+            {"Z": 0}
+            | {f"A{i}": k for i in range(1, N + 1)}
+            | {f"B{i}": ((N - i) * (N - i + 1) // 2 + 2) * k for i in range(1, N + 1)},
+            ops,
         )
 
-        last_allocation = good_allocation_tuple(N)[1]
-        last_allocation = [
-            alloc for alloc in last_allocation if not alloc.buffer.startswith("A")
-        ] + [
-            Allocation(buffer="Z", address=0),
-            Allocation(buffer=f"C{N + 1}", component=Component.HBM),
-        ]
-        good_allocations.append(last_allocation)
-
-        pattern = Pattern(
-            buffers, ops, good_allocation=make_allocation_result(good_allocations)
-        )
+        pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
 
     def test_verify_downward_staircase_pattern(self):
@@ -826,7 +787,9 @@ class TestExamplePattern(TestCase):
         ]
 
         pattern = Pattern(
-            buffers, ops, good_allocation=make_allocation_result(good_allocation)
+            buffers,
+            ops,
+            good_allocation=make_general_allocation_result(good_allocation),
         )
         return pattern
 
@@ -908,7 +871,9 @@ class TestExamplePattern(TestCase):
                 )
 
         pattern = Pattern(
-            buffers, ops, good_allocation=make_allocation_result(good_allocations)
+            buffers,
+            ops,
+            good_allocation=make_general_allocation_result(good_allocations),
         )
         return pattern
 
@@ -1003,39 +968,23 @@ class TestExamplePattern(TestCase):
             buffers,
         )
 
-        alloc_Q_HBM = Allocation("Q_HBM", component=Component.HBM)
-        alloc_K_HBM = Allocation("K_HBM", component=Component.HBM)
-        alloc_V_HBM = Allocation("V_HBM", component=Component.HBM)
-        alloc_scores_HBM = Allocation("scores_HBM", component=Component.HBM)
-        alloc_output_HBM = Allocation("output_HBM", component=Component.HBM)
-
-        alloc_Q = Allocation("Q", address=NDS)
-        alloc_K = Allocation("K", address=NDS + NGD)
-        alloc_Q_K = Allocation("Q_K", address=0)
-        alloc_m = Allocation("m", address=NDS)
-        alloc_numerators = Allocation("numerators", address=NDS + NG)
-        alloc_denominators = Allocation("denominators", address=NDS)
-        alloc_scores = Allocation("scores", address=0)
-        alloc_V = Allocation("V", address=NDS)
-        alloc_output = Allocation("output", address=NDS + ND)
-
-        good_allocations = [
-            [alloc_Q_HBM, alloc_Q],
-            [alloc_Q, alloc_K_HBM, alloc_K],
-            [alloc_Q, alloc_K, alloc_Q_K],
-            [alloc_Q_K, alloc_m],
-            [alloc_Q_K, alloc_m, alloc_numerators],
-            [alloc_numerators, alloc_denominators],
-            [alloc_numerators, alloc_denominators, alloc_scores],
-            [alloc_scores, alloc_scores_HBM],
-            [alloc_scores, alloc_V_HBM, alloc_V],
-            [alloc_scores, alloc_V, alloc_output],
-            [alloc_output, alloc_output_HBM],
-        ]
-
-        pattern = Pattern(
-            buffers, ops, good_allocation=make_allocation_result(good_allocations)
+        good_allocation = make_nonevicting_allocation_result(
+            buffers,
+            {
+                "Q": NDS,
+                "K": NDS + NGD,
+                "Q_K": 0,
+                "m": NDS,
+                "numerators": NDS + NG,
+                "denominators": NDS,
+                "scores": 0,
+                "V": NDS,
+                "output": NDS + ND,
+            },
+            ops,
         )
+
+        pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
 
     def test_verify_gqattention_pattern(self):
