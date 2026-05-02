@@ -153,8 +153,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((55, 2), (2, 99)),
                     ((67, 67), (67, 67)),
                     ((67, 255), (255, 128)),
-                ]
+                ],
+                rand_type="xavier",
             ),
+        },
+        ("test_mm_autocast", "test_mm_autocast_cpu"): {
+            "param_sets": {
+                "fp32_enabled": (
+                    True,
+                    cached_randn((4, 4), dtype=torch.float32),
+                    cached_randn((4, 4), differentiation=1, dtype=torch.float32),
+                ),
+                "f16_enabled": (
+                    True,
+                    cached_randn((4, 4), dtype=torch.float16),
+                    cached_randn((4, 4), differentiation=1, dtype=torch.float16),
+                ),
+                "f16_disabled": (
+                    False,
+                    cached_randn((4, 4), differentiation=2, dtype=torch.float16),
+                    cached_randn((4, 4), differentiation=3, dtype=torch.float16),
+                ),
+            },
+            "expect_fail": ["fp32_enabled"],
         },
         ("test_einsum", "test_mm_relaxed"): {
             "ops_dict": {
@@ -179,7 +200,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     # Padding
                     ((2, 55, 2), (2, 2, 99)),
                     ((2, 99, 65), (2, 65, 55)),
-                ]
+                ],
+                rand_type="xavier",
             ),
         },
         ("test_matmul", "test_binary_op_cpu"): {
@@ -207,7 +229,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2, 99, 65), (2, 65, 55)),
                     ((2, 3, 55, 2), (2, 3, 2, 99)),
                     ((2, 3, 99, 65), (2, 3, 65, 55)),
-                ]
+                ],
+                rand_type="xavier",
             ),
         },
         ("test_large_matmul", "test_mm_relaxed"): {
@@ -2030,6 +2053,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare_with_cpu(op, a, b, atol=0.1, rtol=0.1)
         else:  # single stick, no need to relax
             compare_with_cpu(op, a, b)
+
+    def test_mm_autocast_cpu(self, enabled, a, b):
+        def fn(a, b):
+            with torch.autocast(device_type="spyre", enabled=enabled):
+                return a @ b
+
+        compare_with_cpu(fn, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
