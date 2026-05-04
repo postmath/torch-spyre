@@ -221,12 +221,6 @@ class InstrumentedAllocator(ScratchPadAllocator):
     def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
         return True
 
-    # @override
-    # def find_inplace_address(
-    #     self, tensor_name: str, mem_usage: dict, needed_size: int
-    # ) -> Optional[int]:
-    #     return None
-
     @override
     def allocate(self, tensor_name: str, addr: int):
         if tensor_name in self.allocations:
@@ -250,7 +244,7 @@ class InstrumentedAllocator(ScratchPadAllocator):
         op: Operation,
         core_div_mismatch: dict[str, bool] = {},
         release_next: list = [],
-    ) -> dict[str, dict[str, bool | int] | list[str]]:
+    ) -> dict[str, dict[str, bool | int | str] | list[str]]:
         # Returns a dict mapping each buffer name to a dict with keys "is_input" and "size".
         # is_input is True if the buffer is an input to the op, and False otherwise. size is the
         # size of the buffer.

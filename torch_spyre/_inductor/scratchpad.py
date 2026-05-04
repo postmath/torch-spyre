@@ -217,7 +217,7 @@ class ScratchPadAllocator:
         op: ComputedBuffer,
         core_div_mismatch: dict[str, bool] = {},
         release_next: list = [],
-    ) -> dict[str, dict[str, bool | int] | list[str]]:
+    ) -> dict[str, dict[str, bool | int | str] | list[str]]:
         """
         Get a summary of memory usage of the given operation. Two types of info can be found
         1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
