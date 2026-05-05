@@ -26,6 +26,10 @@ import random as rnd
 import numpy as np
 
 
+def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return not (a[1] <= b[0] or a[0] >= b[1])
+
+
 @dataclass
 class Buffer:
     size: int
@@ -53,6 +57,11 @@ class Buffer:
         t_end = t_start + duration + 1
 
         return cls(size=random.randrange(size_range), first_use=t_start, last_use=t_end)
+
+    def overlaps_in_time(self, other: "Buffer") -> bool:
+        return overlaps(
+            (self.first_use, self.last_use), (other.first_use, other.last_use)
+        )
 
 
 @dataclass
@@ -161,7 +170,7 @@ class CoolingScheduleFromPaper:
             raise StopIteration
         self.i += 1
         return math.exp(
-            (self.log_tau_s - self.log_tau_e) * self.i / self.n + self.log_tau_s
+            (self.log_tau_e - self.log_tau_s) * self.i / self.n + self.log_tau_s
         )
 
 
@@ -172,7 +181,11 @@ class DeterministicHeuristic:
             if isinstance(buffers, BufferList)
             else BufferList.from_buffers(buffers)
         )
-        self.order = self.compute()
+        self.allocations = self.compute()
+        self.order = self.compute_order_from_allocations()
+
+    def compute_order_from_allocations(self) -> list[int]:
+        return sorted(range(len(self.buffers)), key=lambda i: self.allocations[i])
 
     def __call__(self) -> list[int]:
         return self.order
@@ -182,10 +195,6 @@ class DeterministicHeuristic:
 
 
 class FirstFit(DeterministicHeuristic):
-    @staticmethod
-    def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
-        return not (a[1] <= b[0] or a[0] >= b[1])
-
     @staticmethod
     def all_minus(
         intervals: list[tuple[int, int]],
@@ -229,7 +238,7 @@ class FirstFit(DeterministicHeuristic):
             large_gaps = [(0, total_buffer_size)]
 
             for j, other_buffer in enumerate(buffers_sorted[:i]):
-                if not FirstFit.overlaps(
+                if not overlaps(
                     (buffer.first_use, buffer.last_use),
                     (other_buffer.first_use, other_buffer.last_use),
                 ):
@@ -246,7 +255,7 @@ class FirstFit(DeterministicHeuristic):
                 while a < a1:
                     mid = (a + a1) // 2
                     if large_gaps[mid][1] <= allocations[j]:
-                        a = mid
+                        a = mid + 1
                     else:
                         a1 = mid
 
@@ -260,17 +269,18 @@ class FirstFit(DeterministicHeuristic):
                     if large_gaps[mid][0] >= allocations[j] + other_buffer.size:
                         b = mid
                     else:
-                        b1 = mid
+                        b1 = mid + 1
 
-                large_gaps = (
-                    large_gaps[:a]
-                    + FirstFit.all_minus(
-                        large_gaps[a:b],
-                        (allocations[j], allocations[j] + other_buffer.size),
-                        buffer.size,
+                if a < b:
+                    large_gaps = (
+                        large_gaps[:a]
+                        + FirstFit.all_minus(
+                            large_gaps[a:b],
+                            (allocations[j], allocations[j] + other_buffer.size),
+                            buffer.size,
+                        )
+                        + large_gaps[b:]
                     )
-                    + large_gaps[b:]
-                )
 
             allocations[i] = f(large_gaps, buffer.size)
         return list(allocations)
@@ -278,7 +288,7 @@ class FirstFit(DeterministicHeuristic):
     @override
     def compute(self) -> list[int]:
         def allocate_first_fit(large_gaps: list[tuple[int, int]], size: int) -> int:
-            return large_gaps[1][0]
+            return large_gaps[0][0]
 
         return self.allocate_using_large_gaps(allocate_first_fit)
 
@@ -346,23 +356,69 @@ class ImanishiXuAllocator:
             self.random = rnd.Random()
 
     def solve(self):
-        for i, temperature in enumerate(self.schedule):
-            if i % 2 == 0:
-                self.annealing_step_rotate(temperature)
-            else:
-                self.annealing_step_swap(temperature)
+        for temperature in self.schedule:
+            match self.annealing_step_rotate(temperature):
+                case (i, j):
+                    self.annealing_step_swap(i, j)
 
             height = Allocations.from_order(self.buffers, self.order)[0]
             if height < self.best_height:
                 self.best_height = height
                 self.best_order = self.order
 
-    def annealing_step_swap(self, temperature: float):
-        """This is the loop mentioned as Algorithm 5 in the paper."""
-        # TODO - implement this!
+    def annealing_step_swap(self, i: int, j: int):
+        """This is the loop mentioned as Algorithms 5 and 6 in the paper."""
+        _, allocations = Allocations.from_order(self.buffers, self.order)
 
-    def annealing_step_rotate(self, temperature: float):
-        """This is the inner loop of Algorithm 4 from the paper."""
+        assert i != j, (
+            "for a rotation i -> i, we should return None from the rotation method"
+        )
+        assert 0 <= i < len(self.order)
+        assert 0 <= j < len(self.order)
+
+        if i > j:
+            i, j = j, i
+        # Now i < j, and self.order[:i] and self.order[j+1:] are "clean"; that is, there is no k
+        # such that self.order[k] and self.order[k+1] are buffers that *do not overlap* in time, and
+        # have self.order[k] have a higher end point in memory than self.order[k+1]. Because
+        # self.order[i] up to and including self.order[j] changed, we need to examine i-1 <= k <= j
+        # -- except if that would take us outside the bounds of self.order, of course.
+        i -= 1
+
+        # Ensure that both i and j+1 are valid indices.
+        if i < 0:
+            i = 0
+        if j == len(self.order) - 1:
+            j = len(self.order) - 2
+
+        while i <= j:
+            if (
+                not self.buffers[self.order[i]].overlaps_in_time(
+                    self.buffers[self.order[i + 1]]
+                )
+            ) and (
+                allocations.addresses[self.order[i]] + self.buffers[self.order[i]].size
+                > allocations.addresses[self.order[i + 1]]
+                + self.buffers[self.order[i + 1]].size
+            ):
+                # Swap buffers i and i+1. This makes no difference for the quality of the result
+                # *now*, but it makes it easier to rotate to an improved state.
+                self.order[i], self.order[i + 1] = self.order[i + 1], self.order[i]
+
+                # Adjust the bounds of what we need to examine.
+                if i == j and j < len(self.order) - 2:
+                    j += 1
+
+                if i > 0:
+                    i -= 1
+                else:
+                    i = 1
+            else:
+                i += 1
+
+    def annealing_step_rotate(self, temperature: float) -> Optional[tuple[int, int]]:
+        """This is the inner loop of Algorithm 4 from the paper. The return value is (i, j) iff we
+        accepted a rotation inserting entry i into position j."""
         n = len(self.buffers)
         i = self.random.randrange(n)
         buffer = self.buffers[self.order[i]]
@@ -375,7 +431,6 @@ class ImanishiXuAllocator:
         bottom_addresses = np.zeros(n, dtype="int64")
         for j, other_i in enumerate(order_minus_i):
             other_buffer = self.buffers[other_i]
-            print(f"Up sweep: j={j}, other_i={other_i}, other_buffer={other_buffer}")
             # Consider the order that would be given by order_minus_i.insert(j, order[i]). Compute
             # the address where we would allocate buffer i given the order:
             #   order_minus_i[:j] + [order[i]].
@@ -392,7 +447,6 @@ class ImanishiXuAllocator:
         bottom_addresses[n - 1] = np.max(
             bottom_heights[buffer.first_use : buffer.last_use]
         )
-        print(f"Bottom addresses: {bottom_addresses}")
 
         # "Down sweep".
         top_heights = np.zeros(self.buffers.max_time, dtype="int64")
@@ -400,7 +454,6 @@ class ImanishiXuAllocator:
         for j in range(n - 1, 0, -1):
             other_i = order_minus_i[j - 1]
             other_buffer = self.buffers[other_i]
-            print(f"Down sweep: j={j}, other_i={other_i}, other_buffer={other_buffer}")
             # Consider the order that would be given by order_minus_i.insert(j, order[i]). We now
             # compute the address where we would allocate buffer i given the order:
             #   reversed(order_minus_i[j:]) + [order[i]].
@@ -417,7 +470,6 @@ class ImanishiXuAllocator:
                 other_allocation + other_buffer.size
             )
         top_addresses[0] = np.max(top_heights[buffer.first_use : buffer.last_use])
-        print(f"Top addresses: {top_addresses}")
 
         # Actual total heights are the pointwise max of heights_through_buffer with
         # height_order_minus_i, but as the paper explains on page 89, it's better to work with just
@@ -441,12 +493,14 @@ class ImanishiXuAllocator:
 
                 new_height = max(height_through_buffer[j], height_order_minus_i)
                 if new_height < self.best_height:
+                    print(f"new height: {new_height}; best height: {self.best_height}")
                     self.best_height = new_height
                     self.best_order = self.order
 
-                return
+                return (i, j)
 
         # No rotation was accepted.
+        return None
 
 
 if __name__ == "__main__":
@@ -470,5 +524,5 @@ if __name__ == "__main__":
         rnd.seed(0)
         N = 100
         buffers = [Buffer.random(1000000, N) for _ in range(N)]
-        allocator = ImanishiXuAllocator(buffers=buffers)
+        allocator = ImanishiXuAllocator(buffers=buffers, iterations=10000)
         allocator.solve()
