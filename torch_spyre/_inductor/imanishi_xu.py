@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from heapq import heappush, heappop
 import math
 from typing import Iterable, Optional, override, Callable
+from abc import ABC, abstractmethod
 import random as rnd
 import numpy as np
 
@@ -81,6 +82,216 @@ class BufferList:
         return cls(buffers, max_time)
 
 
+class MaxRangeTree(ABC):
+    @abstractmethod
+    def __init__(self, n: int): ...
+
+    @abstractmethod
+    def increase_values(
+        self,
+        left: int,
+        right: int,
+        val: int,
+    ): ...
+
+    @abstractmethod
+    def max(
+        self,
+        left: int,
+        right: int,
+    ) -> int: ...
+
+
+class MaxRangeTree_Array(MaxRangeTree):
+    @override
+    def __init__(self, n: int):
+        self.array = np.zeros(n, dtype="int64")
+
+    @override
+    def increase_values(
+        self,
+        left: int,
+        right: int,
+        val: int,
+    ):
+        self.array[left:right] = val
+
+    @override
+    def max(
+        self,
+        left: int,
+        right: int,
+    ) -> int:
+        return self.array[left:right].max()
+
+
+class MaxRangeTree_List(MaxRangeTree):
+    @override
+    def __init__(self, n: int):
+        self.list = [0] * n
+
+    @override
+    def increase_values(
+        self,
+        left: int,
+        right: int,
+        val: int,
+    ):
+        self.list[left:right] = [val] * (right - left)
+
+    @override
+    def max(
+        self,
+        left: int,
+        right: int,
+    ) -> int:
+        return max(self.list[left:right])
+
+
+class MaxRangeTree_Tree(MaxRangeTree):
+    """Data structure representing an array A of integers that allows one to quickly compute the
+    maximum of a subarray, and to set a subarray to a constant value *higher than its current
+    value*. In the public interface, indexing works as you'd expect in python:
+
+    ```
+    t = MaxRangeTree(n)
+    # (...)
+    t.max(l, r) # returns the max of A[l:r] for 0 <= l < r <= n
+    t.increase_values(l, r, val) # corresponds to setting A[l:r] = val, assuming t.max(l, r) <= val
+    ```
+
+    Internally, self.tree[1] is the root of the tree; self.tree[2*i] and self.tree[2*i+1] are the
+    children of node i. self.tree[0] is not used. This means that node i corresponds to  If
+    self.lazy[i] is not None, then the whole segment under node i is set to self.lazy[i]. If *all of
+    self.lazy[i]'s parents* (but not necessarily self.lazy[i] itself) are None, then self.tree[i] is
+    the max of the corresponding segment.
+
+    This data structure is actually slower than the other two, but if we need something like this,
+    we should implement it in C++. (It is actually a significant use of time, even with the other
+    two versions.)
+    """
+
+    @override
+    def __init__(self, n: int):
+        """Initialize the data structure representing an array of n zeroes. We need n > 0."""
+        assert n > 0
+        self.n = n
+        self.log_n = (n - 1).bit_length()
+        # Round n up to a power of two, then double it, then add 1. This ensures that a full level
+        # of the tree is filled, and that every node's children are allocated. This simplifies the
+        # code below.
+        list_length = 1 + 1 << (1 + (n - 1).bit_length())
+        self.tree: list[int] = [0] * list_length
+        self.lazy: list[Optional[int]] = [None] * list_length
+
+    def _push_down(self, node: int):
+        """If the given node is lazy, push its laziness down to its children."""
+        if self.lazy[node] is not None:
+            for child in (2 * node, 2 * node + 1):
+                self.tree[child] = self.lazy[node]  # type: ignore[assignment]
+                self.lazy[child] = self.lazy[node]
+            self.lazy[node] = None
+
+    @override
+    def max(
+        self,
+        left: int,
+        right: int,
+    ) -> int:
+        result = -1
+        stack: list[tuple[int, int, int, int]] = []
+        node, lo, hi, log_k = 1, 0, self.n, self.log_n
+
+        while True:
+            # Base case 1: A[lo:hi] does not overlap with A[left:right].
+            if right <= lo or hi <= left:
+                if not stack:
+                    return result
+                node, lo, hi, log_k = stack.pop()
+                continue
+
+            # Base case 2: A[left:right] is contained in A[lo:hi].
+            if left <= lo and hi <= right:
+                if result < self.tree[node]:
+                    result = self.tree[node]
+
+                if not stack:
+                    return result
+                node, lo, hi, log_k = stack.pop()
+                continue
+
+            # "Recursive" case: partial overlap with the current node.
+            self._push_down(node)
+            log_k -= 1
+            mid = lo + (1 << log_k)
+            if mid <= hi:
+                # Two branches to explore. Push the left child to the stack to visit later.
+                stack.append((2 * node, lo, mid, log_k))
+
+                # Immediately traverse down the left child.
+                node, lo = 2 * node + 1, mid
+
+            else:
+                # Only one branch to explore -- the left one.
+                node, hi = 2 * node, mid
+
+    @override
+    def increase_values(
+        self,
+        left: int,
+        right: int,
+        val: int,
+    ):
+        """If only left, right, and val are passed, set A[left:right] = val. This *requires* that
+        max(A[left:right]) <= val. Otherwise, incorrect results may be obtained.
+
+        Otherwise, all arguments should be passed. Then, this method sets A on the intersection
+        between left:right and lo:hi. `node` is the node representing A[lo:hi], and no parent of
+        node is lazy. There is m such that lo == m * 2**log_k and hi <= (m+1) * 2**log_k."""
+        stack: list[tuple[int, int, int, int]] = []
+        update_stack = []
+        node, lo, hi, log_k = 1, 0, self.n, self.log_n
+        while True:
+            # Base case 1: A[lo:hi] does not overlap with A[left:right].
+            if right <= lo or hi <= left:
+                if not stack:
+                    break
+                node, lo, hi, log_k = stack.pop()
+                continue
+
+            # Base case 2: A[left:right] is contained in A[lo:hi].
+            if left <= lo and hi <= right:
+                self.tree[node] = val
+                self.lazy[node] = val
+
+                if not stack:
+                    break
+                node, lo, hi, log_k = stack.pop()
+                continue
+
+            # "Recursive" case: partial overlap with the current node.
+            self._push_down(node)
+
+            # Record this node for updating on the way up.
+            update_stack.append(node)
+
+            log_k -= 1
+            mid = lo + (1 << log_k)
+            if mid <= hi:
+                # Two branches to explore. Push the left child to the stack to visit later.
+                stack.append((2 * node, lo, mid, log_k))
+
+                # Immediately traverse down the left child.
+                node, lo = 2 * node + 1, mid
+
+            else:
+                # Only one branch to explore -- the left one.
+                node, hi = 2 * node, mid
+
+        for node in reversed(update_stack):
+            self.tree[node] = max(self.tree[2 * node], self.tree[2 * node + 1])
+
+
 @dataclass
 class Allocations:
     buffers: BufferList
@@ -103,19 +314,17 @@ class Allocations:
             )
 
         # height[i] is the max height of all currently allocated blocks at time i.
-        #
-        # NOTE: The operations on 'height' are "max of a sub-array" and "set a sub-array to a
-        # constant value". There are specialized data structures for that, I think, but I doubt that
-        # they will be worth it. But an ndarray should be faster than a list.
-        height = np.zeros(buffers.max_time, dtype="int64")
-        addresses = np.zeros(n, dtype="int64")
+        height = MaxRangeTree_List(n)
+        addresses = [0] * n
         for j in order:
             buffer = buffers[j]
             # Allocate buffer on top of currently allocated blocks.
-            addresses[j] = np.max(height[buffer.first_use : buffer.last_use])
-            height[buffer.first_use : buffer.last_use] = addresses[j] + buffer.size
+            addresses[j] = height.max(buffer.first_use, buffer.last_use)
+            height.increase_values(
+                buffer.first_use, buffer.last_use, addresses[j] + buffer.size
+            )
 
-        return np.max(height), cls(buffers, list(addresses))
+        return height.max(0, n), cls(buffers, list(addresses))
 
 
 class ExponentialCoolingSchedule:
@@ -230,7 +439,7 @@ class FirstFit(DeterministicHeuristic):
         total_buffer_size = sum(b.size for b in buffers_sorted)
         # We should use an interval tree here to keep track of at what time each allocated buffer is
         # alive.
-        allocations = np.zeros(len(buffers_sorted), dtype="int64")
+        allocations = [0] * len(buffers_sorted)
 
         for i, buffer in enumerate(buffers_sorted):
             # A list of pairs (a, b) such that b - a >= buffer.size and gaps[i][1] < gaps[i+1][0],
@@ -316,8 +525,6 @@ class ImanishiXuAllocator:
         iterations: int = 1000000,
         random: Optional[rnd.Random] = None,
     ):
-        """Implement later: good initial permutation (the paper suggests obtaining it from
-        first-fit)."""
         self.buffers = (
             buffers
             if isinstance(buffers, BufferList)
@@ -427,30 +634,30 @@ class ImanishiXuAllocator:
         height_order_minus_i = Allocations.from_order(self.buffers, order_minus_i)[0]
 
         # "Up sweep".
-        bottom_heights = np.zeros(self.buffers.max_time, dtype="int64")
-        bottom_addresses = np.zeros(n, dtype="int64")
+        bottom_heights = [0] * self.buffers.max_time
+        bottom_addresses = [0] * n
         for j, other_i in enumerate(order_minus_i):
             other_buffer = self.buffers[other_i]
             # Consider the order that would be given by order_minus_i.insert(j, order[i]). Compute
             # the address where we would allocate buffer i given the order:
             #   order_minus_i[:j] + [order[i]].
-            bottom_addresses[j] = np.max(
+            bottom_addresses[j] = max(
                 bottom_heights[buffer.first_use : buffer.last_use]
             )
             # For the next iteration, plan to allocate other_buffer next.
-            other_allocation = np.max(
+            other_allocation = max(
                 bottom_heights[other_buffer.first_use : other_buffer.last_use]
             )
-            bottom_heights[other_buffer.first_use : other_buffer.last_use] = (
+            bottom_heights[other_buffer.first_use : other_buffer.last_use] = [
                 other_allocation + other_buffer.size
-            )
-        bottom_addresses[n - 1] = np.max(
+            ] * (other_buffer.last_use - other_buffer.first_use)
+        bottom_addresses[n - 1] = max(
             bottom_heights[buffer.first_use : buffer.last_use]
         )
 
         # "Down sweep".
-        top_heights = np.zeros(self.buffers.max_time, dtype="int64")
-        top_addresses = np.zeros(n, dtype="int64")
+        top_heights = [0] * self.buffers.max_time
+        top_addresses = [0] * n
         for j in range(n - 1, 0, -1):
             other_i = order_minus_i[j - 1]
             other_buffer = self.buffers[other_i]
@@ -460,21 +667,23 @@ class ImanishiXuAllocator:
             # Imagine this allocation "upside down", hanging from the ceiling. We can obtain the
             # full height of the allocation order_minus_i.insert(j, order[i]) as
             #   max(height_order_minus_i, bottom_heights[j] + top_heights[j] + buffer.size).
-            top_addresses[j] = np.max(top_heights[buffer.first_use : buffer.last_use])
+            top_addresses[j] = max(top_heights[buffer.first_use : buffer.last_use])
 
             # For the next iteration, plan to allocate other_buffer next.
-            other_allocation = np.max(
+            other_allocation = max(
                 top_heights[other_buffer.first_use : other_buffer.last_use]
             )
-            top_heights[other_buffer.first_use : other_buffer.last_use] = (
+            top_heights[other_buffer.first_use : other_buffer.last_use] = [
                 other_allocation + other_buffer.size
-            )
+            ] * (other_buffer.last_use - other_buffer.first_use)
         top_addresses[0] = np.max(top_heights[buffer.first_use : buffer.last_use])
 
         # Actual total heights are the pointwise max of heights_through_buffer with
         # height_order_minus_i, but as the paper explains on page 89, it's better to work with just
         # heights_through_buffer.
-        height_through_buffer = bottom_addresses + top_addresses + buffer.size
+        height_through_buffer = [
+            ba + ta + buffer.size for ba, ta in zip(bottom_addresses, top_addresses)
+        ]
 
         # The paper does not explain how they select a rotation if multiple rotations are accepted.
         # We implement this by sorting the insertion points descending by improvement and choosing
@@ -493,7 +702,6 @@ class ImanishiXuAllocator:
 
                 new_height = max(height_through_buffer[j], height_order_minus_i)
                 if new_height < self.best_height:
-                    print(f"new height: {new_height}; best height: {self.best_height}")
                     self.best_height = new_height
                     self.best_order = self.order
 
@@ -521,8 +729,17 @@ if __name__ == "__main__":
         allocator.annealing_step_rotate()
 
     else:
-        rnd.seed(0)
-        N = 100
-        buffers = [Buffer.random(1000000, N) for _ in range(N)]
-        allocator = ImanishiXuAllocator(buffers=buffers, iterations=10000)
+        random = rnd.Random()
+        random.seed(0)
+        N = 100  # Number of buffers and also time range
+        buffers = [Buffer.random(1000000, N, random) for _ in range(N)]
+        random_height = Allocations.from_order(
+            BufferList.from_buffers(buffers), list(range(N))
+        )[0]
+        print(f"Random arrangement: {random_height}")
+        allocator = ImanishiXuAllocator(
+            buffers=buffers, iterations=10000, random=random, order="best_fit"
+        )
+        print(f"Initial arrangement: {allocator.best_height}")
         allocator.solve()
+        print(f"Final arrangement: {allocator.best_height}")
