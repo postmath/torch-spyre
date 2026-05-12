@@ -312,9 +312,10 @@ class Allocations:
             raise ValueError(
                 f"Expected len(buffers) >= len(order), but got {n} < {len(order)}"
             )
+        max_time = buffers.max_time
 
         # height[i] is the max height of all currently allocated blocks at time i.
-        height = MaxRangeTree_List(n)
+        height = MaxRangeTree_List(max_time)
         addresses = [0] * n
         for j in order:
             buffer = buffers[j]
@@ -324,13 +325,13 @@ class Allocations:
                 buffer.first_use, buffer.last_use, addresses[j] + buffer.size
             )
 
-        return height.max(0, n), cls(buffers, list(addresses))
+        return height.max(0, max_time), cls(buffers, list(addresses))
 
 
 class ExponentialCoolingSchedule:
-    def __init__(self, *, t0: float, alpha: float, steps_per_epoch: int, epochs: int):
+    def __init__(self, *, t0: float, t_end: float, steps_per_epoch: int, epochs: int):
         self.t = t0
-        self.alpha = alpha
+        self.alpha = (t_end / t0) ** (1 / epochs)
         self.steps_per_epoch = steps_per_epoch
         self.epochs = epochs
         self.i = 0
@@ -524,6 +525,7 @@ class ImanishiXuAllocator:
         schedule: Iterable[float] | str = "from_paper",
         iterations: int = 1000000,
         random: Optional[rnd.Random] = None,
+        ordering_fuzz_factor: float = 1.0,
     ):
         self.buffers = (
             buffers
@@ -547,7 +549,7 @@ class ImanishiXuAllocator:
                 root = int(math.sqrt(iterations))
                 schedule = ExponentialCoolingSchedule(
                     t0=max(b.size for b in self.buffers._list) * 10,
-                    alpha=math.exp(-math.log(50) / root),
+                    t_end=min(b.size for b in self.buffers._list) / 10,
                     steps_per_epoch=root,
                     epochs=root,
                 )
@@ -561,6 +563,8 @@ class ImanishiXuAllocator:
             self.random = random
         else:
             self.random = rnd.Random()
+
+        self.ordering_fuzz_factor = ordering_fuzz_factor
 
     def solve(self):
         for temperature in self.schedule:
@@ -686,10 +690,17 @@ class ImanishiXuAllocator:
         ]
 
         # The paper does not explain how they select a rotation if multiple rotations are accepted.
-        # We implement this by sorting the insertion points descending by improvement and choosing
-        # the first accepted improvement. (An alternative might be to choose an insertion point
-        # among the accepted ones by softmax of the improvement.)
-        insertion_points = sorted(range(n), key=lambda j: -height_through_buffer[j])
+        # We implement this by sorting the insertion points descending by improvement plus a random
+        # number scaled by the temperature, and then choosing the first accepted improvement. (An
+        # alternative might be to choose an insertion point among the accepted ones by softmax of
+        # the improvement.)
+        insertion_points = sorted(
+            range(n),
+            key=lambda j: (
+                -height_through_buffer[j]
+                + self.random.random() * temperature * self.ordering_fuzz_factor
+            ),
+        )
 
         for j in insertion_points:
             if j == i:
@@ -728,7 +739,7 @@ if __name__ == "__main__":
         allocator = ImanishiXuAllocator(buffers=bl, order=order, schedule=schedule)
         allocator.annealing_step_rotate()
 
-    else:
+    elif False:
         random = rnd.Random()
         random.seed(0)
         N = 100  # Number of buffers and also time range
@@ -743,3 +754,55 @@ if __name__ == "__main__":
         print(f"Initial arrangement: {allocator.best_height}")
         allocator.solve()
         print(f"Final arrangement: {allocator.best_height}")
+
+    else:
+        random = rnd.Random()
+        random.seed(0)
+
+        buffers = [
+            Buffer(60, 0, 3),  # A: 0
+            Buffer(30, 1, 5),  # B: 1
+            Buffer(30, 2, 14),  # C: 2
+            Buffer(30, 3, 5),  # D: 3
+            Buffer(30, 4, 6),  # E: 4
+            Buffer(60, 5, 7),  # F: 5
+            Buffer(30, 6, 16),  # G: 6
+            Buffer(30, 7, 9),  # H: 7
+            Buffer(30, 8, 11),  # I: 8
+            Buffer(15, 9, 17),  # J: 9
+            Buffer(15, 10, 13),  # K: 10
+            Buffer(15, 11, 13),  # L: 11
+            Buffer(15, 12, 14),  # M: 12
+            Buffer(30, 13, 18),  # N: 13
+            Buffer(45, 14, 18),  # O: 14
+            Buffer(15, 15, 20),  # J': 15
+            Buffer(30, 16, 18),  # G': 16
+            Buffer(30, 17, 20),  # P: 17 (may be in-place)
+            Buffer(75, 18, 20),  # Q: 18
+        ]
+
+        if False:
+            # Original - no in-place: 150
+            pass
+        elif False:
+            # P is in-place from G': 135
+            buffers[16] = Buffer(30, 16, 20)
+            del buffers[17]
+        else:
+            # P is in-place from N
+            buffers[13] = Buffer(30, 13, 20)
+            del buffers[17]
+
+        for n in range(10):
+            allocator = ImanishiXuAllocator(
+                buffers=buffers,
+                iterations=100000,
+                random=random,
+                order="first_fit",
+                schedule=ExponentialCoolingSchedule(
+                    t0=300, t_end=0.2, steps_per_epoch=100, epochs=1000
+                ),
+                ordering_fuzz_factor=30.0,
+            )
+            allocator.solve()
+            print(f"Final arrangement: {allocator.best_height}")
