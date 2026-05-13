@@ -565,6 +565,7 @@ class ImanishiXuAllocator:
             self.random = rnd.Random()
 
         self.ordering_fuzz_factor = ordering_fuzz_factor
+        self.height_log: list[int] = []
 
     def solve(self):
         for temperature in self.schedule:
@@ -573,6 +574,7 @@ class ImanishiXuAllocator:
                     self.annealing_step_swap(i, j)
 
             height = Allocations.from_order(self.buffers, self.order)[0]
+            self.height_log.append(height)
             if height < self.best_height:
                 self.best_height = height
                 self.best_order = self.order
@@ -768,41 +770,72 @@ if __name__ == "__main__":
             Buffer(60, 5, 7),  # F: 5
             Buffer(30, 6, 16),  # G: 6
             Buffer(30, 7, 9),  # H: 7
-            Buffer(30, 8, 11),  # I: 8
+            Buffer(30, 8, 10),  # I: 8
             Buffer(15, 9, 17),  # J: 9
             Buffer(15, 10, 13),  # K: 10
             Buffer(15, 11, 13),  # L: 11
             Buffer(15, 12, 14),  # M: 12
-            Buffer(30, 13, 18),  # N: 13
-            Buffer(45, 14, 18),  # O: 14
-            Buffer(15, 15, 20),  # J': 15
-            Buffer(30, 16, 18),  # G': 16
-            Buffer(30, 17, 20),  # P: 17 (may be in-place)
-            Buffer(75, 18, 20),  # Q: 18
+            Buffer(30, 13, 16),  # N: 13
+            Buffer(45, 14, 16),  # O: 14
+            Buffer(30, 15, 17),  # P: 15 (in-place)
+            Buffer(75, 16, 18),  # Q: 16
         ]
 
         if False:
             # Original - no in-place: 150
             pass
         elif False:
-            # P is in-place from G': 135
-            buffers[16] = Buffer(30, 16, 20)
-            del buffers[17]
+            # P is in-place from G: 120
+            buffers[6] = Buffer(30, 6, 17)
+            del buffers[15]
         else:
-            # P is in-place from N
-            buffers[13] = Buffer(30, 13, 20)
-            del buffers[17]
+            # P is in-place from N: 135
+            buffers[13] = Buffer(30, 13, 17)
+            del buffers[15]
 
-        for n in range(10):
+        def schedule() -> Iterable[float]:
+            return ExponentialCoolingSchedule(
+                t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=250
+            )
+
+        logs = []
+        from collections import Counter
+
+        results: Counter[int] = Counter()
+
+        import time
+
+        N = 500
+        start = time.perf_counter()
+        for n in range(N):
             allocator = ImanishiXuAllocator(
                 buffers=buffers,
-                iterations=100000,
+                # iterations=100000,
                 random=random,
                 order="first_fit",
-                schedule=ExponentialCoolingSchedule(
-                    t0=300, t_end=0.2, steps_per_epoch=100, epochs=1000
-                ),
-                ordering_fuzz_factor=30.0,
+                schedule=schedule(),  # type: ignore[has-type]
+                ordering_fuzz_factor=1000.0,
             )
             allocator.solve()
-            print(f"Final arrangement: {allocator.best_height}")
+            logs.append(allocator.height_log)
+            results[allocator.best_height] += 1
+            # print(f"Final arrangement: {allocator.best_height}")
+        end = time.perf_counter()
+        print(f"Time per iteration: {(end - start) / N}")
+        print(f"Results: {results}")
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax1 = plt.subplots()
+            for log in logs:
+                ax1.plot(log, lw=1, alpha=0.25)
+
+            ax2 = ax1.twinx()
+            ax2.set_yscale("log")
+            ax2.plot([t for t in schedule()])  # type: ignore[has-type]
+
+            fig.savefig("plot.png", dpi=300)
+
+        except ImportError:
+            print("Not creating plot (matplotlib not installed)")
