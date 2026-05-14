@@ -21,10 +21,11 @@
 from dataclasses import dataclass
 from heapq import heappush, heappop
 import math
-from typing import Iterable, Optional, override, Callable
+from typing import Iterable, Iterator, Optional, override, Callable
 from abc import ABC, abstractmethod
 import random as rnd
 import numpy as np
+import copy
 
 
 def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
@@ -33,6 +34,7 @@ def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
 
 @dataclass
 class Buffer:
+    name: str
     size: int
     # The buffer is allocated from tick first_use up to, but not including, last_use.
     first_use: int
@@ -45,19 +47,27 @@ class Buffer:
 
     @classmethod
     def random(
-        cls, size_range: int, time_range: int, random: Optional[rnd.Random] = None
+        cls, name, size_range: int, time_range: int, random: Optional[rnd.Random] = None
     ) -> "Buffer":
         if random is None:
             random = rnd.Random()
 
-        duration = random.randrange(time_range - 1)
-        duration = (
-            duration * duration // (time_range - 1)
-        )  # Bias towards smaller time ranges
+        duration = random.randrange((time_range - 1) // 2)
+        # Bias towards smaller time ranges:
+        duration = duration * duration // (time_range - 1)
         t_start = random.randrange(time_range - duration)
         t_end = t_start + duration + 1
 
-        return cls(size=random.randrange(size_range), first_use=t_start, last_use=t_end)
+        size = random.randrange(size_range)
+        # Bias towards larger sizes:
+        size = math.isqrt(size * size_range)
+
+        return cls(
+            name=name,
+            size=size,
+            first_use=t_start,
+            last_use=t_end,
+        )
 
     def overlaps_in_time(self, other: "Buffer") -> bool:
         return overlaps(
@@ -75,6 +85,9 @@ class BufferList:
 
     def __getitem__(self, i: int) -> Buffer:
         return self._list[i]
+
+    def __iter__(self) -> Iterator[Buffer]:
+        return iter(self._list)
 
     @classmethod
     def from_buffers(cls, buffers: list[Buffer]) -> "BufferList":
@@ -327,8 +340,48 @@ class Allocations:
 
         return height.max(0, max_time), cls(buffers, list(addresses))
 
+    def to_order(self) -> list[int]:
+        return sorted(range(len(self.buffers)), key=lambda i: self.addresses[i])
 
-class ExponentialCoolingSchedule:
+    def plot(self, max_height=None):
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+
+        fig, ax = plt.subplots()
+
+        for i, buffer in enumerate(self.buffers):
+            rect = patches.Rectangle(
+                xy=(buffer.first_use, self.addresses[i]),
+                width=buffer.last_use - buffer.first_use,
+                height=buffer.size,
+                linewidth=0.3,
+                edgecolor="r",
+                facecolor="b",
+                fill=True,
+            )
+
+            ax.add_patch(rect)
+
+        ax.set_xlim(0, self.buffers.max_time)
+        if max_height is None:
+            max_height = max(
+                [self.addresses[i] + b.size for i, b in enumerate(self.buffers)]
+            )
+        ax.set_ylim(0, max_height)
+
+        return fig
+
+
+class CoolingSchedule(ABC):
+    def __iter__(self) -> "CoolingSchedule":
+        """We need iter() to return a *new* copy of the schedule."""
+        return copy.deepcopy(self)
+
+    @abstractmethod
+    def __next__(self) -> float: ...
+
+
+class ExponentialCoolingSchedule(CoolingSchedule):
     def __init__(self, *, t0: float, t_end: float, steps_per_epoch: int, epochs: int):
         self.t = t0
         self.alpha = (t_end / t0) ** (1 / epochs)
@@ -336,9 +389,7 @@ class ExponentialCoolingSchedule:
         self.epochs = epochs
         self.i = 0
 
-    def __iter__(self) -> "ExponentialCoolingSchedule":
-        return self
-
+    @override
     def __next__(self) -> float:
         self.i += 1
         if self.i % self.steps_per_epoch == 0:
@@ -348,7 +399,7 @@ class ExponentialCoolingSchedule:
         return self.t
 
 
-class CoolingScheduleFromPaper:
+class CoolingScheduleFromPaper(CoolingSchedule):
     def __init__(self, *, buffers: BufferList, n: int = 1000000):
         buffers_sorted = sorted(buffers._list, key=lambda b: b.first_use)
         current_load = 0
@@ -372,9 +423,7 @@ class CoolingScheduleFromPaper:
         self.i = 0
         self.n = n
 
-    def __iter__(self) -> "CoolingScheduleFromPaper":
-        return self
-
+    @override
     def __next__(self) -> float:
         if self.i >= self.n:
             raise StopIteration
@@ -391,11 +440,9 @@ class DeterministicHeuristic:
             if isinstance(buffers, BufferList)
             else BufferList.from_buffers(buffers)
         )
-        self.allocations = self.compute()
-        self.order = self.compute_order_from_allocations()
-
-    def compute_order_from_allocations(self) -> list[int]:
-        return sorted(range(len(self.buffers)), key=lambda i: self.allocations[i])
+        self.addresses = self.compute()
+        allocations = Allocations(self.buffers, self.addresses)
+        self.order = allocations.to_order()
 
     def __call__(self) -> list[int]:
         return self.order
@@ -526,6 +573,7 @@ class ImanishiXuAllocator:
         iterations: int = 1000000,
         random: Optional[rnd.Random] = None,
         ordering_fuzz_factor: float = 1.0,
+        starts: int = 1,
     ):
         self.buffers = (
             buffers
@@ -565,19 +613,29 @@ class ImanishiXuAllocator:
             self.random = rnd.Random()
 
         self.ordering_fuzz_factor = ordering_fuzz_factor
-        self.height_log: list[int] = []
+        self.height_logs: list[list[int]] = []
+        self.starts = starts
 
     def solve(self):
-        for temperature in self.schedule:
+        saved_order = copy.copy(self.order)
+        for _ in range(self.starts):
+            self.order = copy.copy(saved_order)
+            self.anneal()
+
+    def anneal(self):
+        height_log = []
+        for temperature in iter(self.schedule):
             match self.annealing_step_rotate(temperature):
                 case (i, j):
                     self.annealing_step_swap(i, j)
 
             height = Allocations.from_order(self.buffers, self.order)[0]
-            self.height_log.append(height)
+            height_log.append(height)
             if height < self.best_height:
                 self.best_height = height
                 self.best_order = self.order
+
+        self.height_logs.append(height_log)
 
     def annealing_step_swap(self, i: int, j: int):
         """This is the loop mentioned as Algorithms 5 and 6 in the paper."""
@@ -723,39 +781,69 @@ class ImanishiXuAllocator:
         # No rotation was accepted.
         return None
 
+    def height_temperature_plot(self):
+        import matplotlib.pyplot as plt
+
+        fig, ax1 = plt.subplots()
+        for log in self.height_logs:
+            ax1.plot(log, lw=1, alpha=0.25)
+
+        ax2 = ax1.twinx()
+        ax2.set_yscale("log")
+        ax2.plot([t for t in iter(self.schedule)])  # type: ignore[has-type]
+
+        return fig
+
+    def plot(self, max_height=None):
+        _, allocation = Allocations.from_order(self.buffers, self.order)
+        return allocation.plot(max_height=max_height)
+
 
 if __name__ == "__main__":
     if False:
         buffers = [
-            Buffer(1, 0, 2),
-            Buffer(3, 0, 2),
-            Buffer(4, 2, 3),
-            Buffer(5, 0, 1),
-            Buffer(3, 1, 4),
+            Buffer("A", 1, 0, 2),
+            Buffer("B", 3, 0, 2),
+            Buffer("C", 4, 2, 3),
+            Buffer("D", 5, 0, 1),
+            Buffer("E", 3, 1, 4),
         ]
         bl = BufferList.from_buffers(buffers)
         order = [0, 2, 3, 1, 4]
         schedule = ExponentialCoolingSchedule(
-            t0=10.0, alpha=0.8, steps_per_epoch=10, epochs=10
+            t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=10
         )
         allocator = ImanishiXuAllocator(buffers=bl, order=order, schedule=schedule)
-        allocator.annealing_step_rotate()
+        allocator.annealing_step_rotate(next(schedule))
 
-    elif False:
+    elif True:
         random = rnd.Random()
         random.seed(0)
         N = 100  # Number of buffers and also time range
-        buffers = [Buffer.random(1000000, N, random) for _ in range(N)]
+        buffers = [Buffer.random(f"B_{i}", 1000000, N, random) for i in range(N)]
         random_height = Allocations.from_order(
             BufferList.from_buffers(buffers), list(range(N))
         )[0]
         print(f"Random arrangement: {random_height}")
         allocator = ImanishiXuAllocator(
-            buffers=buffers, iterations=10000, random=random, order="best_fit"
+            buffers=buffers,
+            schedule=ExponentialCoolingSchedule(
+                t0=1000000.0, t_end=1000.0, steps_per_epoch=10, epochs=1000
+            ),
+            random=random,
+            order="first_fit",
+            ordering_fuzz_factor=1000.0,
         )
         print(f"Initial arrangement: {allocator.best_height}")
         allocator.solve()
         print(f"Final arrangement: {allocator.best_height}")
+
+        try:
+            fig = allocator.plot()
+            fig.savefig("plot.png", dpi=300)
+
+        except ImportError:
+            print("Not creating plot (matplotlib not installed)")
 
     else:
         random = rnd.Random()
