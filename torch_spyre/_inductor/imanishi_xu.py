@@ -43,7 +43,7 @@ class Buffer:
     def __post_init__(self):
         # The original paper doesn't require this, so that it can support cyclic/periodic
         # allocations. We could relatively easily extend the code to allow for this.
-        assert self.last_use > self.first_use
+        assert self.last_use >= self.first_use
 
     @classmethod
     def random(
@@ -71,7 +71,7 @@ class Buffer:
 
     def overlaps_in_time(self, other: "Buffer") -> bool:
         return overlaps(
-            (self.first_use, self.last_use), (other.first_use, other.last_use)
+            (self.first_use, self.last_use + 1), (other.first_use, other.last_use + 1)
         )
 
 
@@ -97,7 +97,9 @@ class BufferList:
 
 class MaxRangeTree(ABC):
     @abstractmethod
-    def __init__(self, n: int): ...
+    def __init__(self, n: int):
+        """Create an instance representing an array, say A, of length n."""
+        ...
 
     @abstractmethod
     def increase_values(
@@ -105,14 +107,18 @@ class MaxRangeTree(ABC):
         left: int,
         right: int,
         val: int,
-    ): ...
+    ):
+        """Increase A[left:right] to val. Precondition: max(A[left:right]) <= val."""
+        ...
 
     @abstractmethod
     def max(
         self,
         left: int,
         right: int,
-    ) -> int: ...
+    ) -> int:
+        """Return the maximum of A[left:right]."""
+        ...
 
 
 class MaxRangeTree_Array(MaxRangeTree):
@@ -328,17 +334,17 @@ class Allocations:
         max_time = buffers.max_time
 
         # height[i] is the max height of all currently allocated blocks at time i.
-        height = MaxRangeTree_List(max_time)
+        height = MaxRangeTree_List(max_time + 1)
         addresses = [0] * n
         for j in order:
             buffer = buffers[j]
             # Allocate buffer on top of currently allocated blocks.
-            addresses[j] = height.max(buffer.first_use, buffer.last_use)
+            addresses[j] = height.max(buffer.first_use, buffer.last_use + 1)
             height.increase_values(
-                buffer.first_use, buffer.last_use, addresses[j] + buffer.size
+                buffer.first_use, buffer.last_use + 1, addresses[j] + buffer.size
             )
 
-        return height.max(0, max_time), cls(buffers, list(addresses))
+        return height.max(0, max_time + 1), cls(buffers, list(addresses))
 
     def to_order(self) -> list[int]:
         return sorted(range(len(self.buffers)), key=lambda i: self.addresses[i])
@@ -352,7 +358,7 @@ class Allocations:
         for i, buffer in enumerate(self.buffers):
             rect = patches.Rectangle(
                 xy=(buffer.first_use, self.addresses[i]),
-                width=buffer.last_use - buffer.first_use,
+                width=buffer.last_use - buffer.first_use + 1,
                 height=buffer.size,
                 linewidth=0.3,
                 edgecolor="r",
@@ -362,7 +368,7 @@ class Allocations:
 
             ax.add_patch(rect)
 
-        ax.set_xlim(0, self.buffers.max_time)
+        ax.set_xlim(0, self.buffers.max_time + 1)
         if max_height is None:
             max_height = max(
                 [self.addresses[i] + b.size for i, b in enumerate(self.buffers)]
@@ -408,7 +414,7 @@ class CoolingScheduleFromPaper(CoolingSchedule):
         # ordered by last_use.
         end_points: list[tuple[int, int]] = []
         for buffer in buffers_sorted:
-            while end_points and end_points[0][0] <= buffer.first_use:
+            while end_points and end_points[0][0] < buffer.first_use:
                 current_load -= heappop(end_points)[1]
 
             current_load += buffer.size
@@ -496,8 +502,8 @@ class FirstFit(DeterministicHeuristic):
 
             for j, other_buffer in enumerate(buffers_sorted[:i]):
                 if not overlaps(
-                    (buffer.first_use, buffer.last_use),
-                    (other_buffer.first_use, other_buffer.last_use),
+                    (buffer.first_use, buffer.last_use + 1),
+                    (other_buffer.first_use, other_buffer.last_use + 1),
                 ):
                     continue
 
@@ -698,7 +704,7 @@ class ImanishiXuAllocator:
         height_order_minus_i = Allocations.from_order(self.buffers, order_minus_i)[0]
 
         # "Up sweep".
-        bottom_heights = [0] * self.buffers.max_time
+        bottom_heights = [0] * (self.buffers.max_time + 1)
         bottom_addresses = [0] * n
         for j, other_i in enumerate(order_minus_i):
             other_buffer = self.buffers[other_i]
@@ -706,21 +712,21 @@ class ImanishiXuAllocator:
             # the address where we would allocate buffer i given the order:
             #   order_minus_i[:j] + [order[i]].
             bottom_addresses[j] = max(
-                bottom_heights[buffer.first_use : buffer.last_use]
+                bottom_heights[buffer.first_use : buffer.last_use + 1]
             )
             # For the next iteration, plan to allocate other_buffer next.
             other_allocation = max(
-                bottom_heights[other_buffer.first_use : other_buffer.last_use]
+                bottom_heights[other_buffer.first_use : other_buffer.last_use + 1]
             )
-            bottom_heights[other_buffer.first_use : other_buffer.last_use] = [
+            bottom_heights[other_buffer.first_use : other_buffer.last_use + 1] = [
                 other_allocation + other_buffer.size
-            ] * (other_buffer.last_use - other_buffer.first_use)
+            ] * (other_buffer.last_use + 1 - other_buffer.first_use)
         bottom_addresses[n - 1] = max(
-            bottom_heights[buffer.first_use : buffer.last_use]
+            bottom_heights[buffer.first_use : buffer.last_use + 1]
         )
 
         # "Down sweep".
-        top_heights = [0] * self.buffers.max_time
+        top_heights = [0] * (self.buffers.max_time + 1)
         top_addresses = [0] * n
         for j in range(n - 1, 0, -1):
             other_i = order_minus_i[j - 1]
@@ -731,16 +737,16 @@ class ImanishiXuAllocator:
             # Imagine this allocation "upside down", hanging from the ceiling. We can obtain the
             # full height of the allocation order_minus_i.insert(j, order[i]) as
             #   max(height_order_minus_i, bottom_heights[j] + top_heights[j] + buffer.size).
-            top_addresses[j] = max(top_heights[buffer.first_use : buffer.last_use])
+            top_addresses[j] = max(top_heights[buffer.first_use : buffer.last_use + 1])
 
             # For the next iteration, plan to allocate other_buffer next.
             other_allocation = max(
-                top_heights[other_buffer.first_use : other_buffer.last_use]
+                top_heights[other_buffer.first_use : other_buffer.last_use + 1]
             )
-            top_heights[other_buffer.first_use : other_buffer.last_use] = [
+            top_heights[other_buffer.first_use : other_buffer.last_use + 1] = [
                 other_allocation + other_buffer.size
-            ] * (other_buffer.last_use - other_buffer.first_use)
-        top_addresses[0] = np.max(top_heights[buffer.first_use : buffer.last_use])
+            ] * (other_buffer.last_use + 1 - other_buffer.first_use)
+        top_addresses[0] = np.max(top_heights[buffer.first_use : buffer.last_use + 1])
 
         # Actual total heights are the pointwise max of heights_through_buffer with
         # height_order_minus_i, but as the paper explains on page 89, it's better to work with just
@@ -802,21 +808,27 @@ class ImanishiXuAllocator:
 if __name__ == "__main__":
     if False:
         buffers = [
-            Buffer("A", 1, 0, 2),
-            Buffer("B", 3, 0, 2),
-            Buffer("C", 4, 2, 3),
-            Buffer("D", 5, 0, 1),
-            Buffer("E", 3, 1, 4),
+            Buffer("B0", 8, 0, 1),
+            Buffer("B1", 4, 1, 4),
+            Buffer("B2", 2, 2, 5),
+            Buffer("B3", 8, 3, 5),
         ]
         bl = BufferList.from_buffers(buffers)
-        order = [0, 2, 3, 1, 4]
-        schedule = ExponentialCoolingSchedule(
-            t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=10
-        )
-        allocator = ImanishiXuAllocator(buffers=bl, order=order, schedule=schedule)
-        allocator.annealing_step_rotate(next(schedule))
+        order = [0, 1, 2, 3]
+        _, a1 = Allocations.from_order(bl, order)
+        a1.plot(max_height=22).savefig("plot.png", dpi=300)
 
-    elif True:
+        # order = [0, 3, 1, 2]
+        # _, a1 = Allocations.from_order(bl, order)
+        # a1.plot(max_height=22).savefig("plot.png", dpi=300)
+
+        # schedule = ExponentialCoolingSchedule(
+        #     t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=10
+        # )
+        # allocator = ImanishiXuAllocator(buffers=bl, order=order, schedule=schedule)
+        # allocator.annealing_step_rotate(next(schedule))
+
+    elif False:
         random = rnd.Random()
         random.seed(0)
         N = 100  # Number of buffers and also time range
@@ -850,35 +862,35 @@ if __name__ == "__main__":
         random.seed(0)
 
         buffers = [
-            Buffer(60, 0, 3),  # A: 0
-            Buffer(30, 1, 5),  # B: 1
-            Buffer(30, 2, 14),  # C: 2
-            Buffer(30, 3, 5),  # D: 3
-            Buffer(30, 4, 6),  # E: 4
-            Buffer(60, 5, 7),  # F: 5
-            Buffer(30, 6, 16),  # G: 6
-            Buffer(30, 7, 9),  # H: 7
-            Buffer(30, 8, 10),  # I: 8
-            Buffer(15, 9, 17),  # J: 9
-            Buffer(15, 10, 13),  # K: 10
-            Buffer(15, 11, 13),  # L: 11
-            Buffer(15, 12, 14),  # M: 12
-            Buffer(30, 13, 16),  # N: 13
-            Buffer(45, 14, 16),  # O: 14
-            Buffer(30, 15, 17),  # P: 15 (in-place)
-            Buffer(75, 16, 18),  # Q: 16
+            Buffer("A", 60, 0, 2),  # A: 0
+            Buffer("B", 30, 1, 4),  # B: 1
+            Buffer("C", 30, 2, 13),  # C: 2
+            Buffer("D", 30, 3, 4),  # D: 3
+            Buffer("E", 30, 4, 5),  # E: 4
+            Buffer("F", 60, 5, 6),  # F: 5
+            Buffer("G", 30, 6, 15),  # G: 6
+            Buffer("H", 30, 7, 8),  # H: 7
+            Buffer("I", 30, 8, 9),  # I: 8
+            Buffer("J", 15, 9, 16),  # J: 9
+            Buffer("K", 15, 10, 12),  # K: 10
+            Buffer("L", 15, 11, 12),  # L: 11
+            Buffer("M", 15, 12, 13),  # M: 12
+            Buffer("N", 30, 13, 15),  # N: 13
+            Buffer("O", 45, 14, 15),  # O: 14
+            Buffer("P", 30, 15, 16),  # P: 15 (in-place)
+            Buffer("Q", 75, 16, 17),  # Q: 16
         ]
 
         if False:
             # Original - no in-place: 150
             pass
-        elif False:
+        elif True:
             # P is in-place from G: 120
-            buffers[6] = Buffer(30, 6, 17)
+            buffers[6] = Buffer("PG", 30, 6, 16)
             del buffers[15]
         else:
             # P is in-place from N: 135
-            buffers[13] = Buffer(30, 13, 17)
+            buffers[13] = Buffer("PN", 30, 13, 16)
             del buffers[15]
 
         def schedule() -> Iterable[float]:
@@ -886,43 +898,29 @@ if __name__ == "__main__":
                 t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=250
             )
 
-        logs = []
-        from collections import Counter
-
-        results: Counter[int] = Counter()
-
         import time
 
-        N = 500
+        N = 100
         start = time.perf_counter()
-        for n in range(N):
-            allocator = ImanishiXuAllocator(
-                buffers=buffers,
-                # iterations=100000,
-                random=random,
-                order="first_fit",
-                schedule=schedule(),  # type: ignore[has-type]
-                ordering_fuzz_factor=1000.0,
-            )
-            allocator.solve()
-            logs.append(allocator.height_log)
-            results[allocator.best_height] += 1
-            # print(f"Final arrangement: {allocator.best_height}")
+        allocator = ImanishiXuAllocator(
+            buffers=buffers,
+            random=random,
+            order="first_fit",
+            schedule=schedule(),  # type: ignore[has-type]
+            ordering_fuzz_factor=1000.0,
+            starts=N,
+        )
+        allocator.solve()
         end = time.perf_counter()
         print(f"Time per iteration: {(end - start) / N}")
+
+        from collections import Counter
+
+        results = Counter(h[-1] for h in allocator.height_logs)
         print(f"Results: {results}")
 
         try:
-            import matplotlib.pyplot as plt
-
-            fig, ax1 = plt.subplots()
-            for log in logs:
-                ax1.plot(log, lw=1, alpha=0.25)
-
-            ax2 = ax1.twinx()
-            ax2.set_yscale("log")
-            ax2.plot([t for t in schedule()])  # type: ignore[has-type]
-
+            fig = allocator.plot()
             fig.savefig("plot.png", dpi=300)
 
         except ImportError:
