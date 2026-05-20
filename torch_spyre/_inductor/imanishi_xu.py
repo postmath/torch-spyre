@@ -18,7 +18,7 @@
 # Algorithm 4 is the simulated annealing algorithm that comes up with the permutation. It takes as
 # inputs an annealing schedule, a list of buffers, and an initial permutation.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from heapq import heappush, heappop
 import math
 from typing import Iterable, Iterator, Optional, override, Callable
@@ -29,6 +29,9 @@ import copy
 
 
 def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """Determines whether the intervals [a[0], a[1]) and [b[0], b[1]) overlap. Note the intervals
+    are closed on the left and open on the right, like Python ranges, unlike buffer objects in the
+    time dimension."""
     return not (a[1] <= b[0] or a[0] >= b[1])
 
 
@@ -39,6 +42,8 @@ class Buffer:
     # The buffer is allocated from tick first_use up to, but not including, last_use.
     first_use: int
     last_use: int
+    in_place_parents: list[str] = field(default_factory=list)
+    in_place_children: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         # The original paper doesn't require this, so that it can support cyclic/periodic
@@ -47,10 +52,35 @@ class Buffer:
 
     @classmethod
     def random(
-        cls, name, size_range: int, time_range: int, random: Optional[rnd.Random] = None
+        cls,
+        name,
+        size_range: int,
+        time_range: int,
+        random: Optional[rnd.Random] = None,
+        in_place_parent_candidates: Optional[list["Buffer"]] = None,
+        in_place_probability: float = 0.1,
     ) -> "Buffer":
+        """If in_place_parent_candidates is given, then with probability in_place_probability, *one*
+        of the given buffers will have its time duration *split* into two parts with the new buffer
+        taking up one part of it and the other buffer taking up the other part as its parent. As a
+        consequence, this may *modify* the in-place parents."""
         if random is None:
             random = rnd.Random()
+
+        if in_place_parent_candidates and random.random() < in_place_probability:
+            parent = random.choice(in_place_parent_candidates)
+            if parent.last_use >= parent.first_use + 2 and not parent.in_place_children:
+                t_split = random.randrange(parent.first_use + 1, parent.last_use)
+                old_last_use = parent.last_use
+                parent.last_use = t_split
+                parent.in_place_children.append(name)
+                return cls(
+                    name=name,
+                    size=parent.size,
+                    first_use=t_split,
+                    last_use=old_last_use,
+                    in_place_parents=[parent.name],
+                )
 
         duration = random.randrange((time_range - 1) // 2)
         # Bias towards smaller time ranges:
@@ -72,13 +102,33 @@ class Buffer:
     def overlaps_in_time(self, other: "Buffer") -> bool:
         return overlaps(
             (self.first_use, self.last_use + 1), (other.first_use, other.last_use + 1)
+        ) and not (
+            (self.name in other.in_place_parents and self.last_use == other.first_use)
+            or (
+                other.name in self.in_place_parents and self.first_use == other.last_use
+            )
         )
 
 
 @dataclass
 class BufferList:
     _list: list[Buffer]
+    _dict: dict[str, int]
     max_time: int
+
+    def __post_init__(self):
+        # TODO: maybe disable this unless some debug config option is on.
+        assert all(b.name in self._dict for b in self._list)
+        assert all(
+            self._list[self._dict[p]].last_use == b.first_use
+            for b in self._list
+            for p in b.in_place_parents
+        )
+        assert all(
+            self._list[self._dict[c]].first_use == b.last_use
+            for b in self._list
+            for c in b.in_place_children
+        )
 
     def __len__(self) -> int:
         return len(self._list)
@@ -92,7 +142,8 @@ class BufferList:
     @classmethod
     def from_buffers(cls, buffers: list[Buffer]) -> "BufferList":
         max_time = max(b.last_use for b in buffers) if buffers else 0
-        return cls(buffers, max_time)
+        dict = {b.name: i for i, b in enumerate(buffers)}
+        return cls(buffers, dict, max_time)
 
 
 class MaxRangeTree(ABC):
@@ -120,6 +171,10 @@ class MaxRangeTree(ABC):
         """Return the maximum of A[left:right]."""
         ...
 
+    def __getitem__(self, key: int) -> int:
+        """Return A[key]."""
+        return self.max(key, key + 1)
+
 
 class MaxRangeTree_Array(MaxRangeTree):
     @override
@@ -143,6 +198,10 @@ class MaxRangeTree_Array(MaxRangeTree):
     ) -> int:
         return self.array[left:right].max()
 
+    @override
+    def __getitem__(self, key: int) -> int:
+        return self.array[key]
+
 
 class MaxRangeTree_List(MaxRangeTree):
     @override
@@ -165,6 +224,10 @@ class MaxRangeTree_List(MaxRangeTree):
         right: int,
     ) -> int:
         return max(self.list[left:right])
+
+    @override
+    def __getitem__(self, key: int) -> int:
+        return self.list[key]
 
 
 class MaxRangeTree_Tree(MaxRangeTree):
@@ -331,20 +394,12 @@ class Allocations:
             raise ValueError(
                 f"Expected len(buffers) >= len(order), but got {n} < {len(order)}"
             )
-        max_time = buffers.max_time
 
-        # height[i] is the max height of all currently allocated blocks at time i.
-        height = MaxRangeTree_List(max_time + 1)
-        addresses = [0] * n
+        builder = AllocationBuilder(buffers)
         for j in order:
-            buffer = buffers[j]
-            # Allocate buffer on top of currently allocated blocks.
-            addresses[j] = height.max(buffer.first_use, buffer.last_use + 1)
-            height.increase_values(
-                buffer.first_use, buffer.last_use + 1, addresses[j] + buffer.size
-            )
+            builder.emplace(j)
 
-        return height.max(0, max_time + 1), cls(buffers, list(addresses))
+        return builder.peak_height(), builder.build()
 
     def to_order(self) -> list[int]:
         return sorted(range(len(self.buffers)), key=lambda i: self.addresses[i])
@@ -355,6 +410,7 @@ class Allocations:
 
         fig, ax = plt.subplots()
 
+        # First draw all the rectangles
         for i, buffer in enumerate(self.buffers):
             rect = patches.Rectangle(
                 xy=(buffer.first_use, self.addresses[i]),
@@ -368,6 +424,36 @@ class Allocations:
 
             ax.add_patch(rect)
 
+        # Then add a different colour rectangle for the overlap between in-place parent/child pairs.
+        # This should come on top of the rectangles, so we can't do it in the same loop above.
+        for i, buffer in enumerate(self.buffers):
+            for p in buffer.in_place_parents:
+                pj = self.buffers._dict[p]
+                parent = self.buffers[pj]
+                if self.addresses[i] == self.addresses[pj]:
+                    rect = patches.Rectangle(
+                        xy=(parent.first_use, self.addresses[i]),
+                        width=buffer.last_use - parent.first_use + 1,
+                        height=buffer.size,
+                        linewidth=0.3,
+                        edgecolor="r",
+                        facecolor="k",
+                        fill=True,
+                        alpha=0.25,
+                    )
+                    ax.add_patch(rect)
+
+                    rect = patches.Rectangle(
+                        xy=(buffer.first_use, self.addresses[i]),
+                        width=1,
+                        height=buffer.size,
+                        linewidth=0.3,
+                        edgecolor="r",
+                        facecolor="g",
+                        fill=True,
+                    )
+                    ax.add_patch(rect)
+
         ax.set_xlim(0, self.buffers.max_time + 1)
         if max_height is None:
             max_height = max(
@@ -376,6 +462,169 @@ class Allocations:
         ax.set_ylim(0, max_height)
 
         return fig
+
+
+class AllocationBuilder:
+    def __init__(self, buffers: BufferList):
+        self._buffers = buffers
+        self._height = MaxRangeTree_List(buffers.max_time + 1)
+        self._addresses = [0] * len(buffers)
+        self._seen: set[int] = set()
+
+    def address_when_currently_emplaced(self, j: int) -> int:
+        """Determine and return the address where buffer j would be placed given the currently
+        placed buffers."""
+        buffer = self._buffers[j]
+        # Allocate buffer on top of currently allocated blocks. If no in-place parents or
+        # children are in play, we place the buffer at the maximum address in use for its
+        # interval of liveness. Use in-placeness in the following situations, where the current
+        # buffer to be placed is indicated with "+" corners:
+        #
+        # - Parent only:
+        #       ┌─────┐
+        #       │     │
+        #       │     │
+        #     ┌─────────+─┐----+
+        #     │ parent  | │    |
+        #   ┌──────────┐+─┘----+
+        #   └──────────┘───────────┐
+        #             │            │
+        #             └────────────┘
+        #
+        # - Child only:
+        #                  +-------┌─+─────────┐
+        #   ┌──────────┐   |       │ |         │
+        #   │          │   |       │ | child   │
+        #   │          │   |       │ |         │
+        #   └──────────┘───+─────────+────┐────┘
+        #             │                   │
+        #             │                   │
+        #             └───────────────────┘
+        #
+        # - Parent and child:
+        #                             ┌───────┐
+        #                             │       │
+        #                             │       │
+        #                             │       │
+        #         ┌────+─┐-------┌─+──└───────┘
+        #         │ pt | │       │ |  child   │
+        #    ┌───────┐─+─┘-------└─+──────┐───┘
+        #    │       │             │      │
+        #    │       │─────────────┐      │
+        #    │       │             │      │
+        #    └───────┘─────────────┘──────┘
+        #
+
+        # To detect these situations, we check (some of) the height at buffer.first_use,
+        # buffer.last_use, and the max height in between. For example, to look for a parent only
+        # situation, we check the height at buffer.first_use; then check if the height under the
+        # rest of the liveness interval is less than or equal to that starting height minus the
+        # buffer size. If so, we go through the potential parents and see if any of them have
+        # already been allocated and have been allocated at exactly this starting height minus
+        # the buffer size. We already know that its liveness ends during the clock tick where
+        # the current buffer's liveness starts: this is a property of the parent/child
+        # relationship; so in this case we place the current buffer in place. If no such buffer
+        # is found, we revert to the previous rule: place the buffer at the maximum of the
+        # starting height and the middle heights.
+
+        if buffer.in_place_parents or buffer.in_place_children:
+            start_height = self._height.max(buffer.first_use, buffer.first_use + 1)
+            middle_height = (
+                self._height.max(buffer.first_use + 1, buffer.last_use)
+                if buffer.first_use + 1 < buffer.last_use
+                else 0
+            )
+            end_height = self._height.max(buffer.last_use, buffer.last_use + 1)
+
+            if buffer.in_place_parents and buffer.in_place_children:
+                if middle_height + buffer.size <= start_height == end_height:
+                    # We can only do an in-place chain with both a parent and a child.
+                    for p in buffer.in_place_parents:
+                        pj = self._buffers._dict[p]
+                        if (
+                            pj in self._seen
+                            and self._addresses[pj] == start_height - buffer.size
+                        ):
+                            for c in buffer.in_place_children:
+                                cj = self._buffers._dict[c]
+                                if (
+                                    cj in self._seen
+                                    and self._addresses[cj] == end_height - buffer.size
+                                ):
+                                    return start_height - buffer.size
+                            # We have already found the one potential parent, and there was no
+                            # suitable child.
+                            break
+
+                elif middle_height <= start_height - buffer.size >= end_height:
+                    # We can only do an in-place onto a parent.
+                    for p in buffer.in_place_parents:
+                        pj = self._buffers._dict[p]
+                        if (
+                            pj in self._seen
+                            and self._addresses[pj] == start_height - buffer.size
+                        ):
+                            return start_height - buffer.size
+
+                elif middle_height <= end_height - buffer.size >= start_height:
+                    # We can only in-place a child onto this buffer.
+                    for c in buffer.in_place_children:
+                        cj = self._buffers._dict[c]
+                        if (
+                            cj in self._seen
+                            and self._addresses[cj] == end_height - buffer.size
+                        ):
+                            return end_height - buffer.size
+
+                # If none of the three branches above apply (e.g., start_height == end_height -
+                # 1 but buffer.size > 1), then no in-place is possible and we fall through to the
+                # default case.
+
+            elif buffer.in_place_parents:
+                if max(middle_height, end_height) + buffer.size <= start_height:
+                    # It is *possible* that we can in-place the buffer onto a parent.
+                    for p in buffer.in_place_parents:
+                        pj = self._buffers._dict[p]
+                        if (
+                            pj in self._seen
+                            and self._addresses[pj] == start_height - buffer.size
+                        ):
+                            return start_height - buffer.size
+
+            else:
+                if max(start_height, middle_height) + buffer.size <= end_height:
+                    # It is *possible* that a child can be in-placed onto this buffer.
+                    for c in buffer.in_place_children:
+                        cj = self._buffers._dict[c]
+                        if (
+                            cj in self._seen
+                            and self._addresses[cj] == end_height - buffer.size
+                        ):
+                            return end_height - buffer.size
+
+            # Default case: no in-place possible.
+            return max(start_height, middle_height, end_height)
+
+        else:
+            # Neither parents nor children exist. We keep this as a separate branch with only a
+            # single call to max for performance reasons.
+            return self._height.max(buffer.first_use, buffer.last_use + 1)
+
+    def emplace(self, j: int) -> int:
+        """Place buffer j given currently placed buffers. Returns the assigned address."""
+        buffer = self._buffers[j]
+        self._seen.add(j)
+        self._addresses[j] = self.address_when_currently_emplaced(j)
+        self._height.increase_values(
+            buffer.first_use, buffer.last_use + 1, self._addresses[j] + buffer.size
+        )
+        return self._addresses[j]
+
+    def peak_height(self) -> int:
+        return self._height.max(0, self._buffers.max_time + 1)
+
+    def build(self) -> "Allocations":
+        return Allocations(self._buffers, list(self._addresses))
 
 
 class CoolingSchedule(ABC):
@@ -623,9 +872,7 @@ class ImanishiXuAllocator:
         self.starts = starts
 
     def solve(self):
-        saved_order = copy.copy(self.order)
         for _ in range(self.starts):
-            self.order = copy.copy(saved_order)
             self.anneal()
 
     def anneal(self):
@@ -704,49 +951,42 @@ class ImanishiXuAllocator:
         height_order_minus_i = Allocations.from_order(self.buffers, order_minus_i)[0]
 
         # "Up sweep".
-        bottom_heights = [0] * (self.buffers.max_time + 1)
+        bottom_heights = AllocationBuilder(self.buffers)
         bottom_addresses = [0] * n
         for j, other_i in enumerate(order_minus_i):
-            other_buffer = self.buffers[other_i]
-            # Consider the order that would be given by order_minus_i.insert(j, order[i]). Compute
-            # the address where we would allocate buffer i given the order:
+            # Consider the order that would be given by order_minus_i.insert(j, order[i]).
+            #
+            # Compute the address where we would allocate buffer i given the order:
             #   order_minus_i[:j] + [order[i]].
-            bottom_addresses[j] = max(
-                bottom_heights[buffer.first_use : buffer.last_use + 1]
+            bottom_addresses[j] = bottom_heights.address_when_currently_emplaced(
+                self.order[i]
             )
+
             # For the next iteration, plan to allocate other_buffer next.
-            other_allocation = max(
-                bottom_heights[other_buffer.first_use : other_buffer.last_use + 1]
-            )
-            bottom_heights[other_buffer.first_use : other_buffer.last_use + 1] = [
-                other_allocation + other_buffer.size
-            ] * (other_buffer.last_use + 1 - other_buffer.first_use)
-        bottom_addresses[n - 1] = max(
-            bottom_heights[buffer.first_use : buffer.last_use + 1]
+            bottom_heights.emplace(other_i)
+
+        bottom_addresses[n - 1] = bottom_heights.address_when_currently_emplaced(
+            self.order[i]
         )
 
         # "Down sweep".
-        top_heights = [0] * (self.buffers.max_time + 1)
+        top_heights = AllocationBuilder(self.buffers)
         top_addresses = [0] * n
         for j in range(n - 1, 0, -1):
             other_i = order_minus_i[j - 1]
-            other_buffer = self.buffers[other_i]
             # Consider the order that would be given by order_minus_i.insert(j, order[i]). We now
             # compute the address where we would allocate buffer i given the order:
             #   reversed(order_minus_i[j:]) + [order[i]].
             # Imagine this allocation "upside down", hanging from the ceiling. We can obtain the
             # full height of the allocation order_minus_i.insert(j, order[i]) as
             #   max(height_order_minus_i, bottom_heights[j] + top_heights[j] + buffer.size).
-            top_addresses[j] = max(top_heights[buffer.first_use : buffer.last_use + 1])
-
-            # For the next iteration, plan to allocate other_buffer next.
-            other_allocation = max(
-                top_heights[other_buffer.first_use : other_buffer.last_use + 1]
+            top_addresses[j] = top_heights.address_when_currently_emplaced(
+                self.order[i]
             )
-            top_heights[other_buffer.first_use : other_buffer.last_use + 1] = [
-                other_allocation + other_buffer.size
-            ] * (other_buffer.last_use + 1 - other_buffer.first_use)
-        top_addresses[0] = np.max(top_heights[buffer.first_use : buffer.last_use + 1])
+            # For the next iteration, plan to allocate other_buffer next.
+            top_heights.emplace(other_i)
+
+        top_addresses[0] = top_heights.address_when_currently_emplaced(self.order[i])
 
         # Actual total heights are the pointwise max of heights_through_buffer with
         # height_order_minus_i, but as the paper explains on page 89, it's better to work with just
@@ -763,7 +1003,7 @@ class ImanishiXuAllocator:
         insertion_points = sorted(
             range(n),
             key=lambda j: (
-                -height_through_buffer[j]
+                height_through_buffer[j]
                 + self.random.random() * temperature * self.ordering_fuzz_factor
             ),
         )
@@ -787,12 +1027,26 @@ class ImanishiXuAllocator:
         # No rotation was accepted.
         return None
 
-    def height_temperature_plot(self):
+    def height_temperature_plot(self, height_logs: Optional[list[list[int]]] = None):
         import matplotlib.pyplot as plt
 
+        if height_logs is None:
+            height_logs = self.height_logs
+
         fig, ax1 = plt.subplots()
-        for log in self.height_logs:
-            ax1.plot(log, lw=1, alpha=0.25)
+        for log in height_logs:
+            ax1.plot(log, "b", lw=1, alpha=0.1)
+
+        average = np.array(height_logs).mean(axis=0)
+        n_points = len(average)
+        if n_points >= 20:
+            n_smoothing = min(n_points // 10, 10)
+            smoothed = np.convolve(average, np.ones(n_smoothing) / n_smoothing, "valid")
+            ax1.plot(
+                [x + n_smoothing / 2 for x in range(len(smoothed))], smoothed, "r", lw=3
+            )
+        else:
+            ax1.plot(average, "r", lw=3)
 
         ax2 = ax1.twinx()
         ax2.set_yscale("log")
@@ -832,10 +1086,21 @@ if __name__ == "__main__":
         random = rnd.Random()
         random.seed(0)
         N = 100  # Number of buffers and also time range
-        buffers = [Buffer.random(f"B_{i}", 1000000, N, random) for i in range(N)]
-        random_height = Allocations.from_order(
-            BufferList.from_buffers(buffers), list(range(N))
-        )[0]
+        buffers = []
+        for i in range(N):
+            buffers.append(
+                Buffer.random(
+                    f"B{i}",
+                    1000000,
+                    N,
+                    random,
+                    in_place_parent_candidates=buffers,
+                    in_place_probability=0.5,
+                )
+            )
+        buffers = BufferList.from_buffers(buffers)
+
+        random_height = Allocations.from_order(buffers, list(range(N)))[0]
         print(f"Random arrangement: {random_height}")
         allocator = ImanishiXuAllocator(
             buffers=buffers,
@@ -849,6 +1114,21 @@ if __name__ == "__main__":
         print(f"Initial arrangement: {allocator.best_height}")
         allocator.solve()
         print(f"Final arrangement: {allocator.best_height}")
+        print(
+            f"In-place operations available: {sum(len(b.in_place_parents) for b in buffers)}"
+        )
+        _, allocations = Allocations.from_order(buffers, allocator.best_order)
+        n_in_place = 0
+        for buffer in buffers:
+            for p in buffer.in_place_parents:
+                pj = buffers._dict[p]
+                if (
+                    allocations.addresses[pj]
+                    == allocations.addresses[buffers._dict[buffer.name]]
+                ):
+                    n_in_place += 1
+                    break
+        print(f"In-place operations in use: {n_in_place}")
 
         try:
             fig = allocator.plot()
@@ -877,13 +1157,18 @@ if __name__ == "__main__":
             Buffer("M", 15, 12, 13),  # M: 12
             Buffer("N", 30, 13, 15),  # N: 13
             Buffer("O", 45, 14, 15),  # O: 14
-            Buffer("P", 30, 15, 16),  # P: 15 (in-place)
+            Buffer("P", 30, 15, 16),  # P: 15 (in-place?)
             Buffer("Q", 75, 16, 17),  # Q: 16
         ]
 
         if False:
             # Original - no in-place: 150
             pass
+        elif True:
+            # Combined -- P is inplace from G or N: 120
+            buffers[6].in_place_children.append("P")
+            buffers[13].in_place_children.append("P")
+            buffers[15].in_place_parents.extend(["G", "N"])
         elif True:
             # P is in-place from G: 120
             buffers[6] = Buffer("PG", 30, 6, 16)
@@ -895,32 +1180,37 @@ if __name__ == "__main__":
 
         def schedule() -> Iterable[float]:
             return ExponentialCoolingSchedule(
-                t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=250
+                t0=10.0, t_end=1, steps_per_epoch=1, epochs=150
             )
 
         import time
 
         N = 100
+        n = 10
         start = time.perf_counter()
-        allocator = ImanishiXuAllocator(
-            buffers=buffers,
-            random=random,
-            order="first_fit",
-            schedule=schedule(),  # type: ignore[has-type]
-            ordering_fuzz_factor=1000.0,
-            starts=N,
-        )
-        allocator.solve()
+        all_logs = []
+        for _ in range(N):
+            allocator = ImanishiXuAllocator(
+                buffers=buffers,
+                random=random,
+                order="first_fit",
+                schedule=schedule(),  # type: ignore[has-type]
+                ordering_fuzz_factor=1.0,
+                starts=n,
+            )
+            allocator.solve()
+
+            all_logs.append([y for x in allocator.height_logs for y in x])
         end = time.perf_counter()
         print(f"Time per iteration: {(end - start) / N}")
 
         from collections import Counter
 
-        results = Counter(h[-1] for h in allocator.height_logs)
+        results = Counter(h[-1] for h in all_logs)
         print(f"Results: {results}")
 
         try:
-            fig = allocator.plot()
+            fig = allocator.height_temperature_plot(all_logs)
             fig.savefig("plot.png", dpi=300)
 
         except ImportError:
