@@ -42,12 +42,12 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.passes import (
-    CloneInputNodesPass,
     ScratchpadOptimizationPass,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     OP_GOOD_FOR_LX_INPLACE,
+    clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
     get_ncores_for_buffers,
@@ -114,7 +114,7 @@ class ScratchpadAllocator(ABC):
             [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
         )
 
-        if "clone" not in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+        if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
             # holds an HBM reference and there is no clone to redirect it to.
             # graph_input_names is a no-op here (inputs are not in graph.operations),
@@ -134,22 +134,28 @@ class ScratchpadAllocator(ABC):
         mem_usage = mem_usage_by_buf(GraphView(graph, self._filter_ops))
         in_place = {} if in_place is None else in_place
         buffers = []
+        graph_output_names = set(graph.get_output_names())
+        cloning_allowed = clone_at_graph_boundaries()
         for output_name, info in mem_usage.items():
+            if not lifetimes[output_name].reads:
+                continue  # output is not read
+            if output_name in graph_output_names and not cloning_allowed:
+                continue  # we can only allocate graph outputs if we're allowed to clone
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
                     info["size_per_core"],
-                    lifetimes[output_name]["liveness_start"],
-                    lifetimes[output_name]["liveness_end"],
+                    lifetimes[output_name].start,
+                    lifetimes[output_name].end,
                     in_place_parents=in_place.get(output_name, []),
                 )
             )
 
-        if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+        if cloning_allowed:
             ncores = get_ncores_for_buffers(graph)
             for input_name in graph.graph_input_names:
-                if lifetimes[input_name]["liveness_end"] == 0:
-                    continue  # unused input
+                if len(lifetimes[input_name].reads) <= 1:
+                    continue  # input read only once, or not at all
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
                     continue  # core division mismatch across consumers
@@ -160,8 +166,8 @@ class ScratchpadAllocator(ABC):
                     LifetimeBoundBuffer(
                         input_name,
                         dev_size // num_cores,
-                        lifetimes[input_name]["liveness_start"],
-                        lifetimes[input_name]["liveness_end"],
+                        lifetimes[input_name].start,
+                        lifetimes[input_name].end,
                         in_place_parents=[],
                     )
                 )
@@ -180,11 +186,11 @@ class ScratchpadAllocator(ABC):
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
                 continue
-            out_start = lifetimes[buf_name]["liveness_start"]
+            out_start = lifetimes[buf_name].start
             out_ten_layout = graph.get_buffer(buf_name).layout.device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
-                in_end = lifetimes[input_buf]["liveness_end"]
+                in_end = lifetimes[input_buf].end
                 in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
                 in_size = mem_usage[input_buf]["size_per_core"]
                 inp_i_size_match = out_size == in_size
@@ -266,7 +272,7 @@ class DefaultAllocator(ScratchpadAllocator):
             layout_planning: Solver that assigns LX addresses to lifetime-bound
                 buffers. Defaults to GreedyLayoutSolver sized to available LX memory.
             pre_optimization_passes: Graph passes applied before layout planning.
-                Defaults to [CloneInputNodesPass].
+                Defaults to no passes.
             post_optimization_passes: Graph passes applied after layout planning.
                 Defaults to no passes.
         """
@@ -283,7 +289,7 @@ class DefaultAllocator(ScratchpadAllocator):
                     f"Invalid layout_solver config option '{config.layout_solver}'."
                 )
         if pre_optimization_passes is None:
-            pre_optimization_passes = [CloneInputNodesPass(size)]
+            pre_optimization_passes = []
         if post_optimization_passes is None:
             post_optimization_passes = []
 

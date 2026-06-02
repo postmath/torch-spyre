@@ -25,7 +25,7 @@ from torch._inductor.virtualized import V
 from ..ir import FixedTiledLayout, TensorBox
 
 from torch_spyre._inductor.scratchpad.utils import (
-    OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    clone_at_graph_boundaries,
     get_buffer_users,
     get_ncores_for_buffers,
 )
@@ -230,7 +230,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         buf_users = get_buffer_users(graph)
 
         operations = graph.operations
-        if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+        if clone_at_graph_boundaries():
             self._try_insert_clone_op_for_inputs(
                 graph,
                 operations,
