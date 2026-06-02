@@ -26,7 +26,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
     "amax",
     "sum",
-    # "clone",
+    "clone",
     "exp",
     "sub",
     "mul",
@@ -59,6 +59,10 @@ class GraphView:
 
 def calculate_liveness(graph: GraphLowering) -> dict:
     liveness: dict[str, dict[str, bool | int]] = {}
+    # Graph inputs are live from before any op runs. liveness_end stays 0
+    # for inputs with no consumers (unused inputs).
+    for input_name in graph.graph_input_names:
+        liveness[input_name] = {"liveness_start": 0, "liveness_end": 0}
     for i, op in enumerate(graph.operations):
         rw = op.get_read_writes()
         for mem_dep in rw.reads | rw.writes:

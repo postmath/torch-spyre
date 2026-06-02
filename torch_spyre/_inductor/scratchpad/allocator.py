@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 from torch._inductor.ir import (
+    TensorBox,
     ComputedBuffer,
     Operation,
     MutationLayoutSHOULDREMOVE,
@@ -50,8 +51,10 @@ from torch_spyre._inductor.scratchpad.utils import (
     mem_usage_by_buf,
     calculate_liveness,
     get_ncores_for_buffers,
+    get_buffer_users,
     GraphView,
 )
+from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 
 from torch_spyre._inductor import config
 
@@ -111,11 +114,14 @@ class ScratchpadAllocator(ABC):
             [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
         )
 
-        # filter out the graph inputs and outputs. The inputs shouldn't appear here anyways.
-        # These can be relaxed once node cloning is implemented as a post-solve optimization
-        # rather than just filling the scratchpad at t = 0
-        drop_list.update(graph.get_output_names())
-        drop_list.update(graph.graph_input_names)
+        if "clone" not in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+            # Without clone support, graph outputs cannot be LX-pinned: the caller
+            # holds an HBM reference and there is no clone to redirect it to.
+            # graph_input_names is a no-op here (inputs are not in graph.operations),
+            # but kept for symmetry with _build_bound_buffers, which handles inputs
+            # separately when clone is available.
+            drop_list.update(graph.get_output_names())
+            drop_list.update(graph.graph_input_names)
 
         return [op for op in graph.operations if op.name not in drop_list]
 
@@ -138,6 +144,27 @@ class ScratchpadAllocator(ABC):
                     in_place_parents=in_place.get(output_name, []),
                 )
             )
+
+        if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+            ncores = get_ncores_for_buffers(graph)
+            for input_name in graph.graph_input_names:
+                if lifetimes[input_name]["liveness_end"] == 0:
+                    continue  # unused input
+                num_cores = ncores.get(input_name, -1)
+                if num_cores < 0:
+                    continue  # core division mismatch across consumers
+                buf = graph.get_buffer(input_name)
+                dev_layout = buf.layout.device_layout
+                dev_size = math.prod(dev_layout.device_size[:-1]) * 128
+                buffers.append(
+                    LifetimeBoundBuffer(
+                        input_name,
+                        dev_size // num_cores,
+                        lifetimes[input_name]["liveness_start"],
+                        lifetimes[input_name]["liveness_end"],
+                        in_place_parents=[],
+                    )
+                )
 
         return buffers
 
@@ -181,12 +208,49 @@ class ScratchpadAllocator(ABC):
     def _push_allocation(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
     ):
-        # push the allocation into the code generation
+        """Push the allocation into the code generation. This includes cloning graph inputs and
+        graph outputs:
+
+        - A graph input B that is allocated into LX means that it is cloned; call the clone C. The
+        downstream users of B are now made to use C. The LX allocation is effectuated by assigning
+        it to C.
+
+        - A graph output B that is allocated into LX means that it is cloned; call the clone C.
+        Nothing changes for the downstream users. The LX allocation is effectuated by assigning it
+        to B itself. The graph is made to have C as its output.
+
+        - A buffer that is neither a graph input nor a graph output gets the LX allocation assigned
+        to itself."""
+        outputs = set(graph.get_output_names())
+        inputs = set(graph.graph_input_names)
+
+        buffer_users = get_buffer_users(graph)
+        graph_editor = GraphEditor(graph)
+
         for b in buffers:
-            if b.address is not None:
-                buf = graph.get_buffer(b.name)
-                layout = buf.get_layout()
-                layout.allocation["lx"] = b.address
+            if b.address is None:
+                continue
+
+            buf = graph.get_buffer(b.name)
+            if b.name in inputs:
+                new_buffer = graph_editor.push_allocation_with_clone(
+                    buf, b.address, buffer_users[b.name], input=True
+                )
+                self._set_one_allocation(new_buffer, b.address)
+
+            elif b.name in outputs:
+                new_buffer = graph_editor.push_allocation_with_clone(
+                    buf, b.address, buffer_users[b.name], input=False
+                )
+                self._set_one_allocation(buf, b.address)
+                graph_editor.change_graph_output(buf, new_buffer)
+
+            else:
+                self._set_one_allocation(buf, b.address)
+
+    def _set_one_allocation(self, buf: TensorBox | ComputedBuffer, address: int):
+        layout = buf.get_layout()
+        layout.allocation["lx"] = address
 
 
 class DefaultAllocator(ScratchpadAllocator):
