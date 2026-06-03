@@ -137,16 +137,17 @@ class ScratchpadAllocator(ABC):
         graph_output_names = set(graph.get_output_names())
         cloning_allowed = clone_at_graph_boundaries()
         for output_name, info in mem_usage.items():
-            if not lifetimes[output_name].reads:
-                continue  # output is not read
+            if len(lifetimes[output_name]) <= 1:
+                continue  # output is not read (only the write, or never touched)
             if output_name in graph_output_names and not cloning_allowed:
                 continue  # we can only allocate graph outputs if we're allowed to clone
+            uses = lifetimes[output_name]
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
                     info["size_per_core"],
-                    lifetimes[output_name].start,
-                    lifetimes[output_name].end,
+                    uses[0],
+                    uses[-1] + 1,
                     in_place_parents=in_place.get(output_name, []),
                 )
             )
@@ -154,7 +155,7 @@ class ScratchpadAllocator(ABC):
         if cloning_allowed:
             ncores = get_ncores_for_buffers(graph)
             for input_name in graph.graph_input_names:
-                if len(lifetimes[input_name].reads) <= 1:
+                if len(lifetimes[input_name]) <= 1:
                     continue  # input read only once, or not at all
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
@@ -162,12 +163,13 @@ class ScratchpadAllocator(ABC):
                 buf = graph.get_buffer(input_name)
                 dev_layout = buf.layout.device_layout
                 dev_size = math.prod(dev_layout.device_size[:-1]) * 128
+                uses = lifetimes[input_name]
                 buffers.append(
                     LifetimeBoundBuffer(
                         input_name,
                         dev_size // num_cores,
-                        lifetimes[input_name].start,
-                        lifetimes[input_name].end,
+                        uses[0],
+                        uses[-1] + 1,
                         in_place_parents=[],
                     )
                 )
@@ -186,16 +188,16 @@ class ScratchpadAllocator(ABC):
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
                 continue
-            out_start = lifetimes[buf_name].start
+            out_start = lifetimes[buf_name][0]
             out_ten_layout = graph.get_buffer(buf_name).layout.device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
-                in_end = lifetimes[input_buf].end
+                in_end = lifetimes[input_buf][-1]  # inclusive last use
                 in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
                 in_size = mem_usage[input_buf]["size_per_core"]
                 inp_i_size_match = out_size == in_size
                 inp_i_lay_match = out_ten_layout == in_ten_layout
-                inp_i_eol = in_end == out_start + 1
+                inp_i_eol = in_end == out_start  # same op reads input and writes output
                 no_core_div_mismatch = not info["core_div_mismatch"]
                 if (
                     inp_i_size_match

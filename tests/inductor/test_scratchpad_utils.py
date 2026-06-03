@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for calculate_liveness and the Liveness dataclass."""
+"""Unit tests for calculate_liveness."""
 
 import unittest
 from dataclasses import dataclass
 
-from torch_spyre._inductor.scratchpad.utils import Liveness, calculate_liveness
+from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 
 @dataclass(frozen=True)
@@ -50,99 +50,40 @@ class _Graph:
 
 
 def _make_graph(input_names, op_specs):
-    """Build a _Graph from (reads, writes) op specs."""
     return _Graph(input_names, [_Op(r, w) for r, w in op_specs])
 
 
 class TestCalculateLiveness(unittest.TestCase):
-    def test_unused_input_has_zero_liveness(self):
+    def test_graph_inputs(self):
+        """Unused inputs stay [], used inputs accumulate op indices, all appear in result."""
         graph = _make_graph(
-            ["x", "unused"],
+            ["a", "b", "unused"],
             [
-                (["x"], ["y"]),  # op0: reads x, writes y; "unused" never touched
+                (["a"], ["x"]),  # op0: reads a
+                (["x"], ["y"]),  # op1: doesn't read a or b
+                (["a", "b"], ["z"]),  # op2: reads a again, reads b once
             ],
         )
         liveness = calculate_liveness(graph)
-        u = liveness["unused"]
-        self.assertEqual(u.start, 0)
-        self.assertEqual(u.end, 0)
-        self.assertEqual(u.reads, [])
+        self.assertIn("unused", liveness)
+        self.assertEqual(liveness["unused"], [])
+        self.assertEqual(liveness["a"], [0, 2])  # read at op0 and op2
+        self.assertEqual(liveness["b"], [2])  # read only at op2
 
-    def test_input_single_read(self):
-        graph = _make_graph(
-            ["x"],
-            [
-                (["x"], ["y"]),  # op0
-            ],
-        )
-        liveness = calculate_liveness(graph)
-        x = liveness["x"]
-        self.assertEqual(x.start, 0)
-        self.assertEqual(x.end, 1)
-        self.assertEqual(x.reads, [0])
-
-    def test_input_multiple_reads(self):
-        graph = _make_graph(
-            ["x"],
-            [
-                (["x"], ["y"]),  # op0: reads x
-                (["y"], ["z"]),  # op1: doesn't read x
-                (["x", "z"], ["w"]),  # op2: reads x again
-            ],
-        )
-        liveness = calculate_liveness(graph)
-        x = liveness["x"]
-        self.assertEqual(x.start, 0)
-        self.assertEqual(x.end, 3)  # last touched at op2 (i=2), end = 3
-        self.assertEqual(x.reads, [0, 2])
-
-    def test_intermediate_start_and_end(self):
-        graph = _make_graph(
-            ["x"],
-            [
-                (["x"], ["y"]),  # op0: x→y
-                (["y"], ["z"]),  # op1: y→z
-            ],
-        )
-        liveness = calculate_liveness(graph)
-        y = liveness["y"]
-        self.assertEqual(y.start, 0)  # first seen at op0 (i=0)
-        self.assertEqual(y.end, 2)  # last touched at op1 (i=1), end = 2
-        self.assertEqual(y.reads, [1])
-
-    def test_buffer_first_seen_at_later_op(self):
+    def test_intermediate_buffers(self):
+        """Intermediates accumulate entries for write and all subsequent reads."""
         graph = _make_graph(
             [],
             [
-                ([], ["a"]),  # op0: creates a
-                (["a"], ["b"]),  # op1: a→b  (b first appears here)
-                (["b"], ["c"]),  # op2: b→c
+                ([], ["a"]),  # op0: writes a
+                (["a"], ["b"]),  # op1: reads a, writes b
+                (["a", "b"], ["c"]),  # op2: reads a and b
             ],
         )
         liveness = calculate_liveness(graph)
-        b = liveness["b"]
-        self.assertEqual(b.start, 1)  # first seen at op1 (i=1)
-        self.assertEqual(b.end, 3)  # last touched at op2 (i=2), end = 3
-        self.assertEqual(b.reads, [2])
-
-    def test_all_graph_inputs_present_in_output(self):
-        """Every name in graph_input_names appears in the returned dict, even if never used."""
-        graph = _make_graph(
-            ["a", "b", "c"],
-            [
-                (["a"], ["x"]),  # b and c never touched
-            ],
-        )
-        liveness = calculate_liveness(graph)
-        self.assertIn("a", liveness)
-        self.assertIn("b", liveness)
-        self.assertIn("c", liveness)
-
-    def test_return_type_is_liveness_dataclass(self):
-        graph = _make_graph(["x"], [(["x"], ["y"])])
-        liveness = calculate_liveness(graph)
-        for v in liveness.values():
-            self.assertIsInstance(v, Liveness)
+        self.assertEqual(liveness["a"], [0, 1, 2])  # written op0, read op1 and op2
+        self.assertEqual(liveness["b"], [1, 2])  # written op1, read op2
+        self.assertEqual(liveness["c"], [2])  # written op2, never read
 
 
 if __name__ == "__main__":
