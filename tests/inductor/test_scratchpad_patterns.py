@@ -17,6 +17,7 @@ from collections import defaultdict
 import copy
 from dataclasses import dataclass
 from typing import Callable, ClassVar, Optional, Iterable
+from typing import Callable, ClassVar, Optional, Iterable
 from unittest import TestCase, expectedFailure
 from enum import Enum
 import os

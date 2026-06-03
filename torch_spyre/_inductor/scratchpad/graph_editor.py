@@ -117,6 +117,9 @@ class GraphEditor:
         - Even though it is not a necessary condition, we assume FX graph and Operations are fully
           consistent and we will try to maintain it that way.
         - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR.
+        - TODO consider cache some of the Op/buf dep table for later use. Only
+          need to refresh input/clone related entries. Because next step,
+          allocator._generate_buffers(), aka buf_analysis, will call it again.
         """
         # Step 1: Add a new FX node for clone and update dependencies
         if isinstance(buffer, TensorBox):
@@ -161,6 +164,15 @@ class GraphEditor:
         new_com_buf.name = self.lowering.register_buffer(new_com_buf)
         self.lowering.register_operation(new_com_buf)
         new_buf_name = new_com_buf.name
+
+        # Step 2b: Propagate per-core splits to the clone.
+        # Users share the same per_core_view (pre-checked by core_div_mismatch guard).
+        # op_it_space_splits keys are stride-based coefficients, which are layout-
+        # invariant, so the first user's output_splits transfer without re-keying.
+        # Reduction splits are dropped: the clone is Pointwise with no reduction axis.
+        first_user = buffer_users[0]
+        user_out_splits, _ = getattr(first_user, "op_it_space_splits", ({}, {}))
+        new_com_buf.op_it_space_splits = (user_out_splits, {})
 
         if input:
             # Step 3: Update self.graph.name_to_users (a list of TensorBox), e.g., existing users of
