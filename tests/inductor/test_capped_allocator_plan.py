@@ -387,3 +387,85 @@ class NeighborGraphTests(TestCase):
                     idx, sorted(fast.below_neighbors[idx])
                 )
                 self.assertEqual(addr, fast.addresses[idx], f"seed={seed} idx={idx}")
+
+
+class SwapTests(TestCase):
+    """Step 4: incremental swap in CappedAllocatorPlan."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return CappedAllocatorPlan(buffers, permutation, capacity, alignment)
+
+    def test_overlapping_swap_relayouts(self):
+        buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
+        plan = self.plan(buffers, [0, 1])
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 64])
+        delta = plan.swap(0)  # -> [b, a]
+        self.assertEqual([_addr(plan, "b"), _addr(plan, "a")], [0, 50])
+        self.assertEqual(delta, 0)  # both still fit
+
+    def test_non_overlapping_swap_is_noop(self):
+        buffers = [_buf("a", 64, 0, 1), _buf("b", 64, 2, 3)]
+        plan = self.plan(buffers, [0, 1])
+        before = list(plan.addresses)
+        delta = plan.swap(0)
+        self.assertEqual(delta, 0)
+        self.assertEqual(plan.addresses, before)
+        self.assertEqual(plan.permutation, [1, 0])
+
+    def test_swap_changes_total_size(self):
+        # Only one of the two can fit fully below capacity; swapping which one
+        # is placed first changes the total.
+        buffers = [_buf("a", 30, 0, 2), _buf("b", 90, 0, 2)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        self.assertEqual(plan.total_size(), 30)  # a@0 fits, b@30 (->120) does not
+        delta = plan.swap(0)  # -> [b, a]: b@0 fits, a@90 (->120) does not
+        self.assertEqual(plan.total_size(), 90)
+        self.assertEqual(delta, 60)
+
+    def test_swap_back_restores(self):
+        buffers = [_buf("a", 30, 0, 2), _buf("b", 90, 0, 2)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        d1 = plan.swap(0)
+        d2 = plan.swap(0)
+        self.assertEqual(d1 + d2, 0)
+        self.assertEqual(plan.total_size(), 30)
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 30])
+
+    def test_random_swap_sequences_match_reference(self):
+        for seed in range(3000):
+            rng = random.Random(seed)
+            n = rng.randint(2, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+
+            for step in range(rng.randint(1, 2 * n)):
+                i = rng.randrange(n - 1)
+                before = fast.total_size()
+                delta = fast.swap(i)
+                tag = f"seed={seed} step={step}"
+
+                # Ground truth: a fresh reference build of the new permutation.
+                ref = ReferenceCappedAllocatorPlan(
+                    buffers, list(fast.permutation), cap, align
+                )
+                self.assertEqual(fast.addresses, ref.addresses, tag)
+                self.assertEqual(fast.total_size(), ref.total_size(), tag)
+                self.assertEqual(delta, fast.total_size() - before, tag)
+
+                # The graph stays self-consistent: addresses recoverable from
+                # below-neighbours, and below/above remain reciprocal.
+                for idx in range(n):
+                    addr, _ = fast._placement_decision(
+                        idx, sorted(fast.below_neighbors[idx])
+                    )
+                    self.assertEqual(addr, fast.addresses[idx], f"{tag} idx={idx}")
+                for c, lowers in fast.below_neighbors.items():
+                    for b in lowers:
+                        self.assertIn(c, fast.above_neighbors[b], tag)
+                for b, uppers in fast.above_neighbors.items():
+                    for c in uppers:
+                        self.assertIn(b, fast.below_neighbors[c], tag)

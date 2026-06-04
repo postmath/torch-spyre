@@ -424,7 +424,12 @@ class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
                 self.total_allocated_size += self.buffers[idx].size
 
     def swap(self, i: int) -> int:
-        raise NotImplementedError("Step 4")
+        """Swap permutation entries ``i``/``i+1`` and rebuild from scratch."""
+        old_total = self.total_allocated_size
+        perm = self.permutation
+        perm[i], perm[i + 1] = perm[i + 1], perm[i]
+        self._build()
+        return self.total_allocated_size - old_total
 
 
 class CappedAllocatorPlan(CappedAllocatorPlanBase):
@@ -534,4 +539,113 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
                         self.above_neighbors[b].add(c)
 
     def swap(self, i: int) -> int:
-        raise NotImplementedError("Step 4")
+        """Swap permutation entries ``i`` and ``i+1`` and re-place incrementally.
+
+        Buffers before position ``i`` are untouched. If the two swapped buffers
+        do not overlap in time the layout is identical, so this is a no-op.
+        Otherwise we re-place the affected buffers in a single forward pass:
+        dependencies always point to earlier positions, so visiting positions in
+        increasing order lets every buffer re-derive from already-settled ones.
+        A buffer is re-placed only when "dirty"; when a re-placed buffer's
+        address changes, every later-positioned buffer overlapping it is marked
+        dirty (a safe superset -- unaffected ones re-derive to the same address
+        and stop the cascade).
+
+        Returns:
+            The change in :meth:`total_size` (new minus old).
+        """
+        n = len(self.buffers)
+        assert 0 <= i < n - 1
+        perm = self.permutation
+        x, y = perm[i], perm[i + 1]
+        perm[i], perm[i + 1] = y, x
+        if not self._overlaps(x, y):
+            # Independent buffers: their order does not affect any address.
+            return 0
+
+        pos = [0] * n
+        for p, idx in enumerate(perm):
+            pos[idx] = p
+
+        old_total = self.total_allocated_size
+        dirty = [False] * n
+        dirty[x] = dirty[y] = True
+        for p in range(i, n):
+            z = perm[p]
+            if not dirty[z]:
+                continue
+            old_addr = self.addresses[z]
+            if self._is_fully_allocated(z):
+                self.total_allocated_size -= self.buffers[z].size
+            self._replace_buffer(z, pos)
+            if self._is_fully_allocated(z):
+                self.total_allocated_size += self.buffers[z].size
+            if self.addresses[z] != old_addr:
+                for w in range(n):
+                    if pos[w] > p and self._overlaps(z, w):
+                        dirty[w] = True
+        return self.total_allocated_size - old_total
+
+    def _replace_buffer(self, z: int, pos: list[int]) -> None:
+        """Recompute ``z``'s address and below/above edges from earlier buffers.
+
+        Uses only buffers placed before ``z`` (``pos[w] < pos[z]``); ``z`` stacks
+        on top of those it overlaps, except for an in-place reuse. Reciprocal
+        ``above_neighbors`` edges are kept consistent.
+        """
+        for b in self.below_neighbors[z]:
+            self.above_neighbors[b].discard(z)
+
+        pos_z = pos[z]
+        cand = [
+            w
+            for w in range(len(self.buffers))
+            if pos[w] < pos_z and self._overlaps(z, w)
+        ]
+        addr, partner = self._placement_decision(z, cand)
+        self.addresses[z] = addr
+        if partner is None:
+            self.inplace_reuse.pop(z, None)
+        else:
+            self.inplace_reuse[z] = partner
+
+        below = self._column_below(z, cand)
+        if partner is not None:
+            below.add(partner)
+        self.below_neighbors[z] = below
+        for b in below:
+            self.above_neighbors[b].add(z)
+
+    def _column_below(self, z: int, cand: list[int]) -> set[int]:
+        """Direct below-neighbours of ``z`` among ``cand`` (already placed).
+
+        At each tick of ``z``'s life, take the column with the greatest top at or
+        below ``z``'s address and include every buffer sharing that column's
+        address (in-place siblings); union over ticks. Mirrors the per-tick rule
+        in :meth:`_build_neighbor_graph`, restricted to the candidate set.
+        """
+        addr = self.addresses[z]
+        assert addr is not None
+        below: set[int] = set()
+        bz = self.buffers[z]
+        for t in range(bz.start_time, bz.end_time + 1):
+            nearest_top = -1
+            nearest_addr = None
+            for w in cand:
+                bw = self.buffers[w]
+                if not (bw.start_time <= t <= bw.end_time):
+                    continue
+                top_w = self._top(w)
+                if top_w <= addr and top_w > nearest_top:
+                    nearest_top = top_w
+                    nearest_addr = self.addresses[w]
+            if nearest_addr is None:
+                continue
+            for w in cand:
+                bw = self.buffers[w]
+                if (
+                    bw.start_time <= t <= bw.end_time
+                    and self.addresses[w] == nearest_addr
+                ):
+                    below.add(w)
+        return below
