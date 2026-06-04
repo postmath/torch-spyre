@@ -23,6 +23,7 @@ from torch._inductor.ir import (
     Operation,
     MutationLayoutSHOULDREMOVE,
     Reduction,
+    ExternKernel,
 )
 from torch._inductor.graph import GraphLowering
 
@@ -140,7 +141,7 @@ class ScratchpadAllocator(ABC):
             uses = lifetimes[output_name]
             if len(uses) <= 1:
                 continue  # output is not read (only the write, or never touched)
-            if not GraphEditor.all_uses_are_rewritable(graph, uses):
+            if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
                 continue
             if output_name in graph_output_names and not cloning_allowed:
                 continue  # we can only allocate graph outputs if we're allowed to clone
@@ -164,6 +165,8 @@ class ScratchpadAllocator(ABC):
                     # saves a roundtrip to HBM if it is allocated in LX, but the input is already
                     # present in HBM and would need to be cloned to LX explicitly, which costs one
                     # transfer anyway.
+                    continue
+                if not GraphEditor.all_uses_are_rewritable(graph, uses):
                     continue
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:

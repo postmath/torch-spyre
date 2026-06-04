@@ -24,9 +24,9 @@ import torch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.utils import OP_OUTPUT_GOOD_FOR_LX_REUSE
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
@@ -58,11 +58,14 @@ class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
 
 
 class TestScratchpadUsage(unittest.TestCase):
-    our_pre_scheduling_passes: list[Callable[[list[Operation]], None]] = []
+    our_pre_scheduling_passes: list[Callable[[GraphLowering], None]] = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.patchers = []
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
-        self.patchers = []
 
         self.patchers.append(t_inductor_config.patch("force_disable_caches", True))
         self.patchers.append(ts_inductor_config.patch("sencores", 1))
@@ -295,7 +298,20 @@ class TestCloneAtGraphBoundaries(TestScratchpadUsage):
     - graph inputs read by multiple ops get a clone that lands in LX
     - graph outputs that are also read inside the graph get a clone (for the HBM return
       value), while the original buffer is pinned to LX
+
+    The test ensures that "clone" is one of the ops that are good for LX reuse.
     """
+
+    @contextmanager
+    def clone_patcher(self):
+        OP_OUTPUT_GOOD_FOR_LX_REUSE.append("clone")
+        yield
+        OP_OUTPUT_GOOD_FOR_LX_REUSE.pop()
+
+    def setUp(self):
+        if "clone" not in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+            self.patchers.append(self.clone_patcher())
+        super().setUp()
 
     def _compile_and_inspect(
         self,
