@@ -303,6 +303,92 @@ class CappedAllocatorPlanBase(ABC):
         addr = self.addresses[idx]
         return addr is not None and addr + self.buffers[idx].size <= self.capacity
 
+    def _overlaps(self, i: int, j: int) -> bool:
+        """True if buffers ``i`` and ``j`` are alive at a common tick.
+
+        Lifetimes are closed intervals ``[start_time, end_time]``, so an
+        in-place parent and child (``parent.end_time == child.start_time``)
+        overlap at exactly that boundary tick.
+        """
+        a = self.buffers[i]
+        b = self.buffers[j]
+        return a.start_time <= b.end_time and b.start_time <= a.end_time
+
+    def _in_place_pair(self, i: int, j: int) -> Optional[tuple[int, int]]:
+        """Return ``(parent_idx, child_idx)`` if ``i`` and ``j`` form an in-place
+        pair, else ``None``.
+
+        The relationship is declared on the child via ``in_place_parents``; it is
+        symmetric for placement purposes, so either argument may be the parent.
+        """
+        bi = self.buffers[i]
+        bj = self.buffers[j]
+        if bj.name in bi.in_place_parents:
+            return (j, i)  # j is the parent of i
+        if bi.name in bj.in_place_parents:
+            return (i, j)  # i is the parent of j
+        return None
+
+    def _can_inplace(self, parent: int, child: int) -> bool:
+        """True if ``child`` is allowed to share ``parent``'s address.
+
+        A child may only reuse a parent's storage if it fits within it; a
+        larger child would still need the parent's inputs while writing past
+        the parent's footprint.
+        """
+        return self.buffers[child].size <= self.buffers[parent].size
+
+    def _inplace_is_safe(
+        self, base: int, size: int, candidates: list[int], exclude: int
+    ) -> bool:
+        """True if placing a buffer at ``[base, base + size)`` collides with no
+        candidate other than ``exclude``.
+
+        Used to validate in-place reuse: an in-place partner only shields the
+        child from buffers that also coexisted with the parent. Any other
+        candidate alive during the child's lifetime that intrudes on the reused
+        range forbids the reuse (we never place a child partway into occupied
+        space).
+        """
+        hi = base + size
+        for p in candidates:
+            if p == exclude:
+                continue
+            assert (addr := self.addresses[p]) is not None
+            if addr < hi and base < self._top(p):
+                return False
+        return True
+
+    def _address_from_candidates(self, idx: int, candidates: list[int]) -> int:
+        """Compute ``idx``'s address given the buffers it must sit on top of.
+
+        ``candidates`` are already-placed buffer indices that overlap ``idx`` in
+        time. For the reference plan these are *all* time-overlapping buffers;
+        for the incremental plan they are ``idx``'s direct below-neighbours --
+        both yield the same address because shielded buffers neither raise the
+        high-water mark nor affect the safety check.
+
+        ``idx`` stacks immediately above the highest candidate, unless that
+        highest candidate is an in-place partner whose address can be safely
+        reused (see :meth:`_inplace_is_safe`).
+        """
+        if not candidates:
+            return 0
+        # Topmost candidate: highest exclusive top; ties prefer an in-place
+        # partner (so reuse gets a chance), then lowest index for determinism.
+        top_buf = max(
+            candidates,
+            key=lambda p: (self._top(p), self._in_place_pair(idx, p) is not None, -p),
+        )
+        max_top = self._top(top_buf)
+        pair = self._in_place_pair(idx, top_buf)
+        if pair is not None and self._can_inplace(*pair):
+            base = self.addresses[top_buf]
+            assert base is not None
+            if self._inplace_is_safe(base, self.buffers[idx].size, candidates, top_buf):
+                return base
+        return self._align_up(max_top)
+
     def total_size(self) -> int:
         """Total size of all buffers fully allocated below capacity (O(1))."""
         return self.total_allocated_size
@@ -330,8 +416,16 @@ class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
     """
 
     def _build(self) -> None:
-        # Step 2: O(n^2) placement.
-        pass
+        n = len(self.buffers)
+        self.addresses = [None] * n
+        self.total_allocated_size = 0
+        for pos in range(n):
+            idx = self.permutation[pos]
+            prior = self.permutation[:pos]
+            candidates = [p for p in prior if self._overlaps(idx, p)]
+            self.addresses[idx] = self._address_from_candidates(idx, candidates)
+            if self._is_fully_allocated(idx):
+                self.total_allocated_size += self.buffers[idx].size
 
     def swap(self, i: int) -> int:
         raise NotImplementedError("Step 4")
