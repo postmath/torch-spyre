@@ -155,15 +155,21 @@ class ScratchpadAllocator(ABC):
         if cloning_allowed:
             ncores = get_ncores_for_buffers(graph)
             for input_name in graph.graph_input_names:
-                if len(lifetimes[input_name]) <= 1:
-                    continue  # input read only once, or not at all
+                uses = lifetimes[input_name]
+                if len(uses) <= 1:
+                    # Input read only once, or not at all. A non-input that's read only once still
+                    # saves a roundtrip to HBM if it is allocated in LX, but the input is already
+                    # present in HBM and would need to be cloned to LX explicitly, which costs one
+                    # transfer anyway.
+                    continue
+                if not GraphEditor.all_uses_are_rewritable(graph, uses):
+                    continue
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
                     continue  # core division mismatch across consumers
                 buf = graph.get_buffer(input_name)
                 dev_layout = buf.layout.device_layout
                 dev_size = math.prod(dev_layout.device_size[:-1]) * 128
-                uses = lifetimes[input_name]
                 buffers.append(
                     LifetimeBoundBuffer(
                         input_name,

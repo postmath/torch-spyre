@@ -67,7 +67,10 @@ class GraphEditor:
         while not isinstance(buffer, Buffer):
             if isinstance(buffer, TensorBox):
                 fs.append(TensorBox)
-            elif isinstance(buffer, StorageBox):
+            else:
+                assert isinstance(buffer, StorageBox), (
+                    f"unexpected buffer type {type(buffer)} ({buffer})"
+                )
                 fs.append(StorageBox)
             buffer = buffer.data
 
@@ -125,6 +128,9 @@ class GraphEditor:
         if isinstance(buffer, TensorBox):
             buf_name = buffer.data.data.name  # type: ignore
         else:
+            assert isinstance(buffer, ComputedBuffer), (
+                f"unexpected buffer type {type(buffer)} ({buffer})"
+            )
             buf_name = buffer.name
         assert isinstance(buf_name, str)
         buf_fx = list(buffer.origins)[0]  # .origin_node may not exist
@@ -181,6 +187,9 @@ class GraphEditor:
             users_of_new_buf = []
             for node in self.lowering.name_to_users[buf_name]:
                 while not isinstance(node, Buffer):
+                    assert hasattr(node, "data"), (
+                        f"unexpected node type {type(node)} ({node})"
+                    )
                     node = node.data
                 if node.name in [buf_name, new_buf_name]:  # type: ignore
                     users_of_inp.append(node)
@@ -191,11 +200,12 @@ class GraphEditor:
 
             # Step 4: Hack user nodes' inner_fn
             for old_com_buf in buffer_users:
-                # hack inner_fn with a nameSwapper ops handler and make a new LoopIR
-                new_loop = self._create_loop_hack_inner_fn(
-                    old_com_buf.data, name_map={buf_name: new_buf_name}
-                )
-                old_com_buf.data = new_loop
+                if GraphEditor.is_rewritable_consumer(old_com_buf):
+                    self._swap_loops_input(old_com_buf, buf_name, new_buf_name)
+                else:
+                    raise NotImplementedError(
+                        f"unexpected buffer user type {type(old_com_buf)} ({old_com_buf})"
+                    )
 
         # NOTE: operations is a reference to graph.operations, which is already
         # updated when we call graph.register_operation() earlier. But the new Op
@@ -210,6 +220,41 @@ class GraphEditor:
         self.lowering.operations.insert(idx_to_first_user, new_com_buf)
 
         return new_com_buf
+
+    @staticmethod
+    def all_uses_are_rewritable(graph: GraphLowering, uses: list[int]) -> bool:
+        return all(
+            GraphEditor.is_rewritable_consumer(graph.operations[use]) for use in uses
+        )
+
+    @staticmethod
+    def is_rewritable_consumer(op: Operation):
+        """An op that wraps a Pointwise or Reduction.
+
+        We encounter a FallbackKernel with some frequency, and that would be really useful to
+        support as well. But the straightforward approach doesn't work, i.e.,
+
+        def _swap_inputs_kernel_input(
+            self, inputs_kernel: ir.InputsKernel, old_name: str, new_buffer: Buffer
+        ):
+            for i in range(len(inputs_kernel.inputs)):
+                if inputs_kernel.input_name(i) == old_name:
+                    inputs_kernel.inputs[i] = new_buffer
+                    break
+
+            inputs_kernel.get_free_symbol_uses.clear_cache(inputs_kernel)
+
+        So instead we just allow ops that wrap a Pointwise or Reduction.
+        """
+        return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
+
+    def _swap_loops_input(self, old_loop: Operation, old_name: str, new_name: str):
+        """Hack inner_fn with a nameSwapper ops handler and make a new LoopIR."""
+        assert isinstance(old_loop.data, Pointwise | Reduction)
+        new_loop = self._create_loop_hack_inner_fn(
+            old_loop.data, name_map={old_name: new_name}
+        )
+        old_loop.data = new_loop
 
     class _NameSwapHandler(WrapperHandler):
         def __init__(self, inner, name_map: dict[str, str]):
