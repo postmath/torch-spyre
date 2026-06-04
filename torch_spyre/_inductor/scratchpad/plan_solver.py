@@ -199,3 +199,156 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                     self._try_allocate(buffer)
 
         return buffers
+
+
+class CappedAllocatorPlanBase(ABC):
+    """Shared state and interface for capacity-bounded allocation plans.
+
+    A plan places a set of :class:`LifetimeBoundBuffer` objects into a
+    fixed-capacity scratchpad following a *permutation*: an explicit allocation
+    order given as a list of buffer indices. Buffer ``permutation[k]`` is
+    allocated on top of every already-placed buffer whose lifetime overlaps it
+    (respecting in-place parents), rounded up to ``alignment``.
+
+    Addresses are maintained internally and are **not** written back to the
+    buffer objects until :meth:`finalize`. Two buffers that are alive at the
+    same logical tick may not occupy overlapping address ranges, with the sole
+    exception of an in-place parent/child pair, which may share an identical
+    address (``P.end_time == C.start_time``).
+
+    The objective being optimized is :meth:`total_size`: the summed size of
+    every buffer that fits *entirely* below ``capacity``. Buffers whose
+    placement would cross the capacity line keep their (notional) address for
+    ordering purposes but are neither counted nor written back on
+    :meth:`finalize`.
+
+    Subclasses implement :meth:`_build` (initial placement) and :meth:`swap`
+    (incremental re-placement after exchanging two adjacent permutation
+    entries).
+
+    Args:
+        buffers: The buffers to place. Indices into this list are the values
+            used in ``permutation`` and as keys throughout the plan.
+        permutation: Allocation order as a permutation of
+            ``range(len(buffers))``.
+        capacity: Scratchpad capacity in bytes.
+        alignment: Byte alignment boundary for placed addresses. Defaults to 128
+            (one Spyre stick).
+    """
+
+    def __init__(
+        self,
+        buffers: list[LifetimeBoundBuffer],
+        permutation: list[int],
+        capacity: int,
+        alignment: int = 128,
+    ):
+        n = len(buffers)
+        assert sorted(permutation) == list(range(n)), (
+            "permutation must be a permutation of range(len(buffers))"
+        )
+        self.buffers = buffers
+        self.permutation = list(permutation)
+        self.capacity = capacity
+        self.alignment = alignment
+        self._name_to_idx = {buf.name: i for i, buf in enumerate(buffers)}
+
+        # Internal address per buffer index; None means unplaced. Populated by
+        # _build and kept in sync by swap. Not written to buffer objects until
+        # finalize.
+        self.addresses: list[Optional[int]] = [None] * n
+
+        # Sum of buf.size over all fully-allocated buffers (address + size <=
+        # capacity). Maintained incrementally; exposed via total_size().
+        self.total_allocated_size: int = 0
+
+        self._build()
+
+    @abstractmethod
+    def _build(self) -> None:
+        """Compute addresses for every buffer in permutation order.
+
+        Populates ``self.addresses`` and ``self.total_allocated_size`` (and any
+        subclass-specific structures). Called once from ``__init__``.
+        """
+        pass
+
+    @abstractmethod
+    def swap(self, i: int) -> int:
+        """Swap permutation entries ``i`` and ``i + 1`` and re-place buffers.
+
+        Args:
+            i: Position in the permutation; entries ``i`` and ``i + 1`` are
+                exchanged.
+
+        Returns:
+            The change in :meth:`total_size` caused by the swap (new minus old).
+        """
+        pass
+
+    # --- shared helpers -----------------------------------------------------
+
+    def _align_up(self, addr: int) -> int:
+        """Round ``addr`` up to the next multiple of ``self.alignment``."""
+        return math.ceil(addr / self.alignment) * self.alignment
+
+    def _top(self, idx: int) -> int:
+        """Return ``address + size`` for a placed buffer (its exclusive top)."""
+        addr = self.addresses[idx]
+        assert addr is not None, f"buffer {idx} is not placed"
+        return addr + self.buffers[idx].size
+
+    def _is_fully_allocated(self, idx: int) -> bool:
+        """True if buffer ``idx`` has an address and fits below ``capacity``."""
+        addr = self.addresses[idx]
+        return addr is not None and addr + self.buffers[idx].size <= self.capacity
+
+    def total_size(self) -> int:
+        """Total size of all buffers fully allocated below capacity (O(1))."""
+        return self.total_allocated_size
+
+    def finalize(self) -> None:
+        """Write back addresses of fully-allocated buffers to the buffers.
+
+        Buffers that do not fit entirely below ``capacity`` have their
+        ``address`` set to ``None`` and are not committed.
+        """
+        for idx, buf in enumerate(self.buffers):
+            if self._is_fully_allocated(idx):
+                buf.address = self.addresses[idx]
+            else:
+                buf.address = None
+
+
+class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
+    """Simple, obviously-correct O(n^2) reference plan.
+
+    Placement scans all previously-placed, time-overlapping buffers for each
+    buffer; ``swap`` mutates the permutation and rebuilds from scratch. Kept as
+    a permanent oracle for differential testing against the incremental
+    :class:`CappedAllocatorPlan`.
+    """
+
+    def _build(self) -> None:
+        # Step 2: O(n^2) placement.
+        pass
+
+    def swap(self, i: int) -> int:
+        raise NotImplementedError("Step 4")
+
+
+class CappedAllocatorPlan(CappedAllocatorPlanBase):
+    """Incremental capacity-bounded allocation plan.
+
+    Maintains a neighbor graph (buffers directly below/above each buffer in
+    address space, including air-gap dependencies) so that swapping two adjacent
+    permutation entries only re-places the affected buffers via change-driven
+    propagation, rather than rebuilding the whole layout.
+    """
+
+    def _build(self) -> None:
+        # Step 3: neighbor-graph construction + placement.
+        pass
+
+    def swap(self, i: int) -> int:
+        raise NotImplementedError("Step 4")
