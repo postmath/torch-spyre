@@ -431,6 +431,16 @@ class SwapTests(TestCase):
         self.assertEqual(plan.total_size(), 30)
         self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 30])
 
+    def test_finalize_after_swaps_end_to_end(self):
+        # Build, optimize via swaps, then commit: only buffers that fit below
+        # capacity get an address written back.
+        buffers = [_buf("a", 30, 0, 2), _buf("b", 90, 0, 2)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        plan.swap(0)  # -> [b, a]: b@0 fits, a@90 (-> 120) does not
+        plan.finalize()
+        self.assertEqual(buffers[1].address, 0)  # b committed
+        self.assertIsNone(buffers[0].address)  # a over capacity, dropped
+
     def test_random_swap_sequences_match_reference(self):
         for seed in range(3000):
             rng = random.Random(seed)
@@ -456,16 +466,11 @@ class SwapTests(TestCase):
                 self.assertEqual(fast.total_size(), ref.total_size(), tag)
                 self.assertEqual(delta, fast.total_size() - before, tag)
 
-                # The graph stays self-consistent: addresses recoverable from
-                # below-neighbours, and below/above remain reciprocal.
-                for idx in range(n):
-                    addr, _ = fast._placement_decision(
-                        idx, sorted(fast.below_neighbors[idx])
-                    )
-                    self.assertEqual(addr, fast.addresses[idx], f"{tag} idx={idx}")
-                for c, lowers in fast.below_neighbors.items():
-                    for b in lowers:
-                        self.assertIn(c, fast.above_neighbors[b], tag)
-                for b, uppers in fast.above_neighbors.items():
-                    for c in uppers:
-                        self.assertIn(b, fast.below_neighbors[c], tag)
+                # The incrementally maintained graph matches a from-scratch
+                # rebuild of the same permutation, exactly.
+                rebuilt = CappedAllocatorPlan(
+                    buffers, list(fast.permutation), cap, align
+                )
+                self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
+                self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
+                self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
