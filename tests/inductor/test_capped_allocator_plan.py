@@ -14,6 +14,7 @@
 
 """Tests for the capacity-bounded allocation plans."""
 
+import random
 from unittest import TestCase
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -23,6 +24,71 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 
 ALIGNMENT = 128
+
+
+def _random_buffers(rng, n, horizon=12, max_size=200):
+    """Generate ``n`` random buffers, occasionally wiring in-place pairs."""
+    buffers = []
+    for i in range(n):
+        start = rng.randint(0, horizon)
+        end = rng.randint(start, horizon)
+        size = rng.randint(1, max_size)
+        buffers.append(_buf(f"b{i}", size, start, end))
+    # Turn a few buffers into in-place children of an earlier buffer: align the
+    # child's start to the parent's end and clamp its size to fit.
+    for child_i in range(1, n):
+        if rng.random() < 0.25:
+            parent_i = rng.randrange(child_i)
+            parent = buffers[parent_i]
+            child = buffers[child_i]
+            child.start_time = parent.end_time
+            child.end_time = max(child.end_time, parent.end_time)
+            child.size = rng.randint(1, parent.size)
+            child.in_place_parents = [parent.name]
+    return buffers
+
+
+def _oracle_graph(plan):
+    """Independent brute-force neighbour graph from the final addresses.
+
+    Implemented differently from the production sweep: for every ordered pair
+    (b, c) with b entirely below c, b is a direct below-neighbour iff there is
+    some shared tick at which no third buffer d sits strictly between them
+    (``b.top <= d.addr`` and ``d.top <= c.addr``). In-place partners sharing an
+    address are never "entirely below" each other, so the explicit edges added
+    first are the only links between them.
+    """
+    n = len(plan.buffers)
+    addr = plan.addresses
+    bufs = plan.buffers
+    below = {i: set() for i in range(n)}
+    above = {i: set() for i in range(n)}
+    for reuser, reused in plan.inplace_reuse.items():
+        below[reuser].add(reused)
+        above[reused].add(reuser)
+
+    def top(i):
+        return addr[i] + bufs[i].size
+
+    for c in range(n):
+        for b in range(n):
+            if b == c or top(b) > addr[c]:
+                continue
+            lo = max(bufs[b].start_time, bufs[c].start_time)
+            hi = min(bufs[b].end_time, bufs[c].end_time)
+            for t in range(lo, hi + 1):
+                between = any(
+                    d not in (b, c)
+                    and bufs[d].start_time <= t <= bufs[d].end_time
+                    and top(b) <= addr[d]
+                    and top(d) <= addr[c]
+                    for d in range(n)
+                )
+                if not between:
+                    below[c].add(b)
+                    above[b].add(c)
+                    break
+    return below, above
 
 
 def _buf(name, size, start, end, in_place_parents=None):
@@ -228,3 +294,96 @@ class ReferencePlacementTests(TestCase):
         plan.finalize()
         self.assertEqual(buffers[0].address, 0)
         self.assertIsNone(buffers[1].address)  # over capacity, not committed
+
+
+class NeighborGraphTests(TestCase):
+    """Step 3: neighbour-graph construction in CappedAllocatorPlan."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return CappedAllocatorPlan(buffers, permutation, capacity, alignment)
+
+    def _below(self, plan, name):
+        return {
+            plan.buffers[i].name for i in plan.below_neighbors[plan._name_to_idx[name]]
+        }
+
+    def _above(self, plan, name):
+        return {
+            plan.buffers[i].name for i in plan.above_neighbors[plan._name_to_idx[name]]
+        }
+
+    def test_simple_stack_edges(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 1, 3)]
+        plan = self.plan(buffers, [0, 1])  # a@0, b@64
+        self.assertEqual(self._below(plan, "b"), {"a"})
+        self.assertEqual(self._above(plan, "a"), {"b"})
+        self.assertEqual(self._below(plan, "a"), set())
+        self.assertEqual(self._above(plan, "b"), set())
+
+    def test_air_gap_neighbor(self):
+        # low spans the whole range; tall is briefly stacked on it and forces
+        # high up to 320. After tall dies, only low sits beneath high, with an
+        # air gap in (64, 320). low must still be a below-neighbour of high.
+        low = _buf("low", 64, 0, 10)
+        tall = _buf("tall", 256, 0, 3)
+        high = _buf("high", 64, 0, 10)
+        plan = self.plan([low, tall, high], [0, 1, 2])
+        self.assertEqual(_addr(plan, "low"), 0)
+        self.assertEqual(_addr(plan, "tall"), 64)
+        self.assertEqual(_addr(plan, "high"), 320)
+        self.assertEqual(self._below(plan, "high"), {"low", "tall"})
+
+    def test_in_place_edge_is_explicit(self):
+        parent = _buf("p", 128, 0, 5)
+        child = _buf("c", 64, 5, 10, in_place_parents=["p"])
+        plan = self.plan([parent, child], [0, 1])  # c reuses p's address (0)
+        self.assertEqual(self._below(plan, "c"), {"p"})
+        self.assertEqual(self._above(plan, "p"), {"c"})
+
+    # --- randomized differential checks ------------------------------------
+
+    def _cases(self, seeds=300, max_n=8):
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, max_n)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            capacity = rng.choice([200, 600, 10_000])
+            alignment = rng.choice([1, 64, 128])
+            yield seed, buffers, perm, capacity, alignment
+
+    def test_addresses_match_reference(self):
+        for seed, buffers, perm, cap, align in self._cases():
+            ref = ReferenceCappedAllocatorPlan(buffers, perm, cap, align)
+            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            self.assertEqual(fast.addresses, ref.addresses, f"seed={seed}")
+            self.assertEqual(fast.total_size(), ref.total_size(), f"seed={seed}")
+
+    def test_graph_matches_oracle(self):
+        for seed, buffers, perm, cap, align in self._cases():
+            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            below, above = _oracle_graph(fast)
+            self.assertEqual(fast.below_neighbors, below, f"seed={seed}")
+            self.assertEqual(fast.above_neighbors, above, f"seed={seed}")
+
+    def test_graph_is_symmetric(self):
+        for seed, buffers, perm, cap, align in self._cases():
+            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            for c, lowers in fast.below_neighbors.items():
+                for b in lowers:
+                    self.assertIn(c, fast.above_neighbors[b], f"seed={seed}")
+            for b, uppers in fast.above_neighbors.items():
+                for c in uppers:
+                    self.assertIn(b, fast.below_neighbors[c], f"seed={seed}")
+
+    def test_below_neighbors_determine_address(self):
+        # The invariant Step 4 relies on: each buffer's address is recovered
+        # from its below-neighbours alone, identically to the full build.
+        for seed, buffers, perm, cap, align in self._cases():
+            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            for idx in range(len(buffers)):
+                addr, _ = fast._placement_decision(
+                    idx, sorted(fast.below_neighbors[idx])
+                )
+                self.assertEqual(addr, fast.addresses[idx], f"seed={seed} idx={idx}")

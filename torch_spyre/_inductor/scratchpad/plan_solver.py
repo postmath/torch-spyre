@@ -338,56 +338,52 @@ class CappedAllocatorPlanBase(ABC):
         """
         return self.buffers[child].size <= self.buffers[parent].size
 
-    def _inplace_is_safe(
-        self, base: int, size: int, candidates: list[int], exclude: int
-    ) -> bool:
-        """True if placing a buffer at ``[base, base + size)`` collides with no
-        candidate other than ``exclude``.
-
-        Used to validate in-place reuse: an in-place partner only shields the
-        child from buffers that also coexisted with the parent. Any other
-        candidate alive during the child's lifetime that intrudes on the reused
-        range forbids the reuse (we never place a child partway into occupied
-        space).
-        """
-        hi = base + size
-        for p in candidates:
-            if p == exclude:
-                continue
-            assert (addr := self.addresses[p]) is not None
-            if addr < hi and base < self._top(p):
-                return False
-        return True
-
-    def _address_from_candidates(self, idx: int, candidates: list[int]) -> int:
-        """Compute ``idx``'s address given the buffers it must sit on top of.
+    def _placement_decision(
+        self, idx: int, candidates: list[int]
+    ) -> tuple[int, Optional[int]]:
+        """Decide ``idx``'s address given the buffers it must sit on top of.
 
         ``candidates`` are already-placed buffer indices that overlap ``idx`` in
         time. For the reference plan these are *all* time-overlapping buffers;
         for the incremental plan they are ``idx``'s direct below-neighbours --
-        both yield the same address because shielded buffers neither raise the
-        high-water mark nor affect the safety check.
+        both yield the same decision, because the highest top among them is the
+        same and that is all the rule depends on.
 
-        ``idx`` stacks immediately above the highest candidate, unless that
-        highest candidate is an in-place partner whose address can be safely
-        reused (see :meth:`_inplace_is_safe`).
+        ``idx`` is placed on top of everything it overlaps. The one exception is
+        an in-place partner ``P`` (``P.end_time == idx.start_time`` or vice
+        versa): ``idx`` may instead drop into ``P``'s slot, reusing ``P``'s
+        address, but *only* when every other overlapping buffer already tops out
+        at or below ``P``'s address -- otherwise ``idx`` would land partway into
+        occupied space. When that holds, dropping onto ``P`` still leaves ``idx``
+        above all the others (it saves ``P``'s footprint rather than stacking on
+        top of it).
+
+        Returns:
+            ``(address, partner)`` where ``partner`` is the candidate whose
+            address was reused in-place, or ``None`` if ``idx`` was stacked.
         """
         if not candidates:
-            return 0
-        # Topmost candidate: highest exclusive top; ties prefer an in-place
-        # partner (so reuse gets a chance), then lowest index for determinism.
-        top_buf = max(
-            candidates,
-            key=lambda p: (self._top(p), self._in_place_pair(idx, p) is not None, -p),
-        )
-        max_top = self._top(top_buf)
-        pair = self._in_place_pair(idx, top_buf)
-        if pair is not None and self._can_inplace(*pair):
-            base = self.addresses[top_buf]
-            assert base is not None
-            if self._inplace_is_safe(base, self.buffers[idx].size, candidates, top_buf):
-                return base
-        return self._align_up(max_top)
+            return 0, None
+        max_top = max(self._top(p) for p in candidates)
+        # Try to drop into an in-place partner's slot. At most one partner can
+        # qualify: if two did, each would have to top out below the other's
+        # address, which is impossible.
+        for partner in candidates:
+            pair = self._in_place_pair(idx, partner)
+            if pair is None or not self._can_inplace(*pair):
+                continue
+            partner_addr = self.addresses[partner]
+            assert partner_addr is not None
+            others_top = max(
+                (self._top(q) for q in candidates if q != partner), default=0
+            )
+            if others_top <= partner_addr:
+                return partner_addr, partner
+        return self._align_up(max_top), None
+
+    def _address_from_candidates(self, idx: int, candidates: list[int]) -> int:
+        """Return only the address from :meth:`_placement_decision`."""
+        return self._placement_decision(idx, candidates)[0]
 
     def total_size(self) -> int:
         """Total size of all buffers fully allocated below capacity (O(1))."""
@@ -438,11 +434,104 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
     address space, including air-gap dependencies) so that swapping two adjacent
     permutation entries only re-places the affected buffers via change-driven
     propagation, rather than rebuilding the whole layout.
+
+    Attributes:
+        below_neighbors: ``below_neighbors[c]`` is the set of buffer indices
+            directly below ``c`` -- those that share a tick with ``c`` and are
+            the nearest buffer beneath it at that tick (air gaps included), plus
+            any in-place partner whose address ``c`` reuses. ``c``'s address is
+            a function of exactly this set.
+        above_neighbors: the inverse relation; used to find which buffers may
+            need re-placing when ``c``'s top moves.
+        inplace_reuse: ``inplace_reuse[x] = y`` when buffer ``x`` reused
+            partner ``y``'s address in-place (``x`` was placed at ``y``'s
+            address).
     """
 
     def _build(self) -> None:
-        # Step 3: neighbor-graph construction + placement.
-        pass
+        n = len(self.buffers)
+        self.addresses = [None] * n
+        self.total_allocated_size = 0
+        # reuser idx -> reused (partner) idx for placements that went in-place.
+        self.inplace_reuse: dict[int, int] = {}
+        for pos in range(n):
+            idx = self.permutation[pos]
+            prior = self.permutation[:pos]
+            candidates = [p for p in prior if self._overlaps(idx, p)]
+            addr, partner = self._placement_decision(idx, candidates)
+            self.addresses[idx] = addr
+            if partner is not None:
+                self.inplace_reuse[idx] = partner
+            if self._is_fully_allocated(idx):
+                self.total_allocated_size += self.buffers[idx].size
+        self._build_neighbor_graph()
+
+    def _build_neighbor_graph(self) -> None:
+        """Populate ``below_neighbors`` / ``above_neighbors`` from the layout.
+
+        ``c``'s direct below-neighbours at a tick are the buffers forming the
+        nearest *column* entirely below it: we find the greatest top at or under
+        ``c``'s address, then take every buffer sharing that column's address
+        (in-place siblings share an address and so share a column). Taking only
+        the single nearest buffer would be wrong -- a shorter in-place sibling,
+        shielded by a taller one whose top reaches a byte higher, would be
+        dropped, yet it still occupies the column beneath ``c`` and so must count
+        among the "other" buffers when deciding whether ``c`` may drop into an
+        in-place partner's slot. Nothing lies between the column and ``c`` (a
+        higher entirely-below buffer contradicts "greatest"; a buffer crossing
+        ``c``'s address would overlap ``c`` in time, which the layout forbids),
+        so this captures the true adjacency, air gaps included. We union over
+        every integer tick: an adjacency can first appear at an interior tick
+        where two buffers that previously separated the pair have both died,
+        with nothing entering or leaving at that tick.
+
+        In-place partners that share ``c``'s own address are handled separately:
+        being level with ``c`` they are not "below" it, so the sweep never links
+        them. The explicit ``reused -> reuser`` edge instead records that
+        dependency, so the reuser re-derives its address from the partner while
+        the reused buffer keeps its own geometric below-neighbours.
+        """
+        n = len(self.buffers)
+        self.below_neighbors: dict[int, set[int]] = {i: set() for i in range(n)}
+        self.above_neighbors: dict[int, set[int]] = {i: set() for i in range(n)}
+
+        # Explicit in-place edges: the reuser depends on the reused partner.
+        for reuser, reused in self.inplace_reuse.items():
+            self.below_neighbors[reuser].add(reused)
+            self.above_neighbors[reused].add(reuser)
+
+        if n == 0:
+            return
+
+        min_start = min(b.start_time for b in self.buffers)
+        max_end = max(b.end_time for b in self.buffers)
+
+        for t in range(min_start, max_end + 1):
+            alive = [
+                i
+                for i in range(n)
+                if self.buffers[i].start_time <= t <= self.buffers[i].end_time
+            ]
+            for c in alive:
+                ca = self.addresses[c]
+                assert ca is not None
+                # Address of the highest column entirely below c at this tick.
+                nearest_top = -1
+                nearest_addr = None
+                for b in alive:
+                    if b == c:
+                        continue
+                    top_b = self._top(b)
+                    if top_b <= ca and top_b > nearest_top:
+                        nearest_top = top_b
+                        nearest_addr = self.addresses[b]
+                if nearest_addr is None:
+                    continue
+                # Link c to every buffer in that column (in-place siblings).
+                for b in alive:
+                    if b != c and self.addresses[b] == nearest_addr:
+                        self.below_neighbors[c].add(b)
+                        self.above_neighbors[b].add(c)
 
     def swap(self, i: int) -> int:
         raise NotImplementedError("Step 4")
