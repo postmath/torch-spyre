@@ -32,14 +32,14 @@ random adjacent swaps that touch non-overlapping buffers and return in O(1).
 ```
      n |  bld ref bld fast |   swap ref |  rnd fast (noop%)  spdup | ovlp fast  spdup
 -------------------------------------------------------------------------------------
-    16 |    0.02m    0.05m |     20.0us |    11.6us     61%     2x |    31.5us     1x
-    32 |    0.06m    0.17m |     59.6us |    24.0us     71%     2x |   116.9us     1x
-    64 |    0.16m    0.42m |    165.1us |    11.8us     86%    14x |    81.2us     2x
-   128 |    0.50m    1.23m |    513.4us |     8.0us     95%    64x |   105.5us     5x
-   256 |    1.82m    4.16m |   1799.4us |    24.0us     96%    75x |   225.2us     8x
-   512 |    7.45m   16.57m |   7530.6us |    14.7us     97%   514x |   333.8us    23x
-  1024 |   28.82m   62.36m |  28623.7us |     4.9us     99%  5871x |   382.3us    75x
-  2048 |  109.70m  256.88m | 110691.6us |    19.9us     99%  5571x |   468.4us   236x
+    16 |    0.02m    0.06m |     20.0us |    11.2us     61%     2x |    22.8us     1x
+    32 |    0.06m    0.18m |     62.2us |    18.2us     71%     3x |    81.4us     1x
+    64 |    0.16m    0.43m |    168.8us |     8.7us     86%    19x |    59.5us     3x
+   128 |    0.53m    1.21m |    519.6us |     5.8us     95%    89x |    73.5us     7x
+   256 |    1.81m    4.08m |   1783.6us |     6.7us     96%   265x |   131.4us    14x
+   512 |    7.42m   16.37m |   7497.7us |    10.5us     97%   712x |   218.8us    34x
+  1024 |   29.91m   64.05m |  28795.0us |     4.3us     99%  6707x |   228.3us   126x
+  2048 |  114.04m  244.48m | 110663.9us |    10.3us     99% 10791x |   255.0us   434x
 ```
 
 (Single run on one machine; absolute numbers vary with hardware, but the
@@ -61,19 +61,20 @@ handful of swaps.
   O(1) no-ops (99% at n ≥ 1024). Average stays ~5–24 µs — up to **~5900x
   faster**.
 - **Incremental, worst case** (`ovlp fast`): forcing *every* swap onto an
-  overlapping pair (full propagation) still grows only ~linearly (31 → 468 µs),
-  giving **236x at n=2048** with a widening gap.
+  overlapping pair (full propagation) stays nearly flat at large `n`
+  (228 → 255 µs from n=1024 to n=2048), giving **434x at n=2048** with a
+  widening gap.
 
-**Bottom line.** Reference swap is O(n^2); incremental swap is roughly O(n)
-even on the all-real-work path. For a local search performing thousands of
-swaps, the ~2.3x build penalty is negligible and the per-swap speedup is one to
-three orders of magnitude.
+**Bottom line.** Reference swap is O(n^2); incremental swap is driven by the
+neighbour graph and scales with the *affected* set rather than `n`. For a local
+search performing thousands of swaps, the ~2.3x build penalty is negligible and
+the per-swap speedup is one to four orders of magnitude.
 
-### Note on the residual O(n) per swap
+### Implementation note
 
-The incremental swap currently still does O(n) work per call independent of how
-much actually changes: it rebuilds the position array and, when an address
-changes, marks every later-positioned overlapping buffer dirty via a linear
-scan. The propagation itself is local. Replacing those linear scans with
-`above_neighbors`-driven propagation would make the worst-case swap sub-linear
-in `n` (proportional to the number of buffers actually affected).
+`swap` maintains the position index in O(1), processes only the affected
+buffers via a min-heap over positions, and propagates through `above_neighbors`
+(plus the resters on any column a buffer joins in-place) rather than scanning
+all positions. The remaining mild growth in the worst-case column comes from
+re-deriving each affected buffer's below-set, which still scans candidate
+buffers; bounding that to the buffer's actual overlap set would remove it.

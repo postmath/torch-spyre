@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
+import heapq
 import math
 
 
@@ -469,6 +470,20 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
                 self.inplace_reuse[idx] = partner
             if self._is_fully_allocated(idx):
                 self.total_allocated_size += self.buffers[idx].size
+        # Persistent position index, maintained in O(1) by swap().
+        self.position: list[int] = [0] * n
+        for p, idx in enumerate(self.permutation):
+            self.position[idx] = p
+        # In-place partners (parents and children) per buffer; the only buffers
+        # that may legally share an address with it. Used by swap() to find the
+        # other members of a buffer's column.
+        self.inplace_partners: dict[int, set[int]] = {i: set() for i in range(n)}
+        for child in range(n):
+            for pname in self.buffers[child].in_place_parents:
+                parent = self._name_to_idx.get(pname)
+                if parent is not None:
+                    self.inplace_partners[child].add(parent)
+                    self.inplace_partners[parent].add(child)
         self._build_neighbor_graph()
 
     def _build_neighbor_graph(self) -> None:
@@ -541,15 +556,24 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
     def swap(self, i: int) -> int:
         """Swap permutation entries ``i`` and ``i+1`` and re-place incrementally.
 
-        Buffers before position ``i`` are untouched. If the two swapped buffers
-        do not overlap in time the layout is identical, so this is a no-op.
-        Otherwise we re-place the affected buffers in a single forward pass:
-        dependencies always point to earlier positions, so visiting positions in
-        increasing order lets every buffer re-derive from already-settled ones.
-        A buffer is re-placed only when "dirty"; when a re-placed buffer's
-        address changes, every later-positioned buffer overlapping it is marked
-        dirty (a safe superset -- unaffected ones re-derive to the same address
-        and stop the cascade).
+        A no-op when the swapped buffers do not overlap in time. Otherwise the
+        work is driven by the neighbour graph instead of by scanning positions:
+
+        - Affected buffers are processed in a min-heap keyed by position.
+          Dependencies always point to earlier positions, so a buffer is settled
+          before anything resting on it, and ``position`` is maintained in O(1).
+        - Each processed buffer is re-derived in full (address *and* below/above
+          edges): the cascade can move a buffer into or out of another's column,
+          changing neighbour sets well beyond the swapped pair, so an
+          address-only update is not enough.
+        - When a buffer's address changes we enqueue its ``above_neighbors``
+          (the buffers resting on it, which a height change can disturb) and, if
+          it reused an in-place partner, also the partner's ``above_neighbors``:
+          a buffer joining a partner's column -- the only way two overlapping
+          buffers share an address -- adds itself to the below-set of everything
+          resting on that column, without the partner itself moving. Only
+          later-positioned buffers are notified, since a below-set draws solely
+          from earlier positions. This visits only the buffers a swap affects.
 
         Returns:
             The change in :meth:`total_size` (new minus old).
@@ -559,31 +583,37 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
         perm = self.permutation
         x, y = perm[i], perm[i + 1]
         perm[i], perm[i + 1] = y, x
+        self.position[x], self.position[y] = i + 1, i
         if not self._overlaps(x, y):
             # Independent buffers: their order does not affect any address.
             return 0
 
-        pos = [0] * n
-        for p, idx in enumerate(perm):
-            pos[idx] = p
-
         old_total = self.total_allocated_size
-        dirty = [False] * n
-        dirty[x] = dirty[y] = True
-        for p in range(i, n):
-            z = perm[p]
-            if not dirty[z]:
-                continue
+        seed = {x, y} | self.above_neighbors[x] | self.above_neighbors[y]
+        heap = [(self.position[idx], idx) for idx in seed]
+        heapq.heapify(heap)
+        queued = set(seed)
+        while heap:
+            _, z = heapq.heappop(heap)
+            queued.discard(z)
             old_addr = self.addresses[z]
             if self._is_fully_allocated(z):
                 self.total_allocated_size -= self.buffers[z].size
-            self._replace_buffer(z, pos)
+            self._replace_buffer(z, self.position)
             if self._is_fully_allocated(z):
                 self.total_allocated_size += self.buffers[z].size
             if self.addresses[z] != old_addr:
-                for w in range(n):
-                    if pos[w] > p and self._overlaps(z, w):
-                        dirty[w] = True
+                # Resters on z, plus resters on any column z now shares with an
+                # in-place partner (z just joined that partner's column).
+                notify = set(self.above_neighbors[z])
+                for partner in self.inplace_partners[z]:
+                    if self.addresses[partner] == self.addresses[z]:
+                        notify |= self.above_neighbors[partner]
+                pos_z = self.position[z]
+                for w in notify:
+                    if w not in queued and self.position[w] > pos_z:
+                        queued.add(w)
+                        heapq.heappush(heap, (self.position[w], w))
         return self.total_allocated_size - old_total
 
     def _replace_buffer(self, z: int, pos: list[int]) -> None:
