@@ -36,13 +36,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 
 
 def make_buffers(rng, n):
-    """Localized lifetimes (length ~ uniform 1..8) over a horizon of n ticks,
-    so overlap density stays bounded and the workload looks like a real
-    schedule rather than everything-alive-at-once."""
+    """Localized half-open lifetimes [start, end) (length ~ uniform 1..8) over a
+    horizon of n ticks, so overlap density stays bounded and the workload looks
+    like a real schedule rather than everything-alive-at-once."""
     buffers = []
     for i in range(n):
         start = rng.randint(0, n)
-        end = start + rng.randint(0, 8)
+        end = start + rng.randint(1, 8)
         size = rng.randint(1, 4096)
         buffers.append(
             LifetimeBoundBuffer(f"b{i}", size, start, end, in_place_parents=[])
@@ -52,7 +52,7 @@ def make_buffers(rng, n):
             pi = rng.randrange(max(0, ci - 12), ci)
             parent = buffers[pi]
             child = buffers[ci]
-            child.start_time = parent.end_time
+            child.start_time = parent.end_time - 1
             child.end_time = parent.end_time + rng.randint(0, 8)
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]

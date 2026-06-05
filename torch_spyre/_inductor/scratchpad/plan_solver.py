@@ -215,7 +215,7 @@ class CappedAllocatorPlanBase(ABC):
     buffer objects until :meth:`finalize`. Two buffers that are alive at the
     same logical tick may not occupy overlapping address ranges, with the sole
     exception of an in-place parent/child pair, which may share an identical
-    address (``P.end_time == C.start_time``).
+    address (``P.end_time == C.start_time + 1``).
 
     The objective being optimized is :meth:`total_size`: the summed size of
     every buffer that fits *entirely* below ``capacity``. Buffers whose
@@ -307,13 +307,13 @@ class CappedAllocatorPlanBase(ABC):
     def _overlaps(self, i: int, j: int) -> bool:
         """True if buffers ``i`` and ``j`` are alive at a common tick.
 
-        Lifetimes are closed intervals ``[start_time, end_time]``, so an
-        in-place parent and child (``parent.end_time == child.start_time``)
-        overlap at exactly that boundary tick.
+        Lifetimes are half-open intervals ``[start_time, end_time)``, so an
+        in-place parent and child (``parent.end_time == child.start_time + 1``)
+        overlap at exactly that boundary tick (``child.start_time``).
         """
         a = self.buffers[i]
         b = self.buffers[j]
-        return a.start_time <= b.end_time and b.start_time <= a.end_time
+        return a.start_time < b.end_time and b.start_time < a.end_time
 
     def _in_place_pair(self, i: int, j: int) -> Optional[tuple[int, int]]:
         """Return ``(parent_idx, child_idx)`` if ``i`` and ``j`` form an in-place
@@ -351,7 +351,7 @@ class CappedAllocatorPlanBase(ABC):
         same and that is all the rule depends on.
 
         ``idx`` is placed on top of everything it overlaps. The one exception is
-        an in-place partner ``P`` (``P.end_time == idx.start_time`` or vice
+        an in-place partner ``P`` (``P.end_time == idx.start_time + 1`` or vice
         versa): ``idx`` may instead drop into ``P``'s slot, reusing ``P``'s
         address, but *only* when every other overlapping buffer already tops out
         at or below ``P``'s address -- otherwise ``idx`` would land partway into
@@ -535,11 +535,11 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
         min_start = min(b.start_time for b in self.buffers)
         max_end = max(b.end_time for b in self.buffers)
 
-        for t in range(min_start, max_end + 1):
+        for t in range(min_start, max_end):
             alive = [
                 i
                 for i in range(n)
-                if self.buffers[i].start_time <= t <= self.buffers[i].end_time
+                if self.buffers[i].start_time <= t < self.buffers[i].end_time
             ]
             for c in alive:
                 ca = self.addresses[c]
@@ -665,12 +665,12 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
         assert addr is not None
         below: set[int] = set()
         bz = self.buffers[z]
-        for t in range(bz.start_time, bz.end_time + 1):
+        for t in range(bz.start_time, bz.end_time):
             nearest_top = -1
             nearest_addr = None
             for w in cand:
                 bw = self.buffers[w]
-                if not (bw.start_time <= t <= bw.end_time):
+                if not (bw.start_time <= t < bw.end_time):
                     continue
                 top_w = self._top(w)
                 if top_w <= addr and top_w > nearest_top:
@@ -681,7 +681,7 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
             for w in cand:
                 bw = self.buffers[w]
                 if (
-                    bw.start_time <= t <= bw.end_time
+                    bw.start_time <= t < bw.end_time
                     and self.addresses[w] == nearest_addr
                 ):
                     below.add(w)

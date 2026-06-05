@@ -27,21 +27,25 @@ ALIGNMENT = 128
 
 
 def _random_buffers(rng, n, horizon=12, max_size=200):
-    """Generate ``n`` random buffers, occasionally wiring in-place pairs."""
+    """Generate ``n`` random buffers, occasionally wiring in-place pairs.
+
+    Lifetimes are half-open ``[start, end)`` and non-empty (end > start).
+    """
     buffers = []
     for i in range(n):
         start = rng.randint(0, horizon)
-        end = rng.randint(start, horizon)
+        end = rng.randint(start + 1, horizon + 1)
         size = rng.randint(1, max_size)
         buffers.append(_buf(f"b{i}", size, start, end))
-    # Turn a few buffers into in-place children of an earlier buffer: align the
-    # child's start to the parent's end and clamp its size to fit.
+    # Turn a few buffers into in-place children of an earlier buffer: the child
+    # starts at the parent's last live tick (parent.end - 1, so that
+    # parent.end == child.start + 1) and clamps its size to fit.
     for child_i in range(1, n):
         if rng.random() < 0.25:
             parent_i = rng.randrange(child_i)
             parent = buffers[parent_i]
             child = buffers[child_i]
-            child.start_time = parent.end_time
+            child.start_time = parent.end_time - 1
             child.end_time = max(child.end_time, parent.end_time)
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
@@ -76,10 +80,10 @@ def _oracle_graph(plan):
                 continue
             lo = max(bufs[b].start_time, bufs[c].start_time)
             hi = min(bufs[b].end_time, bufs[c].end_time)
-            for t in range(lo, hi + 1):
+            for t in range(lo, hi):
                 between = any(
                     d not in (b, c)
-                    and bufs[d].start_time <= t <= bufs[d].end_time
+                    and bufs[d].start_time <= t < bufs[d].end_time
                     and top(b) <= addr[d]
                     and top(d) <= addr[c]
                     for d in range(n)
@@ -244,7 +248,7 @@ class ReferencePlacementTests(TestCase):
 
     def test_in_place_child_reuses_parent_address(self):
         parent = _buf("p", 128, 0, 5)
-        child = _buf("c", 64, 5, 10, in_place_parents=["p"])
+        child = _buf("c", 64, 4, 10, in_place_parents=["p"])
         plan = self.plan([parent, child], [0, 1])
         self.assertEqual(_addr(plan, "p"), 0)
         self.assertEqual(_addr(plan, "c"), 0)  # reuses parent's address
@@ -253,14 +257,14 @@ class ReferencePlacementTests(TestCase):
     def test_in_place_parent_placed_after_child_reuses_address(self):
         # Symmetric case: child allocated first, parent reuses its address.
         parent = _buf("p", 128, 0, 5)
-        child = _buf("c", 64, 5, 10, in_place_parents=["p"])
+        child = _buf("c", 64, 4, 10, in_place_parents=["p"])
         plan = self.plan([parent, child], [1, 0])  # child first
         self.assertEqual(_addr(plan, "c"), 0)
         self.assertEqual(_addr(plan, "p"), 0)  # parent reuses child's address
 
     def test_in_place_blocked_when_child_larger_than_parent(self):
         parent = _buf("p", 64, 0, 5)
-        child = _buf("c", 128, 5, 10, in_place_parents=["p"])
+        child = _buf("c", 128, 4, 10, in_place_parents=["p"])
         plan = self.plan([parent, child], [0, 1])
         self.assertEqual(_addr(plan, "p"), 0)
         self.assertEqual(_addr(plan, "c"), 64)  # cannot reuse; stacks on top
@@ -270,7 +274,7 @@ class ReferencePlacementTests(TestCase):
         # child but not the parent, so reusing the parent's address would
         # overlap Z. Placement must fall back to stacking.
         parent = _buf("p", 50, 0, 5)
-        child = _buf("c", 30, 5, 10, in_place_parents=["p"])
+        child = _buf("c", 30, 4, 10, in_place_parents=["p"])
         z = _buf("z", 20, 6, 10)
         plan = self.plan([parent, child, z], [0, 2, 1])  # order: p, z, c
         self.assertEqual(_addr(plan, "p"), 0)
@@ -335,7 +339,7 @@ class NeighborGraphTests(TestCase):
 
     def test_in_place_edge_is_explicit(self):
         parent = _buf("p", 128, 0, 5)
-        child = _buf("c", 64, 5, 10, in_place_parents=["p"])
+        child = _buf("c", 64, 4, 10, in_place_parents=["p"])
         plan = self.plan([parent, child], [0, 1])  # c reuses p's address (0)
         self.assertEqual(self._below(plan, "c"), {"p"})
         self.assertEqual(self._above(plan, "p"), {"c"})
