@@ -484,6 +484,15 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
                 if parent is not None:
                     self.inplace_partners[child].add(parent)
                     self.inplace_partners[parent].add(child)
+        # Time-overlap sets. Lifetimes never change, so this is computed once
+        # and lets swap() find a buffer's candidates in O(degree) instead of
+        # scanning all n buffers.
+        self.overlaps: dict[int, set[int]] = {i: set() for i in range(n)}
+        for a in range(n):
+            for b in range(a + 1, n):
+                if self._overlaps(a, b):
+                    self.overlaps[a].add(b)
+                    self.overlaps[b].add(a)
         self._build_neighbor_graph()
 
     def _build_neighbor_graph(self) -> None:
@@ -621,17 +630,15 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
 
         Uses only buffers placed before ``z`` (``pos[w] < pos[z]``); ``z`` stacks
         on top of those it overlaps, except for an in-place reuse. Reciprocal
-        ``above_neighbors`` edges are kept consistent.
+        ``above_neighbors`` edges are kept consistent. Candidates are drawn from
+        ``z``'s precomputed time-overlap set, so this costs O(degree) rather than
+        scanning all buffers.
         """
         for b in self.below_neighbors[z]:
             self.above_neighbors[b].discard(z)
 
         pos_z = pos[z]
-        cand = [
-            w
-            for w in range(len(self.buffers))
-            if pos[w] < pos_z and self._overlaps(z, w)
-        ]
+        cand = [w for w in self.overlaps[z] if pos[w] < pos_z]
         addr, partner = self._placement_decision(z, cand)
         self.addresses[z] = addr
         if partner is None:

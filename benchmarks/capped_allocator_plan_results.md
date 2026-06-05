@@ -32,14 +32,14 @@ random adjacent swaps that touch non-overlapping buffers and return in O(1).
 ```
      n |  bld ref bld fast |   swap ref |  rnd fast (noop%)  spdup | ovlp fast  spdup
 -------------------------------------------------------------------------------------
-    16 |    0.02m    0.06m |     20.0us |    11.2us     61%     2x |    22.8us     1x
-    32 |    0.06m    0.18m |     62.2us |    18.2us     71%     3x |    81.4us     1x
-    64 |    0.16m    0.43m |    168.8us |     8.7us     86%    19x |    59.5us     3x
-   128 |    0.53m    1.21m |    519.6us |     5.8us     95%    89x |    73.5us     7x
-   256 |    1.81m    4.08m |   1783.6us |     6.7us     96%   265x |   131.4us    14x
-   512 |    7.42m   16.37m |   7497.7us |    10.5us     97%   712x |   218.8us    34x
-  1024 |   29.91m   64.05m |  28795.0us |     4.3us     99%  6707x |   228.3us   126x
-  2048 |  114.04m  244.48m | 110663.9us |    10.3us     99% 10791x |   255.0us   434x
+    16 |    0.02m    0.06m |     20.0us |     9.7us     61%     2x |    20.3us     1x
+    32 |    0.06m    0.21m |     60.9us |    15.7us     71%     4x |    68.9us     1x
+    64 |    0.17m    0.53m |    169.9us |     6.2us     86%    27x |    45.3us     4x
+   128 |    0.52m    1.60m |    534.1us |     3.5us     95%   154x |    40.0us    13x
+   256 |    1.75m    5.67m |   1834.9us |     3.3us     96%   559x |    56.9us    32x
+   512 |    7.61m   23.75m |   7706.3us |     3.8us     97%  2054x |    65.6us   117x
+  1024 |   29.82m   94.82m |  28784.0us |     1.5us     99% 19064x |    42.1us   683x
+  2048 |  117.07m  362.51m | 114810.2us |     2.2us     99% 51196x |    31.4us  3658x
 ```
 
 (Single run on one machine; absolute numbers vary with hardware, but the
@@ -47,10 +47,10 @@ scaling trends are the point.)
 
 ## Interpretation
 
-**Build.** The incremental plan is ~2.3x slower to build than the reference —
-it pays a one-time cost to construct the neighbour graph on top of computing
-addresses. Both are roughly O(n^2). This penalty is amortized away after a
-handful of swaps.
+**Build.** The incremental plan is ~3x slower to build than the reference — it
+pays a one-time cost to construct the neighbour graph and the time-overlap sets
+on top of computing addresses. Both are roughly O(n^2). This penalty is
+amortized away after a handful of swaps.
 
 **Swap.** This is what the neighbour graph buys:
 
@@ -61,20 +61,20 @@ handful of swaps.
   O(1) no-ops (99% at n ≥ 1024). Average stays ~5–24 µs — up to **~5900x
   faster**.
 - **Incremental, worst case** (`ovlp fast`): forcing *every* swap onto an
-  overlapping pair (full propagation) stays nearly flat at large `n`
-  (228 → 255 µs from n=1024 to n=2048), giving **434x at n=2048** with a
-  widening gap.
+  overlapping pair (full propagation) is flat in `n` (~30–70 µs across the whole
+  range; the variation is noise, not growth), giving **3658x at n=2048** with a
+  gap that widens without bound.
 
 **Bottom line.** Reference swap is O(n^2); incremental swap is driven by the
 neighbour graph and scales with the *affected* set rather than `n`. For a local
-search performing thousands of swaps, the ~2.3x build penalty is negligible and
-the per-swap speedup is one to four orders of magnitude.
+search performing thousands of swaps, the ~3x build penalty is negligible and
+the per-swap speedup is two to four orders of magnitude.
 
 ### Implementation note
 
 `swap` maintains the position index in O(1), processes only the affected
 buffers via a min-heap over positions, and propagates through `above_neighbors`
 (plus the resters on any column a buffer joins in-place) rather than scanning
-all positions. The remaining mild growth in the worst-case column comes from
-re-deriving each affected buffer's below-set, which still scans candidate
-buffers; bounding that to the buffer's actual overlap set would remove it.
+all positions. Candidates for re-deriving an affected buffer come from a
+precomputed time-overlap set (lifetimes never change), so a swap touches no
+work proportional to `n` -- only to the buffers it actually disturbs.
