@@ -188,11 +188,11 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
                 )
         else:
             if initial == "first_fit":
-                initial = FirstFitLayoutSolver(size, self.alignment)
+                initial = FirstFitLayoutSolver(size, alignment)
             elif initial == "best_fit":
-                initial = BestFitLayoutSolver(size, self.alignment)
+                initial = BestFitLayoutSolver(size, alignment)
             elif initial == "greedy":
-                initial = GreedyLayoutSolver(size, self.alignment)
+                initial = GreedyLayoutSolver(size, alignment)
             elif isinstance(initial, str):
                 raise ValueError(
                     f"this string does not describe a known solver: {initial}"
@@ -230,6 +230,11 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
     def solve(self) -> None:
         for _ in range(self.starts):
             self.anneal()
+        # Restore the best permutation seen so finalize() commits it rather than
+        # whatever state annealing happened to end in.
+        if self.permutation != self.best_permutation:
+            self.permutation = copy.copy(self.best_permutation)
+            self._build()
 
     def anneal(self) -> None:
         quality_log = []
@@ -310,28 +315,34 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         qualities: list[Optional[int]] = [None] * n
         quality_before = self.quality()
 
-        # Consider swapping with all possible positions. First rotate i to position 0, then swap it
-        # forward one step at a time.
+        # Consider all reinsertion positions. First rotate i to position 0, then bubble it forward
+        # one step at a time, recording the quality at each position it visits. Buffer x ends at
+        # position ``upper_bound``.
         if i != 0:
             self.rotate(i, 0)
             qualities[0] = self.quality()
-        j = 0
         if allocated[i]:
             upper_bound = n - 1
         else:
-            upper_bound = max((i for i, b in enumerate(allocated) if b), default=0) + 1
+            # x is not legally allocated, so it can only be made to fit by moving it earlier; the
+            # last legally-allocated buffer sits at position k, so only positions 0..k+1 can change
+            # the quality. (See the monotonicity argument: x's address is non-decreasing in its
+            # position.)
+            upper_bound = (
+                max((pos for pos, b in enumerate(allocated) if b), default=0) + 1
+            )
             if upper_bound > n - 1:
                 upper_bound = n - 1
 
-        for j in range(1, upper_bound):
-            self.swap(j)
-            if j != i:
-                qualities[j] = self.quality()
+        for p in range(1, upper_bound + 1):
+            self.swap(p - 1)  # bubble x from position p-1 to position p
+            if p != i:
+                qualities[p] = self.quality()
 
-        insertion_points = [i for i, q in enumerate(qualities) if q is not None]
+        insertion_points = [pos for pos, q in enumerate(qualities) if q is not None]
         insertion_points = sorted(
             insertion_points,
-            key=lambda i: -qualities[i],  # type: ignore
+            key=lambda pos: -qualities[pos],  # type: ignore
         )
 
         for j in insertion_points:
@@ -344,4 +355,6 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
                 self.rotate(upper_bound, j)
                 return (i, j)
 
+        # Nothing accepted: leave the chain where it was by restoring x to position i.
+        self.rotate(upper_bound, i)
         return None
