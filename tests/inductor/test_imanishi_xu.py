@@ -27,6 +27,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 from torch_spyre._inductor.scratchpad.imanishi_xu import (
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
+    ReheatingSchedule,
 )
 
 # Heavy randomized anneals over many seeds, larger problems and longer
@@ -79,6 +80,61 @@ def _committed_total(buffers):
     return sum(b.size for b in buffers if b.address is not None)
 
 
+class CoolingScheduleTests(TestCase):
+    def test_exponential_schedule_sequence(self):
+        # alpha = (1/8) ** (1/3) = 0.5; cools once per epoch (at i=2, 4).
+        s = ExponentialCoolingSchedule(t0=8.0, t_end=1.0, steps_per_epoch=2, epochs=3)
+        traj = [s.reset()]
+        t = traj[0]
+        while t is not None:
+            t = s.update(True)  # ignores acceptance
+            traj.append(t)
+        self.assertEqual(traj, [8.0, 8.0, 4.0, 4.0, 2.0, 2.0, None])
+
+    def test_reheating_schedule_trajectory(self):
+        # Cool (halving) until the windowed acceptance rate drops below 0.5,
+        # locating T1, then cycle the band [T1/2, T1*2] twice.
+        s = ReheatingSchedule(
+            t0=100.0, alpha=0.5, window=4, stall_rate=0.5, delta=2.0, restarts=2
+        )
+        scripted = [True, True, True, True, False, False, False]
+        traj = [s.reset()]
+        t = traj[0]
+        i = 0
+        while t is not None:
+            accepted = scripted[i] if i < len(scripted) else False
+            t = s.update(accepted)
+            traj.append(t)
+            i += 1
+        # Stall at T1=1.5625 (rate 0.25 < 0.5); reheat band top/bottom = 3.125 /
+        # 0.78125, two cycles.
+        self.assertEqual(
+            traj,
+            [
+                100.0,
+                50.0,
+                25.0,
+                12.5,
+                6.25,
+                3.125,
+                1.5625,
+                3.125,
+                1.5625,
+                3.125,
+                1.5625,
+                None,
+            ],
+        )
+
+    def test_reheating_no_restarts_stops_at_stall(self):
+        s = ReheatingSchedule(
+            t0=8.0, alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=0
+        )
+        s.reset()
+        self.assertIsNotNone(s.update(False))  # window not full yet
+        self.assertIsNone(s.update(False))  # window full, rate 0 < 0.5 -> stop
+
+
 class ImanishiXuTests(TestCase):
     def _run(self, buffers, capacity, *, initial, seed, alignment=128):
         solver = ImanishiXuLayoutSolver(
@@ -129,6 +185,34 @@ class ImanishiXuTests(TestCase):
         self._run(second, cap, initial="first_fit", seed=42)
 
         self.assertEqual([b.address for b in first], [b.address for b in second])
+
+    def test_reheating_schedule_end_to_end(self):
+        for seed in range(40):
+            rng = rnd.Random(seed)
+            n = rng.randint(2, 8)
+            buffers = _random_buffers(rng, n)
+            cap = max(b.size for b in buffers) * rng.randint(2, 4)
+            initial = list(range(n))
+            rng.shuffle(initial)
+            initial_quality = PermutationBasedLayoutSolver(
+                copy.deepcopy(buffers), list(initial), cap, 128
+            ).quality()
+
+            schedule = ReheatingSchedule(
+                t0=max(b.size for b in buffers) * 2.0,
+                alpha=0.85,
+                window=15,
+                stall_rate=0.2,
+                delta=4.0,
+                restarts=3,
+            )
+            solver = ImanishiXuLayoutSolver(
+                cap, 128, initial=initial, schedule=schedule, random=rnd.Random(seed)
+            )
+            solver.plan_layout(buffers)
+
+            _assert_feasible(buffers, cap)
+            self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)
 
 
 @unittest.skipUnless(

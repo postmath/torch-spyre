@@ -27,6 +27,7 @@
 import math
 import copy
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import Iterable, Iterator, Optional, override
 import random as rnd
 from heapq import heappush, heappop
@@ -152,6 +153,98 @@ class IterableCoolingSchedule(CoolingSchedule):
     def update(self, accepted: bool) -> Optional[float]:
         assert self._it is not None
         return next(self._it, None)
+
+
+class ReheatingSchedule(CoolingSchedule):
+    """Locate the productive ("critical") temperature, then warm-restart around
+    it.
+
+    Phase 1 (cool): start at ``t0`` and multiply by ``alpha`` every step,
+    tracking the acceptance rate over a sliding window of the last ``window``
+    steps. When that rate first drops below ``stall_rate`` (the chain has
+    frozen at the current temperature), record that temperature as ``T1``.
+
+    Phase 2 (reheat): perform ``restarts`` cycles, each cooling by ``alpha``
+    from ``T1 * delta`` down to ``T1 / delta`` -- a fixed band around the
+    critical temperature -- then stop. This concentrates the budget where moves
+    are useful but not frozen, rather than re-cooling from a high temperature.
+
+    The acceptance signal makes phase 1 adaptive; the band cycling is fixed.
+    A cycle is ``2 * ln(delta) / ln(1/alpha)`` steps, so a run is roughly
+    ``len(phase 1) + restarts * cycle_length`` steps.
+    """
+
+    def __init__(
+        self,
+        *,
+        t0: float,
+        alpha: float,
+        window: int,
+        stall_rate: float,
+        delta: float,
+        restarts: int,
+        min_temp: Optional[float] = None,
+    ):
+        if not 0.0 < alpha < 1.0:
+            raise ValueError("alpha must be in (0, 1)")
+        if delta <= 1.0:
+            raise ValueError("delta must be > 1")
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        if not 0.0 <= stall_rate <= 1.0:
+            raise ValueError("stall_rate must be in [0, 1]")
+        if restarts < 0:
+            raise ValueError("restarts must be >= 0")
+        self.t0 = t0
+        self.alpha = alpha
+        self.window = window
+        self.stall_rate = stall_rate
+        self.delta = delta
+        self.restarts = restarts
+        # Safety floor: cooling reaches zero acceptance eventually, but guard
+        # against never stalling (e.g. stall_rate == 0).
+        self.min_temp = min_temp if min_temp is not None else t0 * 1e-12
+
+    @override
+    def reset(self) -> Optional[float]:
+        self._phase = "cool"
+        self._t = self.t0
+        self._recent: deque[bool] = deque()
+        self._accepts = 0
+        self._t1: Optional[float] = None
+        self._cycles_done = 0
+        return self._t
+
+    @override
+    def update(self, accepted: bool) -> Optional[float]:
+        if self._phase == "cool":
+            self._recent.append(accepted)
+            self._accepts += int(accepted)
+            if len(self._recent) > self.window:
+                self._accepts -= int(self._recent.popleft())
+            stalled = (
+                len(self._recent) == self.window
+                and self._accepts / self.window < self.stall_rate
+            )
+            if stalled or self._t <= self.min_temp:
+                self._t1 = self._t  # critical temperature
+                if self.restarts <= 0:
+                    return None
+                self._phase = "reheat"
+                self._t = self._t1 * self.delta
+                return self._t
+            self._t *= self.alpha
+            return self._t
+
+        # reheat: cool within the band, cycling `restarts` times.
+        assert self._t1 is not None
+        self._t *= self.alpha
+        if self._t <= self._t1 / self.delta:
+            self._cycles_done += 1
+            if self._cycles_done >= self.restarts:
+                return None
+            self._t = self._t1 * self.delta  # next cycle
+        return self._t
 
 
 class SolverToPermutation:
