@@ -488,3 +488,103 @@ class SwapTests(TestCase):
                 self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
                 self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
                 self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+
+
+class RotateTests(TestCase):
+    """rotate(i, j) and the single-element sweep it enables."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def test_rotate_noop(self):
+        buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
+        plan = self.plan(buffers, [0, 1])
+        before = list(plan.addresses)
+        self.assertEqual(plan.rotate(1, 1), 0)
+        self.assertEqual(plan.permutation, [0, 1])
+        self.assertEqual(plan.addresses, before)
+
+    def test_rotate_moves_element(self):
+        # Three mutually overlapping buffers; move the first to the end.
+        buffers = [_buf("a", 10, 0, 3), _buf("b", 20, 0, 3), _buf("c", 30, 0, 3)]
+        plan = self.plan(buffers, [0, 1, 2])  # a@0, b@10, c@30
+        plan.rotate(0, 2)  # -> [b, c, a]: b@0, c@20, a@50
+        self.assertEqual(plan.permutation, [1, 2, 0])
+        self.assertEqual([_addr(plan, n) for n in "abc"], [50, 0, 20])
+
+    def test_random_rotations_match_reference(self):
+        for seed in range(3000):
+            rng = random.Random(seed)
+            n = rng.randint(2, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+
+            for step in range(rng.randint(1, 2 * n)):
+                i, j = rng.randrange(n), rng.randrange(n)
+                before = fast.quality()
+                delta = fast.rotate(i, j)
+                tag = f"seed={seed} step={step} i={i} j={j}"
+
+                ref = ReferencePermutationBasedLayoutSolver(
+                    buffers, list(fast.permutation), cap, align
+                )
+                self.assertEqual(fast.addresses, ref.addresses, tag)
+                self.assertEqual(fast.quality(), ref.quality(), tag)
+                self.assertEqual(fast.count_allocated(), ref.count_allocated(), tag)
+                self.assertEqual(delta, fast.quality() - before, tag)
+
+                rebuilt = PermutationBasedLayoutSolver(
+                    buffers, list(fast.permutation), cap, align
+                )
+                self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
+                self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
+                self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+
+    def test_single_element_sweep_matches_reference(self):
+        # Sweep one element across every position (rotate it to 0, then bubble
+        # it right), reading quality() at each stop. Each stop must match a
+        # fresh build of that permutation, and a round trip must restore the
+        # original state exactly -- the contract the annealing sweep relies on.
+        for seed in range(500):
+            rng = random.Random(seed)
+            n = rng.randint(2, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+
+            orig_perm = list(fast.permutation)
+            orig_addr = list(fast.addresses)
+            i = rng.randrange(n)
+            x = orig_perm[i]
+            others = [b for b in orig_perm if b != x]
+
+            qualities = {}
+            fast.rotate(i, 0)  # x to the front
+            qualities[0] = fast.quality()
+            for p in range(1, n):
+                fast.swap(p - 1)  # bubble x from p-1 to p
+                qualities[p] = fast.quality()
+
+            # Every recorded objective matches a fresh build of "x inserted at p".
+            for p in range(n):
+                test_perm = others[:p] + [x] + others[p:]
+                ref = ReferencePermutationBasedLayoutSolver(
+                    buffers, test_perm, cap, align
+                )
+                self.assertEqual(qualities[p], ref.quality(), f"seed={seed} p={p}")
+
+            # Round trip restores the exact original state (no hysteresis).
+            fast.rotate(n - 1, i)
+            self.assertEqual(fast.permutation, orig_perm, f"seed={seed}")
+            self.assertEqual(fast.addresses, orig_addr, f"seed={seed}")
+            rebuilt = PermutationBasedLayoutSolver(buffers, orig_perm, cap, align)
+            self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, f"{seed}")
+            self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, f"{seed}")
+            self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, f"{seed}")
