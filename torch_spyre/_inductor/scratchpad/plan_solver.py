@@ -434,7 +434,7 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     Placement scans all previously-placed, time-overlapping buffers for each
     buffer; ``swap`` mutates the permutation and rebuilds from scratch. Kept as
     a permanent oracle for differential testing against the incremental
-    :class:`CappedAllocatorPlan`.
+    :class:`PermutationBasedLayoutSolver`.
     """
 
     def _build(self) -> None:
@@ -498,7 +498,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 self.inplace_reuse[idx] = partner
             if self._is_fully_allocated(idx):
                 self.total_allocated_size += self.buffers[idx].size
-                self.total_allocated_size += 1
+                self.total_allocated_count += 1
         # Persistent position index, maintained in O(1) by swap().
         self.position: list[int] = [0] * n
         for p, idx in enumerate(self.permutation):
