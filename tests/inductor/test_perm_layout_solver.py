@@ -588,3 +588,61 @@ class RotateTests(TestCase):
             self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, f"{seed}")
             self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, f"{seed}")
             self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, f"{seed}")
+
+
+class CopyTests(TestCase):
+    """copy() makes an independent layout snapshot sharing static structures."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def test_static_shared_dynamic_independent(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 1, 3)]
+        plan = self.plan(buffers, [0, 1, 2])
+        clone = plan.copy()
+        # Static structures are shared by reference.
+        self.assertIs(clone.buffers, plan.buffers)
+        self.assertIs(clone.overlaps, plan.overlaps)
+        self.assertIs(clone.inplace_partners, plan.inplace_partners)
+        self.assertIs(clone._name_to_idx, plan._name_to_idx)
+        # Dynamic state is equal but independent.
+        self.assertEqual(clone.addresses, plan.addresses)
+        self.assertEqual(clone.below_neighbors, plan.below_neighbors)
+        self.assertIsNot(clone.permutation, plan.permutation)
+        self.assertIsNot(clone.below_neighbors, plan.below_neighbors)
+        self.assertIsNot(clone.below_neighbors[0], plan.below_neighbors[0])
+
+    def test_mutating_copy_leaves_original_intact(self):
+        for seed in range(2000):
+            rng = random.Random(seed)
+            n = rng.randint(2, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+
+            orig_perm = list(plan.permutation)
+            orig_addr = list(plan.addresses)
+            orig_below = {k: set(v) for k, v in plan.below_neighbors.items()}
+            orig_quality = plan.quality()
+
+            clone = plan.copy()
+            for _ in range(rng.randint(1, 2 * n)):
+                clone.swap(rng.randrange(n - 1))
+
+            # Original is untouched by mutations on the clone.
+            self.assertEqual(plan.permutation, orig_perm, seed)
+            self.assertEqual(plan.addresses, orig_addr, seed)
+            self.assertEqual(plan.below_neighbors, orig_below, seed)
+            self.assertEqual(plan.quality(), orig_quality, seed)
+
+            # The mutated clone is a valid plan: matches a fresh build.
+            rebuilt = PermutationBasedLayoutSolver(
+                buffers, list(clone.permutation), cap, align
+            )
+            self.assertEqual(clone.addresses, rebuilt.addresses, seed)
+            self.assertEqual(clone.quality(), rebuilt.quality(), seed)
+            self.assertEqual(clone.below_neighbors, rebuilt.below_neighbors, seed)
+            self.assertEqual(clone.above_neighbors, rebuilt.above_neighbors, seed)

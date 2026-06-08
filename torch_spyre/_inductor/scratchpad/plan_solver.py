@@ -715,3 +715,33 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 ):
                     below.add(w)
         return below
+
+    def copy(self) -> "PermutationBasedLayoutSolver":
+        """Return an independent layout snapshot that can be mutated (via
+        :meth:`swap` / :meth:`rotate`) without affecting this one.
+
+        Structures fixed for the lifetime of the plan -- ``buffers``,
+        ``_name_to_idx``, ``overlaps``, ``inplace_partners`` -- are shared by
+        reference; only the dynamic layout state (permutation, addresses,
+        positions, the neighbour graph and the running totals) is deep-copied.
+        So this costs O(n + graph size), not a rebuild. The result is always a
+        plain :class:`PermutationBasedLayoutSolver`, regardless of subclass.
+        """
+        clone = PermutationBasedLayoutSolver.__new__(PermutationBasedLayoutSolver)
+        # Shared, immutable-during-planning structures.
+        clone.buffers = self.buffers
+        clone._name_to_idx = self._name_to_idx
+        clone.capacity = self.capacity
+        clone.alignment = self.alignment
+        clone.overlaps = self.overlaps
+        clone.inplace_partners = self.inplace_partners
+        # Deep-copied dynamic state.
+        clone.permutation = list(self.permutation)
+        clone.addresses = list(self.addresses)
+        clone.position = list(self.position)
+        clone.total_allocated_size = self.total_allocated_size
+        clone.total_allocated_count = self.total_allocated_count
+        clone.inplace_reuse = dict(self.inplace_reuse)
+        clone.below_neighbors = {k: set(v) for k, v in self.below_neighbors.items()}
+        clone.above_neighbors = {k: set(v) for k, v in self.above_neighbors.items()}
+        return clone
