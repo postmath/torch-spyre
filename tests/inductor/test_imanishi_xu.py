@@ -15,7 +15,9 @@
 """End-to-end tests for the Imanishi/Xu simulated-annealing layout solver."""
 
 import copy
+import os
 import random as rnd
+import unittest
 from unittest import TestCase
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -26,6 +28,10 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
 )
+
+# Heavy randomized anneals over many seeds, larger problems and longer
+# schedules. Skipped by default (slow); opt in with the env var.
+_STRESS = os.environ.get("TORCH_SPYRE_STRESS_SCRATCHPAD") == "1"
 
 
 def _random_buffers(rng, n, horizon=12, max_size=200):
@@ -123,3 +129,38 @@ class ImanishiXuTests(TestCase):
         self._run(second, cap, initial="first_fit", seed=42)
 
         self.assertEqual([b.address for b in first], [b.address for b in second])
+
+
+@unittest.skipUnless(
+    _STRESS, "set TORCH_SPYRE_STRESS_SCRATCHPAD=1 to run scratchpad stress tests"
+)
+class ImanishiXuStressTests(TestCase):
+    """Heavy version of ImanishiXuTests: many seeds, larger problems and a
+    longer cooling schedule. Not run by default."""
+
+    def test_many_anneals_feasible_and_not_worse(self):
+        for seed in range(500):
+            rng = rnd.Random(seed)
+            n = rng.randint(2, 14)
+            buffers = _random_buffers(rng, n, horizon=20, max_size=300)
+            cap = max(b.size for b in buffers) * rng.randint(2, 5)
+            initial = list(range(n))
+            rng.shuffle(initial)
+            initial_quality = PermutationBasedLayoutSolver(
+                copy.deepcopy(buffers), list(initial), cap, 128
+            ).quality()
+
+            schedule = ExponentialCoolingSchedule(
+                t0=200.0, t_end=0.5, steps_per_epoch=8, epochs=6
+            )
+            solver = ImanishiXuLayoutSolver(
+                cap,
+                128,
+                initial=initial,
+                schedule=schedule,
+                random=rnd.Random(seed * 7 + 1),
+            )
+            solver.plan_layout(buffers)
+
+            _assert_feasible(buffers, cap)
+            self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)

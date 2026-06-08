@@ -14,7 +14,9 @@
 
 """Tests for the capacity-bounded allocation plans."""
 
+import os
 import random
+import unittest
 from unittest import TestCase
 from typing import TYPE_CHECKING
 
@@ -26,8 +28,12 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 
 ALIGNMENT = 128
 
+# Exhaustive randomized differential runs: thousands of seeds, larger problems,
+# dense in-place wiring. Skipped by default (slow); opt in with the env var.
+_STRESS = os.environ.get("TORCH_SPYRE_STRESS_SCRATCHPAD") == "1"
 
-def _random_buffers(rng, n, horizon=12, max_size=200):
+
+def _random_buffers(rng, n, horizon=12, max_size=200, inplace_prob=0.25):
     """Generate ``n`` random buffers, occasionally wiring in-place pairs.
 
     Lifetimes are half-open ``[start, end)`` and non-empty (end > start).
@@ -42,7 +48,7 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
     # starts at the parent's last live tick (parent.end - 1, so that
     # parent.end == child.start + 1) and clamps its size to fit.
     for child_i in range(1, n):
-        if rng.random() < 0.25:
+        if rng.random() < inplace_prob:
             parent_i = rng.randrange(child_i)
             parent = buffers[parent_i]
             child = buffers[child_i]
@@ -646,3 +652,101 @@ class CopyTests(TestCase):
             self.assertEqual(clone.quality(), rebuilt.quality(), seed)
             self.assertEqual(clone.below_neighbors, rebuilt.below_neighbors, seed)
             self.assertEqual(clone.above_neighbors, rebuilt.above_neighbors, seed)
+
+
+@unittest.skipUnless(
+    _STRESS, "set TORCH_SPYRE_STRESS_SCRATCHPAD=1 to run scratchpad stress tests"
+)
+class StressTests(TestCase):
+    """Exhaustive randomized differential coverage. Not run by default; these
+    are the heavy versions of the SwapTests / RotateTests / CopyTests checks --
+    thousands of seeds, larger n, dense in-place wiring -- against from-scratch
+    reference and rebuild oracles."""
+
+    def _stress_buffers(self, rng, n):
+        return _random_buffers(rng, n, horizon=15, max_size=300, inplace_prob=0.4)
+
+    def _cases(self, seeds, max_n=13):
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(2, max_n)
+            buffers = self._stress_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 800, 10**9])
+            align = rng.choice([1, 32, 64, 128])
+            yield seed, rng, n, buffers, perm, cap, align
+
+    def _assert_matches_rebuild(self, fast, cap, align, tag):
+        ref = ReferencePermutationBasedLayoutSolver(
+            fast.buffers, list(fast.permutation), cap, align
+        )
+        self.assertEqual(fast.addresses, ref.addresses, tag)
+        self.assertEqual(fast.quality(), ref.quality(), tag)
+        self.assertEqual(fast.count_allocated(), ref.count_allocated(), tag)
+        rebuilt = PermutationBasedLayoutSolver(
+            fast.buffers, list(fast.permutation), cap, align
+        )
+        self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
+        self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
+        self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+
+    def test_swap_sequences(self):
+        for seed, rng, n, buffers, perm, cap, align in self._cases(20000):
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            for step in range(rng.randint(1, 3 * n)):
+                i = rng.randrange(n - 1)
+                before = fast.quality()
+                delta = fast.swap(i)
+                tag = f"seed={seed} step={step}"
+                self.assertEqual(delta, fast.quality() - before, tag)
+                self._assert_matches_rebuild(fast, cap, align, tag)
+
+    def test_rotation_sequences(self):
+        for seed, rng, n, buffers, perm, cap, align in self._cases(10000):
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            for step in range(rng.randint(1, 3 * n)):
+                i, j = rng.randrange(n), rng.randrange(n)
+                before = fast.quality()
+                delta = fast.rotate(i, j)
+                tag = f"seed={seed} step={step} i={i} j={j}"
+                self.assertEqual(delta, fast.quality() - before, tag)
+                self._assert_matches_rebuild(fast, cap, align, tag)
+
+    def test_single_element_sweeps(self):
+        for seed, rng, n, buffers, perm, cap, align in self._cases(3000):
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            orig_perm = list(fast.permutation)
+            orig_addr = list(fast.addresses)
+            i = rng.randrange(n)
+            x = orig_perm[i]
+            others = [b for b in orig_perm if b != x]
+
+            qualities = {}
+            fast.rotate(i, 0)
+            qualities[0] = fast.quality()
+            for p in range(1, n):
+                fast.swap(p - 1)
+                qualities[p] = fast.quality()
+            for p in range(n):
+                test_perm = others[:p] + [x] + others[p:]
+                ref = ReferencePermutationBasedLayoutSolver(
+                    buffers, test_perm, cap, align
+                )
+                self.assertEqual(qualities[p], ref.quality(), f"seed={seed} p={p}")
+
+            fast.rotate(n - 1, i)
+            self.assertEqual(fast.permutation, orig_perm, seed)
+            self.assertEqual(fast.addresses, orig_addr, seed)
+
+    def test_copy_isolation(self):
+        for seed, rng, n, buffers, perm, cap, align in self._cases(10000):
+            plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            orig_addr = list(plan.addresses)
+            orig_below = {k: set(v) for k, v in plan.below_neighbors.items()}
+            clone = plan.copy()
+            for _ in range(rng.randint(1, 3 * n)):
+                clone.swap(rng.randrange(n - 1))
+            self.assertEqual(plan.addresses, orig_addr, seed)
+            self.assertEqual(plan.below_neighbors, orig_below, seed)
+            self._assert_matches_rebuild(clone, cap, align, f"seed={seed} (clone)")
