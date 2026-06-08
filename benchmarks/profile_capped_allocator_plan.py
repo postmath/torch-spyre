@@ -29,9 +29,9 @@ import random
 import time
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    CappedAllocatorPlan,
+    PermutationBasedLayoutSolver,
     LifetimeBoundBuffer,
-    ReferenceCappedAllocatorPlan,
+    ReferencePermutationBasedLayoutSolver,
 )
 
 
@@ -119,21 +119,22 @@ for n in SIZES:
 
     build_repeat = max(1, 2000 // n)
     t_build_ref = time_it(
-        lambda: ReferenceCappedAllocatorPlan(buffers, perm, cap, 128), build_repeat
+        lambda: ReferencePermutationBasedLayoutSolver(buffers, perm, cap, 128),
+        build_repeat,
     )
     t_build_fast = time_it(
-        lambda: CappedAllocatorPlan(buffers, perm, cap, 128), build_repeat
+        lambda: PermutationBasedLayoutSolver(buffers, perm, cap, 128), build_repeat
     )
 
     n_swaps = max(50, min(3000, 300000 // n))
     # swap ref: reference rebuilds regardless, so any swap sequence is O(n^2).
-    ref = ReferenceCappedAllocatorPlan(buffers, list(perm), cap, 128)
+    ref = ReferencePermutationBasedLayoutSolver(buffers, list(perm), cap, 128)
     s_ref = avg_swap_overlapping(ref, random.Random(7), n_swaps)
 
-    fast_rnd = CappedAllocatorPlan(buffers, list(perm), cap, 128)
+    fast_rnd = PermutationBasedLayoutSolver(buffers, list(perm), cap, 128)
     s_fast_rnd, noop = avg_swap_random(fast_rnd, random.Random(7), n_swaps)
 
-    fast_ovlp = CappedAllocatorPlan(buffers, list(perm), cap, 128)
+    fast_ovlp = PermutationBasedLayoutSolver(buffers, list(perm), cap, 128)
     s_fast_ovlp = avg_swap_overlapping(fast_ovlp, random.Random(7), n_swaps)
 
     print(

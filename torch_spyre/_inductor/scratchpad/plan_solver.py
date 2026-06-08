@@ -33,6 +33,10 @@ class LifetimeBoundBuffer:
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
 
+    def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
+        """Returns true iff self and other overlap in time."""
+        return self.start_time < other.end_time and other.start_time < self.end_time
+
 
 class MemoryPlanSolver(ABC):
     """
@@ -52,7 +56,6 @@ class MemoryPlanSolver(ABC):
         """
         self.limit = size
         self.alignment = alignment
-        self.usage: list[LifetimeBoundBuffer] = []
 
     @abstractmethod
     def plan_layout(
@@ -73,6 +76,10 @@ class MemoryPlanSolver(ABC):
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
+    def __init__(self, size: int, alignment: int = 128):
+        super().__init__(size, alignment)
+        self.usage: list[LifetimeBoundBuffer] = []
+
     def _get_lowest_addr_in_use(self):
         return min(
             (rec.address for rec in self.usage if rec.address is not None),
@@ -202,7 +209,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         return buffers
 
 
-class CappedAllocatorPlanBase(ABC):
+class PermutationBasedLayoutSolverBase(ABC):
     """Shared state and interface for capacity-bounded allocation plans.
 
     A plan places a set of :class:`LifetimeBoundBuffer` objects into a
@@ -257,11 +264,13 @@ class CappedAllocatorPlanBase(ABC):
         # Internal address per buffer index; None means unplaced. Populated by
         # _build and kept in sync by swap. Not written to buffer objects until
         # finalize.
-        self.addresses: list[Optional[int]] = [None] * n
+        self.addresses: list[int] = [0] * n
 
         # Sum of buf.size over all fully-allocated buffers (address + size <=
-        # capacity). Maintained incrementally; exposed via total_size().
+        # capacity). Maintained incrementally; exposed via quality(). Also, the
+        # count of these buffers, exposed via count_allocated().
         self.total_allocated_size: int = 0
+        self.total_allocated_count: int = 0
 
         self._build()
 
@@ -283,11 +292,27 @@ class CappedAllocatorPlanBase(ABC):
                 exchanged.
 
         Returns:
-            The change in :meth:`total_size` caused by the swap (new minus old).
+            The change in :meth:`quality` caused by the swap (new minus old).
         """
         pass
 
     # --- shared helpers -----------------------------------------------------
+
+    def rotate(self, i: int, j: int) -> int:
+        """Modify the permutation by taking ``self.permutation[i]`` out of the permutation and
+        reinserting it at position ``j``. Returns the change in :meth:`quality` caused by the
+        rotation (new minus old)."""
+        # If this shows up in profiling, then step 1 is to guard on abs(i - j) and if it's bigger
+        # than a threshold (e.g. n/2), modify the permutation directly and call _build(). For small
+        # values of abs(i - j) this version should be faster.
+        delta = 0
+        if i < j:
+            for k in range(i, j):
+                delta += self.swap(k)
+        elif j < i:
+            for k in range(i - 1, j - 1, -1):
+                delta += self.swap(k)
+        return delta
 
     def _align_up(self, addr: int) -> int:
         """Round ``addr`` up to the next multiple of ``self.alignment``."""
@@ -296,13 +321,12 @@ class CappedAllocatorPlanBase(ABC):
     def _top(self, idx: int) -> int:
         """Return ``address + size`` for a placed buffer (its exclusive top)."""
         addr = self.addresses[idx]
-        assert addr is not None, f"buffer {idx} is not placed"
         return addr + self.buffers[idx].size
 
     def _is_fully_allocated(self, idx: int) -> bool:
         """True if buffer ``idx`` has an address and fits below ``capacity``."""
         addr = self.addresses[idx]
-        return addr is not None and addr + self.buffers[idx].size <= self.capacity
+        return addr + self.buffers[idx].size <= self.capacity
 
     def _overlaps(self, i: int, j: int) -> bool:
         """True if buffers ``i`` and ``j`` are alive at a common tick.
@@ -311,9 +335,7 @@ class CappedAllocatorPlanBase(ABC):
         in-place parent and child (``parent.end_time == child.start_time + 1``)
         overlap at exactly that boundary tick (``child.start_time``).
         """
-        a = self.buffers[i]
-        b = self.buffers[j]
-        return a.start_time < b.end_time and b.start_time < a.end_time
+        return self.buffers[i].overlaps_in_time(self.buffers[j])
 
     def _in_place_pair(self, i: int, j: int) -> Optional[tuple[int, int]]:
         """Return ``(parent_idx, child_idx)`` if ``i`` and ``j`` form an in-place
@@ -374,7 +396,6 @@ class CappedAllocatorPlanBase(ABC):
             if pair is None or not self._can_inplace(*pair):
                 continue
             partner_addr = self.addresses[partner]
-            assert partner_addr is not None
             others_top = max(
                 (self._top(q) for q in candidates if q != partner), default=0
             )
@@ -386,9 +407,13 @@ class CappedAllocatorPlanBase(ABC):
         """Return only the address from :meth:`_placement_decision`."""
         return self._placement_decision(idx, candidates)[0]
 
-    def total_size(self) -> int:
+    def quality(self) -> int:
         """Total size of all buffers fully allocated below capacity (O(1))."""
         return self.total_allocated_size
+
+    def count_allocated(self) -> int:
+        """Count of all buffers fully allocated below capacity (O(1))."""
+        return self.total_allocated_count
 
     def finalize(self) -> None:
         """Write back addresses of fully-allocated buffers to the buffers.
@@ -403,7 +428,7 @@ class CappedAllocatorPlanBase(ABC):
                 buf.address = None
 
 
-class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
+class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     """Simple, obviously-correct O(n^2) reference plan.
 
     Placement scans all previously-placed, time-overlapping buffers for each
@@ -414,8 +439,9 @@ class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
 
     def _build(self) -> None:
         n = len(self.buffers)
-        self.addresses = [None] * n
+        self.addresses = [0] * n
         self.total_allocated_size = 0
+        self.total_allocated_count = 0
         for pos in range(n):
             idx = self.permutation[pos]
             prior = self.permutation[:pos]
@@ -423,6 +449,7 @@ class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
             self.addresses[idx] = self._address_from_candidates(idx, candidates)
             if self._is_fully_allocated(idx):
                 self.total_allocated_size += self.buffers[idx].size
+                self.total_allocated_count += 1
 
     def swap(self, i: int) -> int:
         """Swap permutation entries ``i``/``i+1`` and rebuild from scratch."""
@@ -433,7 +460,7 @@ class ReferenceCappedAllocatorPlan(CappedAllocatorPlanBase):
         return self.total_allocated_size - old_total
 
 
-class CappedAllocatorPlan(CappedAllocatorPlanBase):
+class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     """Incremental capacity-bounded allocation plan.
 
     Maintains a neighbor graph (buffers directly below/above each buffer in
@@ -456,8 +483,9 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
 
     def _build(self) -> None:
         n = len(self.buffers)
-        self.addresses = [None] * n
+        self.addresses = [0] * n
         self.total_allocated_size = 0
+        self.total_allocated_count = 0
         # reuser idx -> reused (partner) idx for placements that went in-place.
         self.inplace_reuse: dict[int, int] = {}
         for pos in range(n):
@@ -470,6 +498,7 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
                 self.inplace_reuse[idx] = partner
             if self._is_fully_allocated(idx):
                 self.total_allocated_size += self.buffers[idx].size
+                self.total_allocated_size += 1
         # Persistent position index, maintained in O(1) by swap().
         self.position: list[int] = [0] * n
         for p, idx in enumerate(self.permutation):
@@ -543,7 +572,6 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
             ]
             for c in alive:
                 ca = self.addresses[c]
-                assert ca is not None
                 # Address of the highest column entirely below c at this tick.
                 nearest_top = -1
                 nearest_addr = None
@@ -608,9 +636,11 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
             old_addr = self.addresses[z]
             if self._is_fully_allocated(z):
                 self.total_allocated_size -= self.buffers[z].size
+                self.total_allocated_count -= 1
             self._replace_buffer(z, self.position)
             if self._is_fully_allocated(z):
                 self.total_allocated_size += self.buffers[z].size
+                self.total_allocated_count += 1
             if self.addresses[z] != old_addr:
                 # Resters on z, plus resters on any column z now shares with an
                 # in-place partner (z just joined that partner's column).
@@ -662,7 +692,6 @@ class CappedAllocatorPlan(CappedAllocatorPlanBase):
         in :meth:`_build_neighbor_graph`, restricted to the candidate set.
         """
         addr = self.addresses[z]
-        assert addr is not None
         below: set[int] = set()
         bz = self.buffers[z]
         for t in range(bz.start_time, bz.end_time):

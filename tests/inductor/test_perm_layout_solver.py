@@ -16,11 +16,12 @@
 
 import random
 from unittest import TestCase
+from typing import TYPE_CHECKING
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    CappedAllocatorPlan,
+    PermutationBasedLayoutSolver,
     LifetimeBoundBuffer,
-    ReferenceCappedAllocatorPlan,
+    ReferencePermutationBasedLayoutSolver,
 )
 
 ALIGNMENT = 128
@@ -105,9 +106,15 @@ def _buf(name, size, start, end, in_place_parents=None):
     )
 
 
-# Both concrete plans share CappedAllocatorPlanBase, so the Step 1 skeleton
+# Both concrete plans share PermutationBasedLayoutSolverBase, so the Step 1 skeleton
 # behaviour (field setup, helpers, finalize) is identical and tested for both.
-class SkeletonTestsMixin:
+if TYPE_CHECKING:
+    MixinBase = TestCase
+else:
+    MixinBase = object
+
+
+class SkeletonTestsMixin(MixinBase):
     plan_class: type = None  # type: ignore[assignment]
 
     def make_plan(self, buffers, permutation, capacity, alignment=ALIGNMENT):
@@ -188,12 +195,12 @@ class SkeletonTestsMixin:
         self.assertIsNone(buffers[2].address)
 
 
-class ReferencePlanSkeletonTests(SkeletonTestsMixin, TestCase):
-    plan_class = ReferenceCappedAllocatorPlan
+class ReferenceSolverSkeletonTests(SkeletonTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
 
 
-class CappedAllocatorPlanSkeletonTests(SkeletonTestsMixin, TestCase):
-    plan_class = CappedAllocatorPlan
+class PermutationBasedLayoutSolverSkeletonTests(SkeletonTestsMixin, TestCase):
+    plan_class = PermutationBasedLayoutSolver
 
 
 def _addr(plan, name):
@@ -201,24 +208,26 @@ def _addr(plan, name):
 
 
 class ReferencePlacementTests(TestCase):
-    """Step 2: O(n^2) placement in ReferenceCappedAllocatorPlan."""
+    """Step 2: O(n^2) placement in ReferencePermutationBasedLayoutSolver."""
 
     def plan(self, buffers, permutation, capacity=10_000, alignment=1):
-        return ReferenceCappedAllocatorPlan(buffers, permutation, capacity, alignment)
+        return ReferencePermutationBasedLayoutSolver(
+            buffers, permutation, capacity, alignment
+        )
 
     def test_disjoint_lifetimes_all_at_zero(self):
         # No two buffers are ever alive together, so each reuses address 0.
         buffers = [_buf("a", 64, 0, 1), _buf("b", 64, 2, 3), _buf("c", 64, 4, 5)]
         plan = self.plan(buffers, [0, 1, 2])
         self.assertEqual([_addr(plan, n) for n in "abc"], [0, 0, 0])
-        self.assertEqual(plan.total_size(), 192)
+        self.assertEqual(plan.quality(), 192)
 
     def test_overlapping_lifetimes_stack(self):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 1, 3)]
         plan = self.plan(buffers, [0, 1])
         self.assertEqual(_addr(plan, "a"), 0)
         self.assertEqual(_addr(plan, "b"), 64)  # stacked on top of a
-        self.assertEqual(plan.total_size(), 114)
+        self.assertEqual(plan.quality(), 114)
 
     def test_permutation_order_changes_layout(self):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 1, 3)]
@@ -252,7 +261,7 @@ class ReferencePlacementTests(TestCase):
         plan = self.plan([parent, child], [0, 1])
         self.assertEqual(_addr(plan, "p"), 0)
         self.assertEqual(_addr(plan, "c"), 0)  # reuses parent's address
-        self.assertEqual(plan.total_size(), 192)
+        self.assertEqual(plan.quality(), 192)
 
     def test_in_place_parent_placed_after_child_reuses_address(self):
         # Symmetric case: child allocated first, parent reuses its address.
@@ -290,7 +299,7 @@ class ReferencePlacementTests(TestCase):
         plan = self.plan(buffers, [0, 1], capacity=100)
         self.assertEqual(_addr(plan, "a"), 0)
         self.assertEqual(_addr(plan, "b"), 64)  # 64 + 64 = 128 > 100
-        self.assertEqual(plan.total_size(), 64)  # only a counts
+        self.assertEqual(plan.quality(), 64)  # only a counts
 
     def test_finalize_after_build(self):
         buffers = [_buf("a", 64, 0, 3), _buf("b", 64, 1, 3)]
@@ -301,10 +310,10 @@ class ReferencePlacementTests(TestCase):
 
 
 class NeighborGraphTests(TestCase):
-    """Step 3: neighbour-graph construction in CappedAllocatorPlan."""
+    """Neighbour-graph construction in PermutationBasedLayoutSolver."""
 
     def plan(self, buffers, permutation, capacity=10_000, alignment=1):
-        return CappedAllocatorPlan(buffers, permutation, capacity, alignment)
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
 
     def _below(self, plan, name):
         return {
@@ -359,21 +368,21 @@ class NeighborGraphTests(TestCase):
 
     def test_addresses_match_reference(self):
         for seed, buffers, perm, cap, align in self._cases():
-            ref = ReferenceCappedAllocatorPlan(buffers, perm, cap, align)
-            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            ref = ReferencePermutationBasedLayoutSolver(buffers, perm, cap, align)
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
             self.assertEqual(fast.addresses, ref.addresses, f"seed={seed}")
-            self.assertEqual(fast.total_size(), ref.total_size(), f"seed={seed}")
+            self.assertEqual(fast.quality(), ref.quality(), f"seed={seed}")
 
     def test_graph_matches_oracle(self):
         for seed, buffers, perm, cap, align in self._cases():
-            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
             below, above = _oracle_graph(fast)
             self.assertEqual(fast.below_neighbors, below, f"seed={seed}")
             self.assertEqual(fast.above_neighbors, above, f"seed={seed}")
 
     def test_graph_is_symmetric(self):
         for seed, buffers, perm, cap, align in self._cases():
-            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
             for c, lowers in fast.below_neighbors.items():
                 for b in lowers:
                     self.assertIn(c, fast.above_neighbors[b], f"seed={seed}")
@@ -385,7 +394,7 @@ class NeighborGraphTests(TestCase):
         # The invariant Step 4 relies on: each buffer's address is recovered
         # from its below-neighbours alone, identically to the full build.
         for seed, buffers, perm, cap, align in self._cases():
-            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
             for idx in range(len(buffers)):
                 addr, _ = fast._placement_decision(
                     idx, sorted(fast.below_neighbors[idx])
@@ -394,10 +403,10 @@ class NeighborGraphTests(TestCase):
 
 
 class SwapTests(TestCase):
-    """Step 4: incremental swap in CappedAllocatorPlan."""
+    """Incremental swap in PermutationBasedLayoutSolver."""
 
     def plan(self, buffers, permutation, capacity=10_000, alignment=1):
-        return CappedAllocatorPlan(buffers, permutation, capacity, alignment)
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
 
     def test_overlapping_swap_relayouts(self):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
@@ -421,9 +430,9 @@ class SwapTests(TestCase):
         # is placed first changes the total.
         buffers = [_buf("a", 30, 0, 2), _buf("b", 90, 0, 2)]
         plan = self.plan(buffers, [0, 1], capacity=100)
-        self.assertEqual(plan.total_size(), 30)  # a@0 fits, b@30 (->120) does not
+        self.assertEqual(plan.quality(), 30)  # a@0 fits, b@30 (->120) does not
         delta = plan.swap(0)  # -> [b, a]: b@0 fits, a@90 (->120) does not
-        self.assertEqual(plan.total_size(), 90)
+        self.assertEqual(plan.quality(), 90)
         self.assertEqual(delta, 60)
 
     def test_swap_back_restores(self):
@@ -432,7 +441,7 @@ class SwapTests(TestCase):
         d1 = plan.swap(0)
         d2 = plan.swap(0)
         self.assertEqual(d1 + d2, 0)
-        self.assertEqual(plan.total_size(), 30)
+        self.assertEqual(plan.quality(), 30)
         self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 30])
 
     def test_finalize_after_swaps_end_to_end(self):
@@ -454,25 +463,25 @@ class SwapTests(TestCase):
             rng.shuffle(perm)
             cap = rng.choice([150, 400, 10_000])
             align = rng.choice([1, 64, 128])
-            fast = CappedAllocatorPlan(buffers, perm, cap, align)
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
 
             for step in range(rng.randint(1, 2 * n)):
                 i = rng.randrange(n - 1)
-                before = fast.total_size()
+                before = fast.quality()
                 delta = fast.swap(i)
                 tag = f"seed={seed} step={step}"
 
                 # Ground truth: a fresh reference build of the new permutation.
-                ref = ReferenceCappedAllocatorPlan(
+                ref = ReferencePermutationBasedLayoutSolver(
                     buffers, list(fast.permutation), cap, align
                 )
                 self.assertEqual(fast.addresses, ref.addresses, tag)
-                self.assertEqual(fast.total_size(), ref.total_size(), tag)
-                self.assertEqual(delta, fast.total_size() - before, tag)
+                self.assertEqual(fast.quality(), ref.quality(), tag)
+                self.assertEqual(delta, fast.quality() - before, tag)
 
                 # The incrementally maintained graph matches a from-scratch
                 # rebuild of the same permutation, exactly.
-                rebuilt = CappedAllocatorPlan(
+                rebuilt = PermutationBasedLayoutSolver(
                     buffers, list(fast.permutation), cap, align
                 )
                 self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
