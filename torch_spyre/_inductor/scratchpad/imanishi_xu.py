@@ -27,7 +27,7 @@
 import math
 import copy
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional, override
+from typing import Iterable, Iterator, Optional, override
 import random as rnd
 from heapq import heappush, heappop
 
@@ -44,33 +44,58 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 
 
 class CoolingSchedule(ABC):
-    def __iter__(self) -> "CoolingSchedule":
-        """We need iter() to return a *new* copy of the schedule."""
-        return copy.deepcopy(self)
+    """A *responsive* temperature controller for simulated annealing.
+
+    Unlike a blind temperature iterator, after every step the annealer reports
+    whether the step accepted a move, so a schedule may adapt -- e.g. detect a
+    stall and reheat. :meth:`reset` begins a fresh anneal and returns the first
+    temperature; :meth:`update` consumes the latest step's acceptance and
+    returns the next temperature, or ``None`` to stop. ``reset`` must fully
+    reinitialize transient state (so a schedule can be reused across anneals).
+    """
 
     @abstractmethod
-    def __next__(self) -> float: ...
+    def reset(self) -> Optional[float]:
+        """Reinitialize and return the first temperature (None for no steps)."""
+
+    @abstractmethod
+    def update(self, accepted: bool) -> Optional[float]:
+        """Return the next temperature given the last step's acceptance, or None
+        to stop."""
 
 
 class ExponentialCoolingSchedule(CoolingSchedule):
+    """Geometric cooling over ``steps_per_epoch * epochs`` steps, dropping by a
+    constant factor once per epoch. Ignores acceptance."""
+
     def __init__(self, *, t0: float, t_end: float, steps_per_epoch: int, epochs: int):
-        self.t = t0
+        self.t0 = t0
         self.alpha = (t_end / t0) ** (1 / epochs)
         self.steps_per_epoch = steps_per_epoch
         self.epochs = epochs
-        self.i = 0
+        self._t = t0
+        self._i = 0
 
     @override
-    def __next__(self) -> float:
-        self.i += 1
-        if self.i % self.steps_per_epoch == 0:
-            if self.i == self.steps_per_epoch * self.epochs:
-                raise StopIteration
-            self.t *= self.alpha
-        return self.t
+    def reset(self) -> Optional[float]:
+        self._t = self.t0
+        self._i = 0
+        return self._t
+
+    @override
+    def update(self, accepted: bool) -> Optional[float]:
+        self._i += 1
+        if self._i >= self.steps_per_epoch * self.epochs:
+            return None
+        if self._i % self.steps_per_epoch == 0:
+            self._t *= self.alpha
+        return self._t
 
 
 class CoolingScheduleFromPaper(CoolingSchedule):
+    """Log-linear schedule between tau_s and tau_e derived from the peak memory
+    load, as in the paper. Ignores acceptance."""
+
     def __init__(self, *, buffers: list[LifetimeBoundBuffer], n: int = 1000000):
         buffers_sorted = sorted(buffers, key=lambda b: b.start_time)
         current_load = 0
@@ -91,17 +116,42 @@ class CoolingScheduleFromPaper(CoolingSchedule):
         tau_e = min(100.0, tau_s / 1000.0)
         self.log_tau_s = math.log(tau_s)
         self.log_tau_e = math.log(tau_e)
-        self.i = 0
         self.n = n
+        self._i = 0
 
     @override
-    def __next__(self) -> float:
-        if self.i >= self.n:
-            raise StopIteration
-        self.i += 1
+    def reset(self) -> Optional[float]:
+        self._i = 0
+        return math.exp(self.log_tau_s)
+
+    @override
+    def update(self, accepted: bool) -> Optional[float]:
+        self._i += 1
+        if self._i >= self.n:
+            return None
         return math.exp(
-            (self.log_tau_e - self.log_tau_s) * self.i / self.n + self.log_tau_s
+            (self.log_tau_e - self.log_tau_s) * self._i / self.n + self.log_tau_s
         )
+
+
+class IterableCoolingSchedule(CoolingSchedule):
+    """Adapts a plain iterable of temperatures to the responsive interface,
+    ignoring acceptance. ``reset`` restarts iteration from the source, so the
+    source should be re-iterable (a list, not a one-shot generator)."""
+
+    def __init__(self, temperatures: Iterable[float]):
+        self._source = temperatures
+        self._it: Optional[Iterator[float]] = None
+
+    @override
+    def reset(self) -> Optional[float]:
+        self._it = iter(self._source)
+        return next(self._it, None)
+
+    @override
+    def update(self, accepted: bool) -> Optional[float]:
+        assert self._it is not None
+        return next(self._it, None)
 
 
 class SolverToPermutation:
@@ -141,7 +191,7 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         alignment: int = 128,
         *,
         initial: list[int] | str | MemoryPlanSolver = "first_fit",
-        schedule: Iterable[float] | str = "from_paper",
+        schedule: "CoolingSchedule | Iterable[float] | str" = "from_paper",
         random: Optional[rnd.Random] = None,
         starts: int = 1,
     ):
@@ -176,7 +226,7 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         alignment: int = 128,
         *,
         initial: list[int] | str | MemoryPlanSolver = "first_fit",
-        schedule: Iterable[float] | str = "from_paper",
+        schedule: "CoolingSchedule | Iterable[float] | str" = "from_paper",
         random: Optional[rnd.Random] = None,
         starts: int = 1,
     ):
@@ -212,15 +262,17 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
 
         if isinstance(schedule, str):
             if schedule == "from_paper":
-                self.schedule: Iterable[float] = CoolingScheduleFromPaper(
+                self.schedule: CoolingSchedule = CoolingScheduleFromPaper(
                     buffers=buffers
                 )
             else:
                 raise ValueError(
                     f"this string does not describe a known schedule: {schedule}"
                 )
-        else:
+        elif isinstance(schedule, CoolingSchedule):
             self.schedule = schedule
+        else:
+            self.schedule = IterableCoolingSchedule(schedule)
 
         if random:
             self.random = random
@@ -237,18 +289,21 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             self._build()
 
     def anneal(self) -> None:
-        quality_log = []
+        quality_log: list[int] = []
 
-        for temperature in iter(self.schedule):
-            match self.annealing_step_rotate(temperature):
-                case (i, j):
-                    self.annealing_step_swap(i, j)
+        temperature = self.schedule.reset()
+        while temperature is not None:
+            move = self.annealing_step_rotate(temperature)
+            if move is not None:
+                self.annealing_step_swap(*move)
 
             quality = self.quality()
             quality_log.append(quality)
             if quality > self.best_quality:
                 self.best_quality = quality
                 self.best_permutation = copy.copy(self.permutation)
+
+            temperature = self.schedule.update(move is not None)
 
         self.quality_logs.append(quality_log)
 
