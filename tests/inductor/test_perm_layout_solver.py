@@ -163,9 +163,6 @@ class SkeletonTestsMixin(MixinBase):
     def test_is_fully_allocated(self):
         buffers = [_buf("a", 64, 0, 1)]
         plan = self.make_plan(buffers, [0], capacity=100)
-        # Unplaced.
-        plan.addresses[0] = None
-        self.assertFalse(plan._is_fully_allocated(0))
         # Fits exactly at the boundary.
         plan.addresses[0] = 36
         self.assertTrue(plan._is_fully_allocated(0))
@@ -173,20 +170,24 @@ class SkeletonTestsMixin(MixinBase):
         plan.addresses[0] = 37
         self.assertFalse(plan._is_fully_allocated(0))
 
-    def test_total_size_accessor(self):
+    def test_quality_accessor(self):
         buffers = [_buf("a", 64, 0, 1)]
         plan = self.make_plan(buffers, [0], capacity=128)
         plan.total_allocated_size = 42
-        self.assertEqual(plan.total_size(), 42)
+        plan.total_allocated_count = 3
+        self.assertEqual(plan.quality(), 42)
+        self.assertEqual(plan.count_allocated(), 3)
 
     def test_finalize_writes_back_only_fully_allocated(self):
         buffers = [
             _buf("fits", 64, 0, 1),
             _buf("over_cap", 64, 0, 1),
-            _buf("unplaced", 64, 0, 1),
+            _buf("also_over", 64, 0, 1),
         ]
         plan = self.make_plan(buffers, [0, 1, 2], capacity=128)
-        plan.addresses = [0, 100, None]  # over_cap: 100 + 64 = 164 > 128
+        # Every buffer has a notional address; only those fitting below capacity
+        # are committed. 100 + 64 = 164 > 128 and 200 + 64 = 264 > 128.
+        plan.addresses = [0, 100, 200]
 
         plan.finalize()
 
