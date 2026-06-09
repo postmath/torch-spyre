@@ -384,6 +384,7 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         self.buffers = buffers
         self.starts = starts
         self.quality_logs: list[list[int]] = []
+        self.temperature_logs: list[list[float]] = []
         self.best_quality = self.quality()
         self.best_permutation = copy.copy(self.initial)
 
@@ -419,6 +420,7 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
 
     def anneal(self) -> None:
         quality_log: list[int] = []
+        temperature_log: list[float] = []
 
         temperature = self.schedule.reset()
         while temperature is not None:
@@ -428,6 +430,7 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
 
             quality = self.quality()
             quality_log.append(quality)
+            temperature_log.append(temperature)
             if quality > self.best_quality:
                 self.best_quality = quality
                 self.best_permutation = copy.copy(self.permutation)
@@ -435,6 +438,7 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             temperature = self.schedule.update(move is not None)
 
         self.quality_logs.append(quality_log)
+        self.temperature_logs.append(temperature_log)
 
     def annealing_step_swap(self, i: int, j: int) -> None:
         """This is the loop mentioned as Algorithms 5 and 6 in the paper."""
@@ -542,3 +546,121 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         # Nothing accepted: leave the chain where it was by restoring x to position i.
         self.rotate(upper_bound, i)
         return None
+
+    def plot(self, max_height: Optional[int] = None):
+        """Visualize the current scratchpad allocation layout.
+
+        Allocated buffers are shown in blue; buffers that exceed the capacity
+        limit are shown in gray.  In-place parent/child pairs that share an
+        address are highlighted: a dark overlay spans the combined lifetime and
+        a green marker indicates the handoff tick.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+
+        name_to_index = {b.name: i for i, b in enumerate(self.buffers)}
+
+        fig, ax = plt.subplots()
+
+        for i, buffer in enumerate(self.buffers):
+            addr = self.addresses[i]
+            color = "b" if self._is_fully_allocated(i) else "lightgray"
+            rect = patches.Rectangle(
+                xy=(buffer.start_time, addr),
+                width=buffer.end_time - buffer.start_time,
+                height=buffer.size,
+                linewidth=0.3,
+                edgecolor="r",
+                facecolor=color,
+                fill=True,
+            )
+            ax.add_patch(rect)
+
+        for i, buffer in enumerate(self.buffers):
+            if not self._is_fully_allocated(i):
+                continue
+            for p in buffer.in_place_parents:
+                pj = name_to_index.get(p)
+                if pj is None or not self._is_fully_allocated(pj):
+                    continue
+                parent = self.buffers[pj]
+                if self.addresses[i] == self.addresses[pj]:
+                    ax.add_patch(
+                        patches.Rectangle(
+                            xy=(parent.start_time, self.addresses[i]),
+                            width=buffer.end_time - parent.start_time,
+                            height=buffer.size,
+                            linewidth=0.3,
+                            edgecolor="r",
+                            facecolor="k",
+                            fill=True,
+                            alpha=0.25,
+                        )
+                    )
+                    ax.add_patch(
+                        patches.Rectangle(
+                            xy=(buffer.start_time, self.addresses[i]),
+                            width=1,
+                            height=buffer.size,
+                            linewidth=0.3,
+                            edgecolor="r",
+                            facecolor="g",
+                            fill=True,
+                        )
+                    )
+
+        max_time = max((b.end_time for b in self.buffers), default=0)
+        ax.set_xlim(0, max_time)
+        if max_height is None:
+            max_height = max(
+                (
+                    self.addresses[i] + b.size
+                    for i, b in enumerate(self.buffers)
+                    if self._is_fully_allocated(i)
+                ),
+                default=0,
+            )
+        ax.set_ylim(0, max_height)
+        return fig
+
+    def quality_plot(self, quality_logs: Optional[list[list[int]]] = None):
+        """Plot quality (buffers allocated) over annealing steps.
+
+        Each run is drawn as a thin blue line; their smoothed average is drawn
+        in red.  When temperature data is available (recorded by
+        :meth:`anneal`), the first run's temperature schedule is overlaid on a
+        log-scale right axis in green.
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        if quality_logs is None:
+            quality_logs = self.quality_logs
+
+        fig, ax1 = plt.subplots()
+        for log in quality_logs:
+            ax1.plot(log, "b", lw=1, alpha=0.1)
+
+        if quality_logs:
+            average = np.array(quality_logs).mean(axis=0)
+            n_points = len(average)
+            if n_points >= 20:
+                n_smoothing = min(n_points // 10, 10)
+                smoothed = np.convolve(
+                    average, np.ones(n_smoothing) / n_smoothing, "valid"
+                )
+                ax1.plot(
+                    [x + n_smoothing / 2 for x in range(len(smoothed))],
+                    smoothed,
+                    "r",
+                    lw=3,
+                )
+            else:
+                ax1.plot(average, "r", lw=3)
+
+        if self.temperature_logs:
+            ax2 = ax1.twinx()
+            ax2.set_yscale("log")
+            ax2.plot(self.temperature_logs[0], "g", lw=1)
+
+        return fig
