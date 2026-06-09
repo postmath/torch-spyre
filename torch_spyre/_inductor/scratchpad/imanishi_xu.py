@@ -16,13 +16,15 @@
 # randomly selects a buffer, and then cleverly compares all possible positions where the buffer
 # could be reinserted. In effect, it cheaply considers (n-1) neighbours every iteration.
 #
-# In order to adjust this algorithm to our setting, we use CappedAllocatorPlan from plan_solver. It
-# allows us to use a permutation of buffers as a source of a layout plan, and modify the permutation
-# and see the modification in the layout plan by repeated swapping. We also adjust our random
-# sampling: a buffer that is currently allocated legally gets to consider being inserted into all
-# other positions, whereas a buffer that is not currently allocated legally only gets to consider
-# being reinserted in positions of (nearly) legally allocated buffers, so that we don't spend too
-# much time on swaps that have no effect.
+# In order to adjust this algorithm to our setting, we hold a PermutationBasedLayoutSolver from
+# plan_solver as a member. It lets us use a permutation of buffers as a source of a layout plan, and
+# modify the permutation and see the modification in the layout plan by repeated swapping. Each
+# reinsertion sweep runs on a throwaway plan.copy(), so the live plan only performs the rotation
+# that is actually accepted rather than sweeping and restoring. We also adjust our random sampling:
+# a buffer that is currently allocated legally gets to consider being inserted into all other
+# positions, whereas a buffer that is not currently allocated legally only gets to consider being
+# reinserted in positions of (nearly) legally allocated buffers, so that we don't spend too much
+# time on swaps that have no effect.
 
 import math
 import copy
@@ -345,7 +347,16 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         return buffers
 
 
-class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
+class ImanishiXuSolverWithBuffers:
+    """Drives simulated annealing over a :class:`PermutationBasedLayoutSolver`.
+
+    The layout is held as a *member* (``self.plan``), not a base class. This lets
+    each reinsertion sweep run on a throwaway ``plan.copy()`` while the live plan
+    only ever performs the single rotation that is actually accepted (and the
+    cleanup swaps) -- so the live layout is never churned through a full sweep
+    and restored.
+    """
+
     def __init__(
         self,
         buffers: list[LifetimeBoundBuffer],
@@ -379,13 +390,14 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             convertor = SolverToPermutation(initial)
             self.initial = convertor.permutation(buffers)
 
-        super().__init__(buffers, self.initial, size, alignment)
-
         self.buffers = buffers
+        self.size = size
+        self.alignment = alignment
+        self.plan = PermutationBasedLayoutSolver(buffers, self.initial, size, alignment)
         self.starts = starts
         self.quality_logs: list[list[int]] = []
         self.temperature_logs: list[list[float]] = []
-        self.best_quality = self.quality()
+        self.best_quality = self.plan.quality()
         self.best_permutation = copy.copy(self.initial)
 
         if isinstance(schedule, str):
@@ -409,14 +421,18 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         else:
             self.random = rnd.Random()
 
+    def finalize(self) -> None:
+        self.plan.finalize()
+
     def solve(self) -> None:
         for _ in range(self.starts):
             self.anneal()
-        # Restore the best permutation seen so finalize() commits it rather than
+        # Commit the best permutation seen, so finalize() writes it rather than
         # whatever state annealing happened to end in.
-        if self.permutation != self.best_permutation:
-            self.permutation = copy.copy(self.best_permutation)
-            self._build()
+        if self.plan.permutation != self.best_permutation:
+            self.plan = PermutationBasedLayoutSolver(
+                self.buffers, list(self.best_permutation), self.size, self.alignment
+            )
 
     def anneal(self) -> None:
         quality_log: list[int] = []
@@ -428,12 +444,12 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             if move is not None:
                 self.annealing_step_swap(*move)
 
-            quality = self.quality()
+            quality = self.plan.quality()
             quality_log.append(quality)
             temperature_log.append(temperature)
             if quality > self.best_quality:
                 self.best_quality = quality
-                self.best_permutation = copy.copy(self.permutation)
+                self.best_permutation = copy.copy(self.plan.permutation)
 
             temperature = self.schedule.update(move is not None)
 
@@ -442,41 +458,42 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
 
     def annealing_step_swap(self, i: int, j: int) -> None:
         """This is the loop mentioned as Algorithms 5 and 6 in the paper."""
+        plan = self.plan
+        perm = plan.permutation
         assert i != j, (
             "for a rotation i -> i, we should return None from the rotation method"
         )
-        assert 0 <= i < len(self.permutation)
-        assert 0 <= j < len(self.permutation)
+        assert 0 <= i < len(perm)
+        assert 0 <= j < len(perm)
 
         if i > j:
             i, j = j, i
-        # Now i < j, and self.permutation[:i] and self.permutation[j+1:] are "clean"; that is, there
-        # is no k such that self.permutation[k] and self.permutation[k+1] are buffers that *do not
-        # overlap* in time, and have self.permutation[k] have a higher end point in memory than
-        # self.permutation[k+1]. Because self.permutation[i] up to and including self.permutation[j]
+        # Now i < j, and perm[:i] and perm[j+1:] are "clean"; that is, there is no k such that
+        # perm[k] and perm[k+1] are buffers that *do not overlap* in time, and have perm[k] have a
+        # higher end point in memory than perm[k+1]. Because perm[i] up to and including perm[j]
         # changed, we need to examine i-1 <= k <= j -- except if that would take us outside the
-        # bounds of self.permutation, of course.
+        # bounds of perm, of course.
         i -= 1
 
         # Ensure that both i and j+1 are valid indices.
         if i < 0:
             i = 0
-        if j == len(self.permutation) - 1:
-            j = len(self.permutation) - 2
+        if j == len(perm) - 1:
+            j = len(perm) - 2
 
         while i <= j:
-            pi = self.permutation[i]
-            pi1 = self.permutation[i + 1]
+            pi = perm[i]
+            pi1 = perm[i + 1]
 
-            if (not self._overlaps(pi, pi1)) and self.addresses[pi] + self.buffers[
+            if (not plan._overlaps(pi, pi1)) and plan.addresses[pi] + self.buffers[
                 pi
-            ].size > self.addresses[pi1] + self.buffers[pi1].size:
+            ].size > plan.addresses[pi1] + self.buffers[pi1].size:
                 # Swap buffers pi and pi1. This makes no difference for the quality of the result
                 # *now*, but it makes it easier to rotate to an improved state.
-                self.swap(i)
+                plan.swap(i)
 
                 # Adjust the bounds of what we need to examine.
-                if i == j and j < len(self.permutation) - 2:
+                if i == j and j < len(perm) - 2:
                     j += 1
                 if i > 0:
                     i -= 1
@@ -488,9 +505,13 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
     def annealing_step_rotate(self, temperature: float) -> Optional[tuple[int, int]]:
         """This is the inner loop of Algorithm 4 from the paper. The return value is (i, j) iff we
         accepted a rotation inserting entry i of the permutation into position j != i; None if we
-        accepted no rotation. We never accept a trivial rotation."""
+        accepted no rotation. We never accept a trivial rotation.
+
+        The reinsertion sweep runs on a throwaway copy of the plan; only the accepted rotation (if
+        any) is applied to the live plan, so the live layout never has to sweep-and-restore."""
+        plan = self.plan
         n = len(self.buffers)
-        allocated = [self._is_fully_allocated(self.permutation[i]) for i in range(n)]
+        allocated = [plan._is_fully_allocated(plan.permutation[i]) for i in range(n)]
         n_allocated = sum(1 if b else 0 for b in allocated)
         # Choose each allocated buffer with weight n and each non-allocated buffer with weight
         # n_allocated + 1.
@@ -501,14 +522,14 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         # qualities[j] is the quality if we rotate i to position j in the permutation, or None if we
         # don't consider rotating i to position j.
         qualities: list[Optional[int]] = [None] * n
-        quality_before = self.quality()
+        quality_before = plan.quality()
 
-        # Consider all reinsertion positions. First rotate i to position 0, then bubble it forward
-        # one step at a time, recording the quality at each position it visits. Buffer x ends at
-        # position ``upper_bound``.
+        # Probe all reinsertion positions on a copy: rotate i to position 0, then bubble it forward
+        # one step at a time, recording the quality at each position it visits.
+        probe = plan.copy()
         if i != 0:
-            self.rotate(i, 0)
-            qualities[0] = self.quality()
+            probe.rotate(i, 0)
+            qualities[0] = probe.quality()
         if allocated[i]:
             upper_bound = n - 1
         else:
@@ -523,9 +544,9 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
                 upper_bound = n - 1
 
         for p in range(1, upper_bound + 1):
-            self.swap(p - 1)  # bubble x from position p-1 to position p
+            probe.swap(p - 1)  # bubble x from position p-1 to position p
             if p != i:
-                qualities[p] = self.quality()
+                qualities[p] = probe.quality()
 
         insertion_points = [pos for pos, q in enumerate(qualities) if q is not None]
         insertion_points = sorted(
@@ -540,11 +561,11 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             if qj > quality_before or self.random.random() < math.exp(
                 (qj - quality_before) / temperature
             ):
-                self.rotate(upper_bound, j)
+                # Apply only the accepted rotation to the live plan (others keep their order).
+                plan.rotate(i, j)
                 return (i, j)
 
-        # Nothing accepted: leave the chain where it was by restoring x to position i.
-        self.rotate(upper_bound, i)
+        # Nothing accepted: the live plan was never touched.
         return None
 
     def plot(self, max_height: Optional[int] = None):
@@ -563,8 +584,8 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         fig, ax = plt.subplots()
 
         for i, buffer in enumerate(self.buffers):
-            addr = self.addresses[i]
-            color = "b" if self._is_fully_allocated(i) else "lightgray"
+            addr = self.plan.addresses[i]
+            color = "b" if self.plan._is_fully_allocated(i) else "lightgray"
             rect = patches.Rectangle(
                 xy=(buffer.start_time, addr),
                 width=buffer.end_time - buffer.start_time,
@@ -577,17 +598,17 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             ax.add_patch(rect)
 
         for i, buffer in enumerate(self.buffers):
-            if not self._is_fully_allocated(i):
+            if not self.plan._is_fully_allocated(i):
                 continue
             for p in buffer.in_place_parents:
                 pj = name_to_index.get(p)
-                if pj is None or not self._is_fully_allocated(pj):
+                if pj is None or not self.plan._is_fully_allocated(pj):
                     continue
                 parent = self.buffers[pj]
-                if self.addresses[i] == self.addresses[pj]:
+                if self.plan.addresses[i] == self.plan.addresses[pj]:
                     ax.add_patch(
                         patches.Rectangle(
-                            xy=(parent.start_time, self.addresses[i]),
+                            xy=(parent.start_time, self.plan.addresses[i]),
                             width=buffer.end_time - parent.start_time,
                             height=buffer.size,
                             linewidth=0.3,
@@ -599,7 +620,7 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
                     )
                     ax.add_patch(
                         patches.Rectangle(
-                            xy=(buffer.start_time, self.addresses[i]),
+                            xy=(buffer.start_time, self.plan.addresses[i]),
                             width=1,
                             height=buffer.size,
                             linewidth=0.3,
@@ -614,9 +635,9 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
         if max_height is None:
             max_height = max(
                 (
-                    self.addresses[i] + b.size
+                    self.plan.addresses[i] + b.size
                     for i, b in enumerate(self.buffers)
-                    if self._is_fully_allocated(i)
+                    if self.plan._is_fully_allocated(i)
                 ),
                 default=0,
             )
