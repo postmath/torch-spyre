@@ -28,6 +28,8 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
     ReheatingSchedule,
+    default_initial_temperature,
+    peak_memory_load,
 )
 
 # Heavy randomized anneals over many seeds, larger problems and longer
@@ -134,6 +136,43 @@ class CoolingScheduleTests(TestCase):
         self.assertIsNotNone(s.update(False))  # window not full yet
         self.assertIsNone(s.update(False))  # window full, rate 0 < 0.5 -> stop
 
+    def test_peak_memory_load(self):
+        # a:[0,2) b:[1,3) c:[2,4); peak live set is {b,c} at tick 2 = 50.
+        buffers = [
+            LifetimeBoundBuffer("a", 10, 0, 2),
+            LifetimeBoundBuffer("b", 20, 1, 3),
+            LifetimeBoundBuffer("c", 30, 2, 4),
+        ]
+        self.assertEqual(peak_memory_load(buffers), 50)
+        self.assertAlmostEqual(default_initial_temperature(buffers), 50 / 300.0)
+
+    def test_reheating_t0_derived_from_buffers(self):
+        buffers = [
+            LifetimeBoundBuffer("a", 10, 0, 2),
+            LifetimeBoundBuffer("b", 20, 1, 3),
+            LifetimeBoundBuffer("c", 30, 2, 4),
+        ]
+        s = ReheatingSchedule(
+            alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
+        )
+        s.set_buffers(buffers)
+        self.assertAlmostEqual(s.t0, 50 / 300.0)
+        self.assertAlmostEqual(s.reset(), 50 / 300.0)
+
+    def test_reheating_explicit_t0_not_overridden(self):
+        s = ReheatingSchedule(
+            t0=99.0, alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
+        )
+        s.set_buffers([LifetimeBoundBuffer("a", 10, 0, 2)])
+        self.assertEqual(s.t0, 99.0)
+
+    def test_reheating_no_t0_errors(self):
+        s = ReheatingSchedule(
+            alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
+        )
+        with self.assertRaises(ValueError):
+            s.reset()
+
 
 class ImanishiXuTests(TestCase):
     def _run(self, buffers, capacity, *, initial, seed, alignment=128):
@@ -198,8 +237,8 @@ class ImanishiXuTests(TestCase):
                 copy.deepcopy(buffers), list(initial), cap, 128
             ).quality()
 
+            # t0 omitted: the solver derives it from the peak load.
             schedule = ReheatingSchedule(
-                t0=max(b.size for b in buffers) * 2.0,
                 alpha=0.85,
                 window=15,
                 stall_rate=0.2,

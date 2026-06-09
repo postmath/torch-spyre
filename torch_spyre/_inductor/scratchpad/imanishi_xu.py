@@ -44,6 +44,28 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 
 
+def peak_memory_load(buffers: list[LifetimeBoundBuffer]) -> int:
+    """Maximum total size of simultaneously-live buffers (a lower bound on the
+    space any layout needs). Swept over lifetime start points."""
+    by_start = sorted(buffers, key=lambda b: b.start_time)
+    current_load = 0
+    peak_load = 0
+    end_points: list[tuple[int, int]] = []  # (end_time, size) min-heap
+    for buffer in by_start:
+        while end_points and end_points[0][0] <= buffer.start_time:
+            current_load -= heappop(end_points)[1]
+        current_load += buffer.size
+        peak_load = max(peak_load, current_load)
+        heappush(end_points, (buffer.end_time, buffer.size))
+    return peak_load
+
+
+def default_initial_temperature(buffers: list[LifetimeBoundBuffer]) -> float:
+    """A principled starting temperature from the peak memory load -- the paper's
+    tau_s. Used when a schedule is not given an explicit ``t0``."""
+    return peak_memory_load(buffers) / 300.0
+
+
 class CoolingSchedule(ABC):
     """A *responsive* temperature controller for simulated annealing.
 
@@ -54,6 +76,11 @@ class CoolingSchedule(ABC):
     returns the next temperature, or ``None`` to stop. ``reset`` must fully
     reinitialize transient state (so a schedule can be reused across anneals).
     """
+
+    def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
+        """Preparation hook: the solver calls this with the buffer set before
+        annealing, so a schedule may derive parameters (e.g. an initial
+        temperature from the peak load). Default: no-op."""
 
     @abstractmethod
     def reset(self) -> Optional[float]:
@@ -98,22 +125,7 @@ class CoolingScheduleFromPaper(CoolingSchedule):
     load, as in the paper. Ignores acceptance."""
 
     def __init__(self, *, buffers: list[LifetimeBoundBuffer], n: int = 1000000):
-        buffers_sorted = sorted(buffers, key=lambda b: b.start_time)
-        current_load = 0
-        peak_load = 0
-        # When we encounter a buffer, we include (last_use, size) in end_points, which is a min-heap
-        # ordered by last_use.
-        end_points: list[tuple[int, int]] = []
-        for buffer in buffers_sorted:
-            while end_points and end_points[0][0] <= buffer.start_time:
-                current_load -= heappop(end_points)[1]
-
-            current_load += buffer.size
-            peak_load = max(peak_load, current_load)
-
-            heappush(end_points, (buffer.end_time, buffer.size))
-
-        tau_s = peak_load / 300.0
+        tau_s = default_initial_temperature(buffers)
         tau_e = min(100.0, tau_s / 1000.0)
         self.log_tau_s = math.log(tau_s)
         self.log_tau_e = math.log(tau_e)
@@ -164,6 +176,10 @@ class ReheatingSchedule(CoolingSchedule):
     steps. When that rate first drops below ``stall_rate`` (the chain has
     frozen at the current temperature), record that temperature as ``T1``.
 
+    ``t0`` defaults to the peak-load estimate (:func:`default_initial_temperature`)
+    when run through a solver: leave it ``None`` and the solver fills it in via
+    :meth:`set_buffers`. Pass ``t0`` explicitly to override.
+
     Phase 2 (reheat): perform ``restarts`` cycles, each cooling by ``alpha``
     from ``T1 * delta`` down to ``T1 / delta`` -- a fixed band around the
     critical temperature -- then stop. This concentrates the budget where moves
@@ -177,7 +193,7 @@ class ReheatingSchedule(CoolingSchedule):
     def __init__(
         self,
         *,
-        t0: float,
+        t0: Optional[float] = None,
         alpha: float,
         window: int,
         stall_rate: float,
@@ -195,18 +211,36 @@ class ReheatingSchedule(CoolingSchedule):
             raise ValueError("stall_rate must be in [0, 1]")
         if restarts < 0:
             raise ValueError("restarts must be >= 0")
+        # t0/min_temp may be None until set_buffers() derives them from the peak
+        # load. An explicit t0 is never overridden.
+        self._explicit_t0 = t0
+        self._explicit_min_temp = min_temp
         self.t0 = t0
         self.alpha = alpha
         self.window = window
         self.stall_rate = stall_rate
         self.delta = delta
         self.restarts = restarts
-        # Safety floor: cooling reaches zero acceptance eventually, but guard
-        # against never stalling (e.g. stall_rate == 0).
-        self.min_temp = min_temp if min_temp is not None else t0 * 1e-12
+
+    @override
+    def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
+        if self._explicit_t0 is None:
+            self.t0 = default_initial_temperature(buffers)
 
     @override
     def reset(self) -> Optional[float]:
+        if self.t0 is None:
+            raise ValueError(
+                "ReheatingSchedule needs t0; pass it explicitly or run via a "
+                "solver, which derives it from the buffers via set_buffers()"
+            )
+        # Safety floor: cooling reaches zero acceptance eventually, but guard
+        # against never stalling (e.g. stall_rate == 0).
+        self._min_temp = (
+            self._explicit_min_temp
+            if self._explicit_min_temp is not None
+            else self.t0 * 1e-12
+        )
         self._phase = "cool"
         self._t = self.t0
         self._recent: deque[bool] = deque()
@@ -226,7 +260,7 @@ class ReheatingSchedule(CoolingSchedule):
                 len(self._recent) == self.window
                 and self._accepts / self.window < self.stall_rate
             )
-            if stalled or self._t <= self.min_temp:
+            if stalled or self._t <= self._min_temp:
                 self._t1 = self._t  # critical temperature
                 if self.restarts <= 0:
                     return None
@@ -366,6 +400,8 @@ class ImanishiXuSolverWithBuffers(PermutationBasedLayoutSolver):
             self.schedule = schedule
         else:
             self.schedule = IterableCoolingSchedule(schedule)
+        # Let the schedule derive any buffer-dependent parameters (e.g. t0).
+        self.schedule.set_buffers(buffers)
 
         if random:
             self.random = random
