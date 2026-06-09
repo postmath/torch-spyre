@@ -302,9 +302,11 @@ class PermutationBasedLayoutSolverBase(ABC):
         """Modify the permutation by taking ``self.permutation[i]`` out of the permutation and
         reinserting it at position ``j``. Returns the change in :meth:`quality` caused by the
         rotation (new minus old)."""
-        # If this shows up in profiling, then step 1 is to guard on abs(i - j) and if it's bigger
-        # than a threshold (e.g. n/2), modify the permutation directly and call _build(). For small
-        # values of abs(i - j) this version should be faster.
+        # A product of swaps, even over the full distance, beats a permutation-edit + _build():
+        # most of the swaps are O(1) no-ops, so the chain is far cheaper than an O(n^2) rebuild in
+        # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
+        # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
+        # benchmarks/copy_vs_swap_results.md.)
         delta = 0
         if i < j:
             for k in range(i, j):
