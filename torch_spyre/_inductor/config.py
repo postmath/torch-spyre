@@ -53,11 +53,12 @@ unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
 # Options:
-#  "greedy":   GreedyLayoutSolver (default),
-#  "bestfit":  BestFitLayoutSolver,
-#  "firstfit": FirstFitLayoutSolver.
+#  "greedy":       GreedyLayoutSolver (default),
+#  "bestfit":      BestFitLayoutSolver,
+#  "firstfit":     FirstFitLayoutSolver,
+#  "imanishi_xu":  ImanishiXuLayoutSolver (simulated annealing).
 
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
-layout_solver: Literal["greedy", "bestfit", "firstfit"] = "greedy"
+layout_solver: Literal["greedy", "bestfit", "firstfit", "imanishi_xu"] = "greedy"
 
 install_config_module(sys.modules[__name__])

@@ -35,6 +35,7 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
 )
+from torch_spyre._inductor.scratchpad.imanishi_xu import ImanishiXuLayoutSolver
 from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
     ScratchpadOptimizationPass,
@@ -209,6 +210,8 @@ class DefaultAllocator(ScratchpadAllocator):
                 layout_planning = BestFitLayoutSolver(size)
             elif config.layout_solver == "firstfit":
                 layout_planning = FirstFitLayoutSolver(size)
+            elif config.layout_solver == "imanishi_xu":
+                layout_planning = ImanishiXuLayoutSolver(size)
             else:
                 raise ValueError(
                     f"Invalid layout_solver config option '{config.layout_solver}'."
