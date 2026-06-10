@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from torch_spyre._inductor.scratchpad.plan_solver import (
     PermutationBasedLayoutSolver,
     LifetimeBoundBuffer,
+    Profile,
     ReferencePermutationBasedLayoutSolver,
 )
 
@@ -750,3 +751,106 @@ class StressTests(TestCase):
             self.assertEqual(plan.addresses, orig_addr, seed)
             self.assertEqual(plan.below_neighbors, orig_below, seed)
             self._assert_matches_rebuild(clone, cap, align, f"seed={seed} (clone)")
+
+
+class ProfileTests(TestCase):
+    """Unit tests for the Profile step-function, in isolation."""
+
+    def test_uniform_and_label_at(self):
+        p = Profile.uniform(0, 10, 7)
+        self.assertEqual(p.span_start, 0)
+        self.assertEqual(p.span_end, 10)
+        self.assertEqual(p.label_at(0), 7)
+        self.assertEqual(p.label_at(9), 7)
+        p.validate()
+
+    def test_from_segments_coalesces(self):
+        p = Profile.from_segments([0, 3, 5, 9], [1, 1, 2])
+        self.assertEqual(p, Profile([0, 5, 9], [1, 2]))
+        p.validate()
+
+    def test_segments_clips_and_copies(self):
+        p = Profile([0, 5, 10, 15], [1, 2, 3])
+        starts, labels = p.segments(3, 12)
+        self.assertEqual(starts, [3, 5, 10, 12])
+        self.assertEqual(labels, [1, 2, 3])
+        # returned data must not alias internal state
+        starts[0] = -999
+        self.assertEqual(p.starts[0], 0)
+        # whole-span and empty range
+        self.assertEqual(p.segments(0, 15), ([0, 5, 10, 15], [1, 2, 3]))
+        self.assertEqual(p.segments(7, 7), ([7], []))
+
+    def test_splice_at_exact_breakpoints(self):
+        p = Profile([0, 5, 10, 15], [1, 2, 3])
+        p.splice(5, 10, [5, 10], [9])
+        self.assertEqual(p, Profile([0, 5, 10, 15], [1, 9, 3]))
+        p.validate()
+
+    def test_splice_inside_one_segment(self):
+        p = Profile([0, 10], [1])
+        p.splice(3, 7, [3, 7], [2])
+        self.assertEqual(p, Profile([0, 3, 7, 10], [1, 2, 1]))
+        p.validate()
+
+    def test_splice_spanning_several_segments(self):
+        p = Profile([0, 5, 10, 15, 20], [1, 2, 3, 4])
+        p.splice(3, 17, [3, 17], [9])
+        self.assertEqual(p, Profile([0, 3, 17, 20], [1, 9, 4]))
+        p.validate()
+
+    def test_splice_coalesces_both_seams(self):
+        p = Profile([0, 5, 10, 15], [1, 2, 1])
+        # replace the middle [5,10) with label 1 -> whole thing coalesces to one
+        p.splice(5, 10, [5, 10], [1])
+        self.assertEqual(p, Profile([0, 15], [1]))
+        p.validate()
+
+    def test_splice_multi_segment_replacement(self):
+        p = Profile([0, 10], [1])
+        p.splice(2, 8, [2, 4, 6, 8], [2, 3, 2])
+        self.assertEqual(p, Profile([0, 2, 4, 6, 8, 10], [1, 2, 3, 2, 1]))
+        p.validate()
+
+    def test_relabel_splits_straddling_segment(self):
+        p = Profile([0, 10], [1])
+        p.relabel(3, 7, {1: 5})
+        self.assertEqual(p, Profile([0, 3, 7, 10], [1, 5, 1]))
+        p.validate()
+
+    def test_relabel_only_matching_labels(self):
+        p = Profile([0, 5, 10, 15], [1, 2, 3])
+        p.relabel(0, 15, {1: 9, 3: 9})  # 1->9, 3->9, 2 untouched
+        self.assertEqual(p, Profile([0, 5, 10, 15], [9, 2, 9]))
+        p.validate()
+
+    def test_empty_range_noops(self):
+        p = Profile([0, 5, 10], [1, 2])
+        before = Profile(list(p.starts), list(p.labels))
+        p.splice(5, 5, [5], [])
+        self.assertEqual(p, before)
+        p.relabel(7, 7, {2: 9})
+        self.assertEqual(p, before)
+
+    def test_label_set(self):
+        p = Profile([0, 5, 10], [1, None])
+        self.assertEqual(p.label_set(), {1, None})
+        self.assertEqual(p.label_set() - {None}, {1})
+
+    def test_validate_catches_corruption(self):
+        bad_order = Profile([0, 5, 5, 10], [1, 2, 3])  # not strictly increasing
+        with self.assertRaises(AssertionError):
+            bad_order.validate()
+        bad_adjacent = Profile([0, 5, 10], [1, 1])  # adjacent equal labels
+        with self.assertRaises(AssertionError):
+            bad_adjacent.validate()
+        bad_len = Profile([0, 5, 10], [1])  # length mismatch
+        with self.assertRaises(AssertionError):
+            bad_len.validate()
+
+    def test_none_labels_round_trip(self):
+        p = Profile.uniform(0, 10, None)
+        self.assertIsNone(p.label_at(4))
+        p.splice(3, 7, [3, 7], [2])
+        self.assertEqual(p, Profile([0, 3, 7, 10], [None, 2, None]))
+        p.validate()
