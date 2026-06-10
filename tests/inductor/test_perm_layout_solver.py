@@ -87,6 +87,46 @@ def _check_consistency(test, plan, tag=""):
                     test.assertEqual(lab, x, f"{tag} reverse-pointer x={x} z={z}")
 
 
+def _check_contact_faithful(test, plan, tag=""):
+    """Verify ``contact_at(c, t)`` names what ``c`` physically rests on at every
+    column ``t``: the max-top buffer among ``c``'s earlier-positioned candidates
+    alive there. A ``(parent, child)`` tuple appears iff that buffer is reached
+    through an active in-place pair -- ``child`` is ``c``'s order-below neighbour
+    and reuses ``parent``'s address, and ``parent`` is the buffer ``c`` rests on.
+    """
+    n = len(plan.buffers)
+    pos = plan.position
+
+    def top(w):
+        return plan.addresses[w] + plan.buffers[w].size
+
+    for c in range(n):
+        bc = plan.buffers[c]
+        for t in range(bc.start_time, bc.end_time):
+            contact = plan.contact_at(c, t)
+            cand = [
+                w
+                for w in plan.overlaps[c]
+                if pos[w] < pos[c]
+                and plan.buffers[w].start_time <= t < plan.buffers[w].end_time
+            ]
+            if not cand:
+                test.assertIsNone(contact, f"{tag} c={c} t={t}")
+                continue
+            max_top = max(top(w) for w in cand)
+            if isinstance(contact, tuple):
+                parent, child = contact
+                test.assertEqual(top(parent), max_top, f"{tag} c={c} t={t} parent")
+                test.assertEqual(
+                    plan.inplace_reuse.get(child), parent, f"{tag} c={c} t={t} reuse"
+                )
+                test.assertEqual(
+                    plan.below_profile[c].label_at(t), child, f"{tag} c={c} t={t} order"
+                )
+            else:
+                test.assertEqual(top(contact), max_top, f"{tag} c={c} t={t} int")
+
+
 def _named_segments(plan, profile):
     """A profile as a readable list of (start, end, neighbour-name-or-None)."""
     return [
@@ -354,6 +394,33 @@ class ContactProfileTests(TestCase):
         self.assertEqual(_below_named(plan, "c"), [(4, 5, "p"), (5, 10, None)])
         self.assertEqual(_above_named(plan, "p"), [(0, 4, None), (4, 5, "c")])
 
+    def test_contact_at_floor_and_plain_stack(self):
+        # a is on the floor; b rests on a (plain int, no in-placement).
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 1, 3)]
+        plan = self.plan(buffers, [0, 1])
+        a, b = plan._name_to_idx["a"], plan._name_to_idx["b"]
+        self.assertIsNone(plan.contact_at(a, 0))
+        self.assertIsNone(plan.contact_at(a, 2))
+        self.assertEqual(plan.contact_at(b, 1), a)
+        self.assertEqual(plan.contact_at(b, 2), a)
+
+    def test_contact_at_poke_through_tuple(self):
+        # Order p, c, h. c in-places onto p; p (taller) pokes through, so h
+        # rests on p at the shared tick (4) and is reported as (p, c). After p
+        # dies (t >= 5) h rests on the now-plain child c.
+        p = _buf("p", 128, 0, 5)
+        c = _buf("c", 64, 4, 10, in_place_parents=["p"])
+        h = _buf("h", 32, 4, 10)
+        plan = self.plan([p, c, h], [0, 1, 2])
+        ip, ic, ih = (plan._name_to_idx[n] for n in ("p", "c", "h"))
+        self.assertEqual(_addr(plan, "c"), 0)  # reuses p
+        self.assertEqual(_addr(plan, "h"), 128)  # rests on p, not on c
+        self.assertEqual(plan.contact_at(ih, 4), (ip, ic))  # poke-through tuple
+        self.assertEqual(plan.contact_at(ih, 5), ic)  # p gone -> plain child
+        self.assertEqual(plan.contact_at(ih, 9), ic)
+        self.assertEqual(plan.contact_at(ic, 4), ip)  # c's own contact is p
+        self.assertIsNone(plan.contact_at(ip, 0))  # p on the floor
+
     # --- randomized differential checks ------------------------------------
 
     def _cases(self, seeds=300, max_n=8):
@@ -378,6 +445,7 @@ class ContactProfileTests(TestCase):
         for seed, buffers, perm, cap, align in self._cases():
             fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
             _check_consistency(self, fast, f"seed={seed}")
+            _check_contact_faithful(self, fast, f"seed={seed}")
 
 
 class RegressionFixtureTests(TestCase):
@@ -500,6 +568,7 @@ class SwapTests(TestCase):
                 self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
                 self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
                 _check_consistency(self, fast, tag)
+                _check_contact_faithful(self, fast, tag)
 
 
 class RotateTests(TestCase):
@@ -556,6 +625,7 @@ class RotateTests(TestCase):
                 self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
                 self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
                 _check_consistency(self, fast, tag)
+                _check_contact_faithful(self, fast, tag)
 
     def test_single_element_sweep_matches_reference(self):
         # Sweep one element across every position (rotate it to 0, then bubble
@@ -700,6 +770,7 @@ class StressTests(TestCase):
         self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
         self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
         self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+        _check_contact_faithful(self, fast, tag)
 
     def test_swap_sequences(self):
         for seed, rng, n, buffers, perm, cap, align in self._cases(20000):

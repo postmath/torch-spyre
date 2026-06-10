@@ -859,6 +859,38 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         else:
             self.inplace_reuse[z] = partner
 
+    def contact_at(self, c: int, t: int) -> Optional[int] | tuple[int, int]:
+        """What buffer ``c`` rests on at column ``t``, surfacing in-place reuse.
+
+        The stored ``below_profile`` records only the *order*-below neighbour,
+        which is not always what ``c`` physically rests on: across an active
+        in-placement the order-below buffer is a transparent child reusing its
+        parent's address, and the taller parent pokes through to actually carry
+        ``c``. This is the faithful view, derived on demand from the order
+        profile and :attr:`inplace_reuse` (nothing extra is stored):
+
+        - ``None`` -- ``c`` is on the floor at ``t`` (no buffer below).
+        - ``int m`` -- ``c`` rests on buffer ``m``.
+        - ``(parent, child)`` -- the slot directly below ``c`` is held by an
+          active in-place pair: ``c`` rests on ``parent`` while ``child`` (which
+          reuses ``parent``'s address and is ``c``'s order-below neighbour) sits
+          transparently inside it. Reported only at the single tick where parent
+          and child overlap; elsewhere the parent is gone and ``c`` rests on the
+          (former) child as a plain ``int``.
+        """
+        m = self.below_profile[c].label_at(t)
+        if m is None:
+            return None
+        partner = self.inplace_reuse.get(m)
+        if partner is not None:
+            pair = self._in_place_pair(m, partner)
+            assert pair is not None  # m reuses partner: they form a pair
+            parent, child = pair
+            pbuf = self.buffers[parent]
+            if m == child and pbuf.start_time <= t < pbuf.end_time:
+                return (parent, child)
+        return m
+
     def copy(self) -> "PermutationBasedLayoutSolver":
         """Return an independent layout snapshot that can be mutated (via
         :meth:`swap` / :meth:`rotate`) without affecting this one.
