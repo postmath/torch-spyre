@@ -120,9 +120,7 @@ class GraphEditor:
         - Even though it is not a necessary condition, we assume FX graph and Operations are fully
           consistent and we will try to maintain it that way.
         - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR.
-        - TODO consider cache some of the Op/buf dep table for later use. Only
-          need to refresh input/clone related entries. Because next step,
-          allocator._generate_buffers(), aka buf_analysis, will call it again.
+
         """
         # Step 1: Add a new FX node for clone and update dependencies
         if isinstance(buffer, TensorBox):
