@@ -713,13 +713,28 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         2. Addresses are then re-placed for the buffers the change reaches,
            processed in a min-heap by position (dependencies always point to
            earlier positions, so a buffer is settled before anything resting on
-           it; ``position`` is maintained in O(1)). When a buffer ``z``'s address
-           changes, every later-positioned buffer overlapping it in time --
-           ``z``'s dependents, the buffers that carry ``z`` in their candidate
-           set -- is enqueued. (Immediate-above edges alone are *not* enough:
-           an in-place buffer sits low, so a taller buffer beneath it can "poke
-           through" and bind a dependent that is not its immediate successor in
-           the order. The full overlap set is the true address dependency.)
+           it; ``position`` is maintained in O(1)). Two kinds of edge feed the
+           dirty set:
+
+           - *Order-above.* When ``z``'s address changes, the buffers directly
+             above it -- ``above_profile[z]`` -- are dirtied. This is the cheap
+             contact-profile frontier and it is exactly right whenever the
+             buffer a dependent rests on is also its order-below neighbour.
+
+           - *In-place transition.* In-placement makes the contact order and the
+             rest-on order diverge: a transparent in-place child sits low while
+             its taller parent pokes through and binds the buffer above the
+             child. While that in-placement is stable the order-above frontier
+             still suffices (the child's address tracks the parent it reuses, so
+             a change in the parent reaches the buffer above the child through
+             the child). The gap is at the *transition*: when a buffer ``z``'s
+             in-place status flips (activates or deactivates), the poke-through
+             appears or vanishes, so the buffer resting on it must be revisited
+             even though nothing it can see changed value. So on a status change
+             we dirty the order-above neighbour of *both* members of the pair at
+             their shared (overlap) tick -- the parent's above-neighbour is the
+             child, and the child's above-neighbour is the buffer that gains or
+             loses the poke-through.
 
         Returns:
             The change in :meth:`total_size` (new minus old).
@@ -739,21 +754,31 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         b = min(self.buffers[x].end_time, self.buffers[y].end_time)
         self._update_profiles_for_swap(x, y, a, b)
 
-        # 2. Re-place affected addresses. Seeding with the two swapped buffers
-        # suffices: nothing sits between adjacent positions, so any other buffer
-        # can only be affected through x or y (or transitively through a buffer
-        # that itself changed). Each change re-enqueues the changed buffer's
-        # later-positioned overlap set -- the dependents whose candidate set
-        # contains it -- processed in position order so every candidate is final
-        # before the buffers resting on it are re-placed.
+        # 2. Re-place affected addresses, propagating along order-above edges and
+        # in-place transitions (see the method docstring). Seed with the swapped
+        # pair and whatever rested on them before the swap.
         old_total = self.total_allocated_size
-        heap = [(self.position[x], x), (self.position[y], y)]
+        seed: set[int] = {x, y}
+        for lbl in (
+            self.above_profile[x].label_set() | self.above_profile[y].label_set()
+        ):
+            if lbl is not None:
+                seed.add(lbl)
+        heap = [(self.position[idx], idx) for idx in seed]
         heapq.heapify(heap)
-        queued = {x, y}
+        queued = set(seed)
+
+        def _dirty(w: Optional[int], pos_z: int) -> None:
+            if w is not None and w not in queued and self.position[w] > pos_z:
+                queued.add(w)
+                heapq.heappush(heap, (self.position[w], w))
+
         while heap:
             _, z = heapq.heappop(heap)
             queued.discard(z)
+            pos_z = self.position[z]
             old_addr = self.addresses[z]
+            old_partner = self.inplace_reuse.get(z)
             if self._is_fully_allocated(z):
                 self.total_allocated_size -= self.buffers[z].size
                 self.total_allocated_count -= 1
@@ -761,12 +786,22 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             if self._is_fully_allocated(z):
                 self.total_allocated_size += self.buffers[z].size
                 self.total_allocated_count += 1
+            new_partner = self.inplace_reuse.get(z)
             if self.addresses[z] != old_addr:
-                pos_z = self.position[z]
-                for w in self.overlaps[z]:
-                    if self.position[w] > pos_z and w not in queued:
-                        queued.add(w)
-                        heapq.heappush(heap, (self.position[w], w))
+                for w in self.above_profile[z].label_set():
+                    _dirty(w, pos_z)
+            if new_partner != old_partner:
+                # In-place status changed: revisit the buffers resting on the
+                # pair at the tick where parent and child overlap.
+                for partner in (old_partner, new_partner):
+                    if partner is None:
+                        continue
+                    pair = self._in_place_pair(z, partner)
+                    assert pair is not None  # partner is a recorded in-place reuse
+                    parent, child = pair
+                    t = self.buffers[child].start_time
+                    _dirty(self.above_profile[child].label_at(t), pos_z)
+                    _dirty(self.above_profile[parent].label_at(t), pos_z)
         return self.total_allocated_size - old_total
 
     def _update_profiles_for_swap(self, x: int, y: int, a: int, b: int) -> None:
