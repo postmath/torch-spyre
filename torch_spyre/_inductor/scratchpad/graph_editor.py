@@ -69,7 +69,7 @@ class GraphEditor:
                 fs.append(TensorBox)
             else:
                 assert isinstance(buffer, StorageBox), (
-                    f"unexpected buffer type {type(buffer)} ({buffer})"
+                    f"unexpected buffer type {type(buffer)} while replacing '{old_name}' ({buffer})"
                 )
                 fs.append(StorageBox)
             buffer = buffer.data
