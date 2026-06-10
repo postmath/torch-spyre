@@ -63,21 +63,23 @@ from torch_spyre._inductor import config
 logger = logging.getLogger(__name__)
 
 
-class ScratchpadAllocator(ABC):
-    """
-    Abstract class for all implementations of ScratchpadAllocator
-    """
+class SolverPass(ScratchpadOptimizationPass):
+    """Computes eligible buffers, runs the layout solver, and stores the resulting
+    allocation plan in ``graph.module.meta`` for downstream passes to consume."""
 
-    @abstractmethod
-    def plan_allocation(self, graph: GraphLowering):
-        """
-        Accepts a graph to be considered for scratchpad memory according
-        to its composition and the specific implementation used.
+    META_KEY = "spyre_lx_allocations"
 
-        Args:
-            graph (GraphLowering): Graph to be considered for scratchpad planning
-        """
-        pass
+    def __init__(self, layout_planning: MemoryPlanSolver):
+        self.layout_planning = layout_planning
+
+    def apply_pass(self, graph: GraphLowering) -> None:
+        buffers = self.generate_buffers(graph)
+        allocation = self.layout_planning.plan_layout(buffers)
+        graph.module.meta[self.META_KEY] = allocation
+
+    def generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
+        in_place = self._determine_in_place(graph)
+        return self._build_bound_buffers(graph, in_place)
 
     def _get_op_name(self, op: Any) -> str:
         target = getattr(getattr(op, "origin_node", None), "target", None)
@@ -116,12 +118,10 @@ class ScratchpadAllocator(ABC):
         core_div_mismatch = get_ncores_for_buffers(graph)
         drop_list = set()
 
-        # filter out by permitted operations
         for op in graph.operations:
             if not self._op_output_good_for_lx_reuse(op):
                 drop_list.add(op.name)
 
-        # filter out core division mismatches
         drop_list.update(
             [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
         )
@@ -229,10 +229,16 @@ class ScratchpadAllocator(ABC):
                     allow_inplace[buf_name].append(input_buf)
         return allow_inplace
 
-    def _generate_buffers(self, graph: GraphLowering) -> list[Operation]:
-        in_place = self._determine_in_place(graph)
-        buffers = self._build_bound_buffers(graph, in_place)
-        return buffers
+
+class PushAllocationPass(ScratchpadOptimizationPass):
+    """Reads the allocation plan stored by ``SolverPass`` and applies it to the graph,
+    inserting clone ops at graph input/output boundaries where needed."""
+
+    def apply_pass(self, graph: GraphLowering) -> None:
+        allocation: list[LifetimeBoundBuffer] = graph.module.meta.get(
+            SolverPass.META_KEY, []
+        )
+        self._push_allocation(graph, allocation)
 
     def _push_allocation(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
@@ -282,6 +288,23 @@ class ScratchpadAllocator(ABC):
         layout.allocation["lx"] = address
 
 
+class ScratchpadAllocator(ABC):
+    """
+    Abstract class for all implementations of ScratchpadAllocator
+    """
+
+    @abstractmethod
+    def plan_allocation(self, graph: GraphLowering):
+        """
+        Accepts a graph to be considered for scratchpad memory according
+        to its composition and the specific implementation used.
+
+        Args:
+            graph (GraphLowering): Graph to be considered for scratchpad planning
+        """
+        pass
+
+
 class DefaultAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -314,11 +337,11 @@ class DefaultAllocator(ScratchpadAllocator):
         if pre_optimization_passes is None:
             pre_optimization_passes = []
         if post_optimization_passes is None:
-            post_optimization_passes = []
+            post_optimization_passes = [PushAllocationPass()]
 
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
-        self.layout_planning = layout_planning
+        self.solver_pass = SolverPass(layout_planning)
 
     def plan_allocation(self, graph: GraphLowering):
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
@@ -329,9 +352,7 @@ class DefaultAllocator(ScratchpadAllocator):
         """
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
-        buffers = self._generate_buffers(graph)
-        allocation = self.layout_planning.plan_layout(buffers)
-        self._push_allocation(graph, allocation)
+        self.solver_pass.apply_pass(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
@@ -434,9 +455,8 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
 
         # Standard downstream flow on the now-fixed winning splits. Mirrors
         # DefaultAllocator.plan_allocation past the pre-passes.
-        buffers = self._generate_buffers(graph)
-        allocation = self.layout_planning.plan_layout(buffers)
-        self._push_allocation(graph, allocation)
+        self.solver_pass.apply_pass(graph)
+        self.push_pass.apply_pass(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
@@ -454,7 +474,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         _score_layout. Returns the option index per op for the leaf
         with minimum HBM bytes. No early-stop pruning — bounded by
         ≤ K^N leaves where N counts ops with >1 option (most return
-        [seed]). Per-leaf cost is one full _generate_buffers +
+        [seed]). Per-leaf cost is one full generate_buffers +
         plan_layout pass; the `cache` param on _per_core_view_on_buf
         amortizes sympy work if it ever becomes hot.
         """
@@ -506,8 +526,8 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         bytes of every buffer the solver couldn't pin. Non-committing
         (addresses land on throwaway buffers) and solver-agnostic.
         """
-        buffers = self._generate_buffers(graph)
-        allocation = self.layout_planning.plan_layout(buffers)
+        buffers = self.solver_pass.generate_buffers(graph)
+        allocation = self.solver_pass.layout_planning.plan_layout(buffers)
         pinned_names = {b.name for b in allocation if b.address is not None}
 
         return sum(
