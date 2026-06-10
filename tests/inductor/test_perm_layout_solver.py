@@ -60,47 +60,51 @@ def _random_buffers(rng, n, horizon=12, max_size=200, inplace_prob=0.25):
     return buffers
 
 
-def _oracle_graph(plan):
-    """Independent brute-force neighbour graph from the final addresses.
-
-    Implemented differently from the production sweep: for every ordered pair
-    (b, c) with b entirely below c, b is a direct below-neighbour iff there is
-    some shared tick at which no third buffer d sits strictly between them
-    (``b.top <= d.addr`` and ``d.top <= c.addr``). In-place partners sharing an
-    address are never "entirely below" each other, so the explicit edges added
-    first are the only links between them.
+def _check_consistency(test, plan, tag=""):
+    """Verify the live contact profiles: each is canonical and spans its
+    buffer's lifetime, and the reverse-pointer invariant holds in both
+    directions (iterating segments, not sampling columns):
+    ``below_profile[x] == z`` over a segment iff ``above_profile[z] == x`` there.
     """
     n = len(plan.buffers)
-    addr = plan.addresses
-    bufs = plan.buffers
-    below = {i: set() for i in range(n)}
-    above = {i: set() for i in range(n)}
-    for reuser, reused in plan.inplace_reuse.items():
-        below[reuser].add(reused)
-        above[reused].add(reuser)
+    for i in range(n):
+        for prof in (plan.below_profile[i], plan.above_profile[i]):
+            prof.validate()
+            test.assertEqual(prof.span_start, plan.buffers[i].start_time, tag)
+            test.assertEqual(prof.span_end, plan.buffers[i].end_time, tag)
+    for primary, reverse in (
+        (plan.below_profile, plan.above_profile),
+        (plan.above_profile, plan.below_profile),
+    ):
+        for x in range(n):
+            p = primary[x]
+            for k, z in enumerate(p.labels):
+                if z is None:
+                    continue
+                a, b = p.starts[k], p.starts[k + 1]
+                _, rev_labels = reverse[z].segments(a, b)
+                for lab in rev_labels:
+                    test.assertEqual(lab, x, f"{tag} reverse-pointer x={x} z={z}")
 
-    def top(i):
-        return addr[i] + bufs[i].size
 
-    for c in range(n):
-        for b in range(n):
-            if b == c or top(b) > addr[c]:
-                continue
-            lo = max(bufs[b].start_time, bufs[c].start_time)
-            hi = min(bufs[b].end_time, bufs[c].end_time)
-            for t in range(lo, hi):
-                between = any(
-                    d not in (b, c)
-                    and bufs[d].start_time <= t < bufs[d].end_time
-                    and top(b) <= addr[d]
-                    and top(d) <= addr[c]
-                    for d in range(n)
-                )
-                if not between:
-                    below[c].add(b)
-                    above[b].add(c)
-                    break
-    return below, above
+def _named_segments(plan, profile):
+    """A profile as a readable list of (start, end, neighbour-name-or-None)."""
+    return [
+        (
+            profile.starts[k],
+            profile.starts[k + 1],
+            None if profile.labels[k] is None else plan.buffers[profile.labels[k]].name,
+        )
+        for k in range(len(profile.labels))
+    ]
+
+
+def _below_named(plan, name):
+    return _named_segments(plan, plan.below_profile[plan._name_to_idx[name]])
+
+
+def _above_named(plan, name):
+    return _named_segments(plan, plan.above_profile[plan._name_to_idx[name]])
 
 
 def _buf(name, size, start, end, in_place_parents=None):
@@ -317,49 +321,38 @@ class ReferencePlacementTests(TestCase):
         self.assertIsNone(buffers[1].address)  # over capacity, not committed
 
 
-class NeighborGraphTests(TestCase):
-    """Neighbour-graph construction in PermutationBasedLayoutSolver."""
+class ContactProfileTests(TestCase):
+    """Order-based contact profiles in PermutationBasedLayoutSolver."""
 
     def plan(self, buffers, permutation, capacity=10_000, alignment=1):
         return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
 
-    def _below(self, plan, name):
-        return {
-            plan.buffers[i].name for i in plan.below_neighbors[plan._name_to_idx[name]]
-        }
-
-    def _above(self, plan, name):
-        return {
-            plan.buffers[i].name for i in plan.above_neighbors[plan._name_to_idx[name]]
-        }
-
-    def test_simple_stack_edges(self):
+    def test_simple_stack(self):
         buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 1, 3)]
-        plan = self.plan(buffers, [0, 1])  # a@0, b@64
-        self.assertEqual(self._below(plan, "b"), {"a"})
-        self.assertEqual(self._above(plan, "a"), {"b"})
-        self.assertEqual(self._below(plan, "a"), set())
-        self.assertEqual(self._above(plan, "b"), set())
+        plan = self.plan(buffers, [0, 1])
+        self.assertEqual(_below_named(plan, "b"), [(1, 3, "a")])
+        self.assertEqual(_above_named(plan, "a"), [(0, 1, None), (1, 3, "b")])
+        self.assertEqual(_below_named(plan, "a"), [(0, 3, None)])
+        self.assertEqual(_above_named(plan, "b"), [(1, 3, None)])
 
     def test_air_gap_neighbor(self):
-        # low spans the whole range; tall is briefly stacked on it and forces
-        # high up to 320. After tall dies, only low sits beneath high, with an
-        # air gap in (64, 320). low must still be a below-neighbour of high.
+        # low spans the whole range; tall is between low and high in order over
+        # [0,3); after tall dies, high's below-neighbour is low (over an address
+        # air gap -- the order-based relation does not care about the gap).
         low = _buf("low", 64, 0, 10)
         tall = _buf("tall", 256, 0, 3)
         high = _buf("high", 64, 0, 10)
         plan = self.plan([low, tall, high], [0, 1, 2])
-        self.assertEqual(_addr(plan, "low"), 0)
-        self.assertEqual(_addr(plan, "tall"), 64)
-        self.assertEqual(_addr(plan, "high"), 320)
-        self.assertEqual(self._below(plan, "high"), {"low", "tall"})
+        self.assertEqual(_below_named(plan, "high"), [(0, 3, "tall"), (3, 10, "low")])
 
-    def test_in_place_edge_is_explicit(self):
+    def test_in_place_pair_ordered_by_position(self):
+        # Parent before child in the permutation -> parent below child over the
+        # shared boundary tick, even though the child reuses the parent's slot.
         parent = _buf("p", 128, 0, 5)
         child = _buf("c", 64, 4, 10, in_place_parents=["p"])
-        plan = self.plan([parent, child], [0, 1])  # c reuses p's address (0)
-        self.assertEqual(self._below(plan, "c"), {"p"})
-        self.assertEqual(self._above(plan, "p"), {"c"})
+        plan = self.plan([parent, child], [0, 1])
+        self.assertEqual(_below_named(plan, "c"), [(4, 5, "p"), (5, 10, None)])
+        self.assertEqual(_above_named(plan, "p"), [(0, 4, None), (4, 5, "c")])
 
     # --- randomized differential checks ------------------------------------
 
@@ -381,33 +374,43 @@ class NeighborGraphTests(TestCase):
             self.assertEqual(fast.addresses, ref.addresses, f"seed={seed}")
             self.assertEqual(fast.quality(), ref.quality(), f"seed={seed}")
 
-    def test_graph_matches_oracle(self):
+    def test_profiles_consistent(self):
         for seed, buffers, perm, cap, align in self._cases():
             fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
-            below, above = _oracle_graph(fast)
-            self.assertEqual(fast.below_neighbors, below, f"seed={seed}")
-            self.assertEqual(fast.above_neighbors, above, f"seed={seed}")
+            _check_consistency(self, fast, f"seed={seed}")
 
-    def test_graph_is_symmetric(self):
-        for seed, buffers, perm, cap, align in self._cases():
-            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
-            for c, lowers in fast.below_neighbors.items():
-                for b in lowers:
-                    self.assertIn(c, fast.above_neighbors[b], f"seed={seed}")
-            for b, uppers in fast.above_neighbors.items():
-                for c in uppers:
-                    self.assertIn(b, fast.below_neighbors[c], f"seed={seed}")
 
-    def test_below_neighbors_determine_address(self):
-        # The invariant Step 4 relies on: each buffer's address is recovered
-        # from its below-neighbours alone, identically to the full build.
-        for seed, buffers, perm, cap, align in self._cases():
-            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
-            for idx in range(len(buffers)):
-                addr, _ = fast._placement_decision(
-                    idx, sorted(fast.below_neighbors[idx])
-                )
-                self.assertEqual(addr, fast.addresses[idx], f"seed={seed} idx={idx}")
+class RegressionFixtureTests(TestCase):
+    """The exact contact-profile fixture from the spec."""
+
+    def _fixture(self):
+        # index: z=0, w=1, x=2, y=3; per-column order bottom->top: z, w, x, y.
+        buffers = [
+            _buf("z", 10, 0, 15),
+            _buf("w", 10, 0, 10),
+            _buf("x", 10, 0, 10),
+            _buf("y", 10, 5, 15),
+        ]
+        return PermutationBasedLayoutSolver(buffers, [0, 1, 2, 3], 10_000, 1)
+
+    def test_initial_profiles(self):
+        plan = self._fixture()
+        self.assertEqual(_below_named(plan, "z"), [(0, 15, None)])
+        self.assertEqual(_below_named(plan, "w"), [(0, 10, "z")])
+        self.assertEqual(_below_named(plan, "x"), [(0, 10, "w")])
+        self.assertEqual(_below_named(plan, "y"), [(5, 10, "x"), (10, 15, "z")])
+        _check_consistency(self, plan)
+
+    def test_after_swapping_x_and_y(self):
+        plan = self._fixture()
+        plan.swap(2)  # swap x (pos 2) and y (pos 3); shared range I = [5, 10)
+        self.assertEqual(_below_named(plan, "x"), [(0, 5, "w"), (5, 10, "y")])
+        self.assertEqual(_below_named(plan, "y"), [(5, 10, "w"), (10, 15, "z")])
+        self.assertEqual(_above_named(plan, "w"), [(0, 5, "x"), (5, 10, "y")])
+        self.assertEqual(_above_named(plan, "z"), [(0, 10, "w"), (10, 15, "y")])
+        self.assertEqual(_above_named(plan, "y"), [(5, 10, "x"), (10, 15, None)])
+        self.assertEqual(_above_named(plan, "x"), [(0, 10, None)])
+        _check_consistency(self, plan)
 
 
 class SwapTests(TestCase):
@@ -487,14 +490,16 @@ class SwapTests(TestCase):
                 self.assertEqual(fast.quality(), ref.quality(), tag)
                 self.assertEqual(delta, fast.quality() - before, tag)
 
-                # The incrementally maintained graph matches a from-scratch
-                # rebuild of the same permutation, exactly.
+                # The incrementally maintained contact profiles match a
+                # from-scratch rebuild of the same permutation, exactly, and are
+                # internally consistent.
                 rebuilt = PermutationBasedLayoutSolver(
                     buffers, list(fast.permutation), cap, align
                 )
-                self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
-                self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
+                self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
+                self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
                 self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+                _check_consistency(self, fast, tag)
 
 
 class RotateTests(TestCase):
@@ -547,9 +552,10 @@ class RotateTests(TestCase):
                 rebuilt = PermutationBasedLayoutSolver(
                     buffers, list(fast.permutation), cap, align
                 )
-                self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
-                self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
+                self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
+                self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
                 self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+                _check_consistency(self, fast, tag)
 
     def test_single_element_sweep_matches_reference(self):
         # Sweep one element across every position (rotate it to 0, then bubble
@@ -592,9 +598,10 @@ class RotateTests(TestCase):
             self.assertEqual(fast.permutation, orig_perm, f"seed={seed}")
             self.assertEqual(fast.addresses, orig_addr, f"seed={seed}")
             rebuilt = PermutationBasedLayoutSolver(buffers, orig_perm, cap, align)
-            self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, f"{seed}")
-            self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, f"{seed}")
+            self.assertEqual(fast.below_profile, rebuilt.below_profile, f"{seed}")
+            self.assertEqual(fast.above_profile, rebuilt.above_profile, f"{seed}")
             self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, f"{seed}")
+            _check_consistency(self, fast, f"seed={seed}")
 
 
 class CopyTests(TestCase):
@@ -610,14 +617,13 @@ class CopyTests(TestCase):
         # Static structures are shared by reference.
         self.assertIs(clone.buffers, plan.buffers)
         self.assertIs(clone.overlaps, plan.overlaps)
-        self.assertIs(clone.inplace_partners, plan.inplace_partners)
         self.assertIs(clone._name_to_idx, plan._name_to_idx)
         # Dynamic state is equal but independent.
         self.assertEqual(clone.addresses, plan.addresses)
-        self.assertEqual(clone.below_neighbors, plan.below_neighbors)
+        self.assertEqual(clone.below_profile, plan.below_profile)
         self.assertIsNot(clone.permutation, plan.permutation)
-        self.assertIsNot(clone.below_neighbors, plan.below_neighbors)
-        self.assertIsNot(clone.below_neighbors[0], plan.below_neighbors[0])
+        self.assertIsNot(clone.below_profile, plan.below_profile)
+        self.assertIsNot(clone.below_profile[0], plan.below_profile[0])
 
     def test_mutating_copy_leaves_original_intact(self):
         for seed in range(2000):
@@ -632,7 +638,10 @@ class CopyTests(TestCase):
 
             orig_perm = list(plan.permutation)
             orig_addr = list(plan.addresses)
-            orig_below = {k: set(v) for k, v in plan.below_neighbors.items()}
+            orig_below = {
+                k: Profile(list(p.starts), list(p.labels))
+                for k, p in plan.below_profile.items()
+            }
             orig_quality = plan.quality()
 
             clone = plan.copy()
@@ -642,7 +651,7 @@ class CopyTests(TestCase):
             # Original is untouched by mutations on the clone.
             self.assertEqual(plan.permutation, orig_perm, seed)
             self.assertEqual(plan.addresses, orig_addr, seed)
-            self.assertEqual(plan.below_neighbors, orig_below, seed)
+            self.assertEqual(plan.below_profile, orig_below, seed)
             self.assertEqual(plan.quality(), orig_quality, seed)
 
             # The mutated clone is a valid plan: matches a fresh build.
@@ -651,8 +660,8 @@ class CopyTests(TestCase):
             )
             self.assertEqual(clone.addresses, rebuilt.addresses, seed)
             self.assertEqual(clone.quality(), rebuilt.quality(), seed)
-            self.assertEqual(clone.below_neighbors, rebuilt.below_neighbors, seed)
-            self.assertEqual(clone.above_neighbors, rebuilt.above_neighbors, seed)
+            self.assertEqual(clone.below_profile, rebuilt.below_profile, seed)
+            self.assertEqual(clone.above_profile, rebuilt.above_profile, seed)
 
 
 @unittest.skipUnless(
@@ -688,8 +697,8 @@ class StressTests(TestCase):
         rebuilt = PermutationBasedLayoutSolver(
             fast.buffers, list(fast.permutation), cap, align
         )
-        self.assertEqual(fast.below_neighbors, rebuilt.below_neighbors, tag)
-        self.assertEqual(fast.above_neighbors, rebuilt.above_neighbors, tag)
+        self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
+        self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
         self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
 
     def test_swap_sequences(self):
@@ -744,12 +753,15 @@ class StressTests(TestCase):
         for seed, rng, n, buffers, perm, cap, align in self._cases(10000):
             plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
             orig_addr = list(plan.addresses)
-            orig_below = {k: set(v) for k, v in plan.below_neighbors.items()}
+            orig_below = {
+                k: Profile(list(p.starts), list(p.labels))
+                for k, p in plan.below_profile.items()
+            }
             clone = plan.copy()
             for _ in range(rng.randint(1, 3 * n)):
                 clone.swap(rng.randrange(n - 1))
             self.assertEqual(plan.addresses, orig_addr, seed)
-            self.assertEqual(plan.below_neighbors, orig_below, seed)
+            self.assertEqual(plan.below_profile, orig_below, seed)
             self._assert_matches_rebuild(clone, cap, align, f"seed={seed} (clone)")
 
 

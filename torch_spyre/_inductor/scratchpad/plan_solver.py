@@ -600,19 +600,26 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
 class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     """Incremental capacity-bounded allocation plan.
 
-    Maintains a neighbor graph (buffers directly below/above each buffer in
-    address space, including air-gap dependencies) so that swapping two adjacent
-    permutation entries only re-places the affected buffers via change-driven
-    propagation, rather than rebuilding the whole layout.
+    Maintains, for each buffer, a *contact profile* -- a step function over its
+    lifetime giving the buffer directly below / above it in the per-column
+    stacking order (or None at the ends). Swapping two adjacent permutation
+    entries transposes them only over their shared column range, so the profiles
+    are updated by O(segments) splices rather than rebuilt; addresses are then
+    re-placed for the buffers the change actually reaches, propagated along the
+    time-overlap dependency graph.
+
+    The contact relation is purely order-based (a function of the permutation
+    and lifetimes): at a column the alive buffers are ordered by permutation
+    position, and ``below_profile[c]`` at that column is ``c``'s immediate
+    predecessor in that order. In-place placement is ignored by the relation
+    (parent-before-child means parent-below-child); it still affects addresses,
+    which are computed separately.
 
     Attributes:
-        below_neighbors: ``below_neighbors[c]`` is the set of buffer indices
-            directly below ``c`` -- those that share a tick with ``c`` and are
-            the nearest buffer beneath it at that tick (air gaps included), plus
-            any in-place partner whose address ``c`` reuses. ``c``'s address is
-            a function of exactly this set.
-        above_neighbors: the inverse relation; used to find which buffers may
-            need re-placing when ``c``'s top moves.
+        below_profile: ``below_profile[c]`` maps each column of ``c``'s lifetime
+            to the buffer directly below ``c`` there, or None.
+        above_profile: the inverse relation; used to find which buffers may need
+            re-placing when ``c``'s top moves.
         inplace_reuse: ``inplace_reuse[x] = y`` when buffer ``x`` reused
             partner ``y``'s address in-place (``x`` was placed at ``y``'s
             address).
@@ -640,114 +647,79 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         self.position: list[int] = [0] * n
         for p, idx in enumerate(self.permutation):
             self.position[idx] = p
-        # In-place partners (parents and children) per buffer; the only buffers
-        # that may legally share an address with it. Used by swap() to find the
-        # other members of a buffer's column.
-        self.inplace_partners: dict[int, set[int]] = {i: set() for i in range(n)}
-        for child in range(n):
-            for pname in self.buffers[child].in_place_parents:
-                parent = self._name_to_idx.get(pname)
-                if parent is not None:
-                    self.inplace_partners[child].add(parent)
-                    self.inplace_partners[parent].add(child)
         # Time-overlap sets. Lifetimes never change, so this is computed once
-        # and lets swap() find a buffer's candidates in O(degree) instead of
-        # scanning all n buffers.
+        # and lets the address recompute find a buffer's candidates in O(degree)
+        # instead of scanning all n buffers.
         self.overlaps: dict[int, set[int]] = {i: set() for i in range(n)}
         for a in range(n):
             for b in range(a + 1, n):
                 if self._overlaps(a, b):
                     self.overlaps[a].add(b)
                     self.overlaps[b].add(a)
-        self._build_neighbor_graph()
+        self._build_profiles()
 
-    def _build_neighbor_graph(self) -> None:
-        """Populate ``below_neighbors`` / ``above_neighbors`` from the layout.
+    def _build_profiles(self) -> None:
+        """Build the below/above contact profiles from ground truth.
 
-        ``c``'s direct below-neighbours at a tick are the buffers forming the
-        nearest *column* entirely below it: we find the greatest top at or under
-        ``c``'s address, then take every buffer sharing that column's address
-        (in-place siblings share an address and so share a column). Taking only
-        the single nearest buffer would be wrong -- a shorter in-place sibling,
-        shielded by a taller one whose top reaches a byte higher, would be
-        dropped, yet it still occupies the column beneath ``c`` and so must count
-        among the "other" buffers when deciding whether ``c`` may drop into an
-        in-place partner's slot. Nothing lies between the column and ``c`` (a
-        higher entirely-below buffer contradicts "greatest"; a buffer crossing
-        ``c``'s address would overlap ``c`` in time, which the layout forbids),
-        so this captures the true adjacency, air gaps included. We union over
-        every integer tick: an adjacency can first appear at an interior tick
-        where two buffers that previously separated the pair have both died,
-        with nothing entering or leaving at that tick.
-
-        In-place partners that share ``c``'s own address are handled separately:
-        being level with ``c`` they are not "below" it, so the sweep never links
-        them. The explicit ``reused -> reuser`` edge instead records that
-        dependency, so the reuser re-derives its address from the partner while
-        the reused buffer keeps its own geometric below-neighbours.
+        At each column the buffers alive there are totally ordered by
+        permutation position (the bottom-to-top stacking order); a buffer's
+        below/above neighbour is its immediate predecessor / successor in that
+        per-column order, or None at the ends. Sweeping the breakpoint intervals
+        and reading adjacent pairs gives each buffer's contact step function over
+        its lifetime. In-place placement is ignored -- the relation is purely a
+        function of the permutation and lifetimes.
         """
         n = len(self.buffers)
-        self.below_neighbors: dict[int, set[int]] = {i: set() for i in range(n)}
-        self.above_neighbors: dict[int, set[int]] = {i: set() for i in range(n)}
-
-        # Explicit in-place edges: the reuser depends on the reused partner.
-        for reuser, reused in self.inplace_reuse.items():
-            self.below_neighbors[reuser].add(reused)
-            self.above_neighbors[reused].add(reuser)
-
+        self.below_profile: dict[int, Profile] = {}
+        self.above_profile: dict[int, Profile] = {}
         if n == 0:
             return
-
-        min_start = min(b.start_time for b in self.buffers)
-        max_end = max(b.end_time for b in self.buffers)
-
-        for t in range(min_start, max_end):
-            alive = [
-                i
-                for i in range(n)
-                if self.buffers[i].start_time <= t < self.buffers[i].end_time
-            ]
-            for c in alive:
-                ca = self.addresses[c]
-                # Address of the highest column entirely below c at this tick.
-                nearest_top = -1
-                nearest_addr = None
-                for b in alive:
-                    if b == c:
-                        continue
-                    top_b = self._top(b)
-                    if top_b <= ca and top_b > nearest_top:
-                        nearest_top = top_b
-                        nearest_addr = self.addresses[b]
-                if nearest_addr is None:
-                    continue
-                # Link c to every buffer in that column (in-place siblings).
-                for b in alive:
-                    if b != c and self.addresses[b] == nearest_addr:
-                        self.below_neighbors[c].add(b)
-                        self.above_neighbors[b].add(c)
+        bufs = self.buffers
+        below_segs: dict[int, tuple[list[int], list[Optional[int]]]] = {
+            i: ([], []) for i in range(n)
+        }
+        above_segs: dict[int, tuple[list[int], list[Optional[int]]]] = {
+            i: ([], []) for i in range(n)
+        }
+        breakpoints = sorted({b.start_time for b in bufs} | {b.end_time for b in bufs})
+        for t0 in breakpoints[:-1]:
+            alive = sorted(
+                (i for i in range(n) if bufs[i].start_time <= t0 < bufs[i].end_time),
+                key=lambda i: self.position[i],
+            )
+            for idx, c in enumerate(alive):
+                below = alive[idx - 1] if idx > 0 else None
+                above = alive[idx + 1] if idx + 1 < len(alive) else None
+                below_segs[c][0].append(t0)
+                below_segs[c][1].append(below)
+                above_segs[c][0].append(t0)
+                above_segs[c][1].append(above)
+        for i in range(n):
+            bs, bl = below_segs[i]
+            bs.append(bufs[i].end_time)
+            self.below_profile[i] = Profile.from_segments(bs, bl)
+            as_, al = above_segs[i]
+            as_.append(bufs[i].end_time)
+            self.above_profile[i] = Profile.from_segments(as_, al)
 
     def swap(self, i: int) -> int:
         """Swap permutation entries ``i`` and ``i+1`` and re-place incrementally.
 
-        A no-op when the swapped buffers do not overlap in time. Otherwise the
-        work is driven by the neighbour graph instead of by scanning positions:
+        A no-op when the swapped buffers do not overlap in time. Otherwise:
 
-        - Affected buffers are processed in a min-heap keyed by position.
-          Dependencies always point to earlier positions, so a buffer is settled
-          before anything resting on it, and ``position`` is maintained in O(1).
-        - Each processed buffer is re-derived in full (address *and* below/above
-          edges): the cascade can move a buffer into or out of another's column,
-          changing neighbour sets well beyond the swapped pair, so an
-          address-only update is not enough.
-        - When a buffer's address changes we enqueue its ``above_neighbors``
-          (the buffers resting on it, which a height change can disturb) and, if
-          it reused an in-place partner, also the partner's ``above_neighbors``:
-          a buffer joining a partner's column -- the only way two overlapping
-          buffers share an address -- adds itself to the below-set of everything
-          resting on that column, without the partner itself moving. Only
-          later-positioned buffers are notified, since a below-set draws solely
-          from earlier positions. This visits only the buffers a swap affects.
+        1. Over their shared column range the two buffers' per-column order
+           transposes and nothing else changes, so the contact profiles are
+           updated by a handful of splices (:meth:`_update_profiles_for_swap`).
+        2. Addresses are then re-placed for the buffers the change reaches,
+           processed in a min-heap by position (dependencies always point to
+           earlier positions, so a buffer is settled before anything resting on
+           it; ``position`` is maintained in O(1)). When a buffer ``z``'s address
+           changes, every later-positioned buffer overlapping it in time --
+           ``z``'s dependents, the buffers that carry ``z`` in their candidate
+           set -- is enqueued. (Immediate-above edges alone are *not* enough:
+           an in-place buffer sits low, so a taller buffer beneath it can "poke
+           through" and bind a dependent that is not its immediate successor in
+           the order. The full overlap set is the true address dependency.)
 
         Returns:
             The change in :meth:`total_size` (new minus old).
@@ -762,11 +734,22 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             # Independent buffers: their order does not affect any address.
             return 0
 
+        # 1. Transpose the contact profiles over the shared column range.
+        a = max(self.buffers[x].start_time, self.buffers[y].start_time)
+        b = min(self.buffers[x].end_time, self.buffers[y].end_time)
+        self._update_profiles_for_swap(x, y, a, b)
+
+        # 2. Re-place affected addresses. Seeding with the two swapped buffers
+        # suffices: nothing sits between adjacent positions, so any other buffer
+        # can only be affected through x or y (or transitively through a buffer
+        # that itself changed). Each change re-enqueues the changed buffer's
+        # later-positioned overlap set -- the dependents whose candidate set
+        # contains it -- processed in position order so every candidate is final
+        # before the buffers resting on it are re-placed.
         old_total = self.total_allocated_size
-        seed = {x, y} | self.above_neighbors[x] | self.above_neighbors[y]
-        heap = [(self.position[idx], idx) for idx in seed]
+        heap = [(self.position[x], x), (self.position[y], y)]
         heapq.heapify(heap)
-        queued = set(seed)
+        queued = {x, y}
         while heap:
             _, z = heapq.heappop(heap)
             queued.discard(z)
@@ -774,38 +757,66 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             if self._is_fully_allocated(z):
                 self.total_allocated_size -= self.buffers[z].size
                 self.total_allocated_count -= 1
-            self._replace_buffer(z, self.position)
+            self._recompute_address(z)
             if self._is_fully_allocated(z):
                 self.total_allocated_size += self.buffers[z].size
                 self.total_allocated_count += 1
             if self.addresses[z] != old_addr:
-                # Resters on z, plus resters on any column z now shares with an
-                # in-place partner (z just joined that partner's column).
-                notify = set(self.above_neighbors[z])
-                for partner in self.inplace_partners[z]:
-                    if self.addresses[partner] == self.addresses[z]:
-                        notify |= self.above_neighbors[partner]
                 pos_z = self.position[z]
-                for w in notify:
-                    if w not in queued and self.position[w] > pos_z:
+                for w in self.overlaps[z]:
+                    if self.position[w] > pos_z and w not in queued:
                         queued.add(w)
                         heapq.heappush(heap, (self.position[w], w))
         return self.total_allocated_size - old_total
 
-    def _replace_buffer(self, z: int, pos: list[int]) -> None:
-        """Recompute ``z``'s address and below/above edges from earlier buffers.
+    def _update_profiles_for_swap(self, x: int, y: int, a: int, b: int) -> None:
+        """Transpose ``x`` (was lower) and ``y`` (was upper) in the contact
+        profiles over the shared column range ``[a, b)``.
 
-        Uses only buffers placed before ``z`` (``pos[w] < pos[z]``); ``z`` stacks
-        on top of those it overlaps, except for an in-place reuse. Reciprocal
-        ``above_neighbors`` edges are kept consistent. Candidates are drawn from
-        ``z``'s precomputed time-overlap set, so this costs O(degree) rather than
-        scanning all buffers.
+        Captures both views before mutating, then runs the same splice logic
+        once per side (downward and upward are exact mirrors).
         """
-        for b in self.below_neighbors[z]:
-            self.above_neighbors[b].discard(z)
+        old_x_below = self.below_profile[x].segments(a, b)
+        old_y_above = self.above_profile[y].segments(a, b)
+        self._splice_half(
+            self.below_profile, self.above_profile, x, y, a, b, old_x_below
+        )
+        self._splice_half(
+            self.above_profile, self.below_profile, y, x, a, b, old_y_above
+        )
 
-        pos_z = pos[z]
-        cand = [w for w in self.overlaps[z] if pos[w] < pos_z]
+    @staticmethod
+    def _splice_half(
+        primary: dict[int, Profile],
+        reverse: dict[int, Profile],
+        lo: int,
+        hi: int,
+        a: int,
+        b: int,
+        old_lo: tuple[list[int], list[Optional[int]]],
+    ) -> None:
+        """One side of the transposition. ``lo`` was directly below ``hi`` (in
+        the ``primary`` direction) over ``[a, b)``; after the swap ``hi`` is.
+
+        - ``primary[lo]`` over ``[a, b)`` becomes ``hi``.
+        - ``primary[hi]`` over ``[a, b)`` inherits ``lo``'s old ``primary`` view.
+        - Each buffer ``lo`` pointed at keeps the relationship but now via
+          ``hi``, so its ``reverse`` profile relabels ``lo -> hi`` over that
+          segment.
+        """
+        primary[lo].splice(a, b, [a, b], [hi])
+        seg_starts, seg_labels = old_lo
+        primary[hi].splice(a, b, list(seg_starts), list(seg_labels))
+        for k, label in enumerate(seg_labels):
+            if label is not None:
+                reverse[label].relabel(seg_starts[k], seg_starts[k + 1], {lo: hi})
+
+    def _recompute_address(self, z: int) -> None:
+        """Re-place ``z``'s address from its earlier-positioned overlapping
+        candidates (the contact profiles are not consulted; they were already
+        updated by the splice)."""
+        pos_z = self.position[z]
+        cand = [w for w in self.overlaps[z] if self.position[w] < pos_z]
         addr, partner = self._placement_decision(z, cand)
         self.addresses[z] = addr
         if partner is None:
@@ -813,56 +824,16 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         else:
             self.inplace_reuse[z] = partner
 
-        below = self._column_below(z, cand)
-        if partner is not None:
-            below.add(partner)
-        self.below_neighbors[z] = below
-        for b in below:
-            self.above_neighbors[b].add(z)
-
-    def _column_below(self, z: int, cand: list[int]) -> set[int]:
-        """Direct below-neighbours of ``z`` among ``cand`` (already placed).
-
-        At each tick of ``z``'s life, take the column with the greatest top at or
-        below ``z``'s address and include every buffer sharing that column's
-        address (in-place siblings); union over ticks. Mirrors the per-tick rule
-        in :meth:`_build_neighbor_graph`, restricted to the candidate set.
-        """
-        addr = self.addresses[z]
-        below: set[int] = set()
-        bz = self.buffers[z]
-        for t in range(bz.start_time, bz.end_time):
-            nearest_top = -1
-            nearest_addr = None
-            for w in cand:
-                bw = self.buffers[w]
-                if not (bw.start_time <= t < bw.end_time):
-                    continue
-                top_w = self._top(w)
-                if top_w <= addr and top_w > nearest_top:
-                    nearest_top = top_w
-                    nearest_addr = self.addresses[w]
-            if nearest_addr is None:
-                continue
-            for w in cand:
-                bw = self.buffers[w]
-                if (
-                    bw.start_time <= t < bw.end_time
-                    and self.addresses[w] == nearest_addr
-                ):
-                    below.add(w)
-        return below
-
     def copy(self) -> "PermutationBasedLayoutSolver":
         """Return an independent layout snapshot that can be mutated (via
         :meth:`swap` / :meth:`rotate`) without affecting this one.
 
         Structures fixed for the lifetime of the plan -- ``buffers``,
-        ``_name_to_idx``, ``overlaps``, ``inplace_partners`` -- are shared by
-        reference; only the dynamic layout state (permutation, addresses,
-        positions, the neighbour graph and the running totals) is deep-copied.
-        So this costs O(n + graph size), not a rebuild. The result is always a
-        plain :class:`PermutationBasedLayoutSolver`, regardless of subclass.
+        ``_name_to_idx``, ``overlaps`` -- are shared by reference; only the
+        dynamic layout state (permutation, addresses, positions, contact
+        profiles and running totals) is deep-copied. So this costs O(n + profile
+        size), not a rebuild. The result is always a plain
+        :class:`PermutationBasedLayoutSolver`, regardless of subclass.
         """
         clone = PermutationBasedLayoutSolver.__new__(PermutationBasedLayoutSolver)
         # Shared, immutable-during-planning structures.
@@ -871,7 +842,6 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.capacity = self.capacity
         clone.alignment = self.alignment
         clone.overlaps = self.overlaps
-        clone.inplace_partners = self.inplace_partners
         # Deep-copied dynamic state.
         clone.permutation = list(self.permutation)
         clone.addresses = list(self.addresses)
@@ -879,6 +849,12 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.total_allocated_size = self.total_allocated_size
         clone.total_allocated_count = self.total_allocated_count
         clone.inplace_reuse = dict(self.inplace_reuse)
-        clone.below_neighbors = {k: set(v) for k, v in self.below_neighbors.items()}
-        clone.above_neighbors = {k: set(v) for k, v in self.above_neighbors.items()}
+        clone.below_profile = {
+            k: Profile(list(p.starts), list(p.labels))
+            for k, p in self.below_profile.items()
+        }
+        clone.above_profile = {
+            k: Profile(list(p.starts), list(p.labels))
+            for k, p in self.above_profile.items()
+        }
         return clone
