@@ -733,23 +733,34 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         """Re-place ``z``'s address from the buffers it actually rests on, read
         off the (already-spliced) contact profile.
 
-        ``contact_at`` over ``z``'s below-profile breakpoints names, per column,
-        the buffer ``z`` rests on plus -- across an in-place transition -- the
-        co-located partner buried in that slot. This is a provably sufficient
-        candidate set for :meth:`_placement_decision`: it preserves the maximum
-        top (the binder is the per-column rest-on) and surfaces exactly the
-        co-located buffers that the in-place legality test needs. So it yields
-        the same address and partner as scanning the full earlier-overlapping
-        set, while touching only ``z``'s own contact segments rather than its
-        whole time-overlap set.
+        This is :meth:`contact_at` over ``z``'s below-profile breakpoints,
+        inlined: walking the profile segments hands us each order-below label
+        directly, so we skip ``contact_at``'s per-breakpoint bisect (its hot
+        cost), and -- since the candidate set is used unordered -- the
+        ``_in_place_pair`` ordering as well. Per segment the candidates are the
+        order-below buffer plus, across an active in-place transition (the
+        partner it reused is still alive at the segment's first column, so the
+        two are co-located there), that co-located partner. This is a provably
+        sufficient candidate set for :meth:`_placement_decision`: it preserves
+        the maximum top and surfaces exactly the co-located buffers the in-place
+        legality test needs, so it yields the same address and partner as
+        scanning the full earlier-overlapping set, while touching only ``z``'s
+        own contact segments.
         """
         cand: set[int] = set()
-        for t in self.below_profile[z].starts[:-1]:
-            contact = self.contact_at(z, t)
-            if isinstance(contact, tuple):
-                cand.update(contact)
-            elif contact is not None:
-                cand.add(contact)
+        prof = self.below_profile[z]
+        starts, labels = prof.starts, prof.labels
+        reuse = self.inplace_reuse
+        bufs = self.buffers
+        for i, m in enumerate(labels):
+            if m is None:
+                continue
+            cand.add(m)
+            reused = reuse.get(m)
+            if reused is not None:
+                rbuf = bufs[reused]
+                if rbuf.start_time <= starts[i] < rbuf.end_time:
+                    cand.add(reused)
         addr, partner = self._placement_decision(z, list(cand))
         self.addresses[z] = addr
         if partner is None:
