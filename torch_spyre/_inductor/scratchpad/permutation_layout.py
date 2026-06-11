@@ -730,12 +730,27 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 reverse[label].relabel(seg_starts[k], seg_starts[k + 1], {lo: hi})
 
     def _recompute_address(self, z: int) -> None:
-        """Re-place ``z``'s address from its earlier-positioned overlapping
-        candidates (the contact profiles are not consulted; they were already
-        updated by the splice)."""
-        pos_z = self.position[z]
-        cand = [w for w in self.overlaps[z] if self.position[w] < pos_z]
-        addr, partner = self._placement_decision(z, cand)
+        """Re-place ``z``'s address from the buffers it actually rests on, read
+        off the (already-spliced) contact profile.
+
+        ``contact_at`` over ``z``'s below-profile breakpoints names, per column,
+        the buffer ``z`` rests on plus -- across an in-place transition -- the
+        co-located partner buried in that slot. This is a provably sufficient
+        candidate set for :meth:`_placement_decision`: it preserves the maximum
+        top (the binder is the per-column rest-on) and surfaces exactly the
+        co-located buffers that the in-place legality test needs. So it yields
+        the same address and partner as scanning the full earlier-overlapping
+        set, while touching only ``z``'s own contact segments rather than its
+        whole time-overlap set.
+        """
+        cand: set[int] = set()
+        for t in self.below_profile[z].starts[:-1]:
+            contact = self.contact_at(z, t)
+            if isinstance(contact, tuple):
+                cand.update(contact)
+            elif contact is not None:
+                cand.add(contact)
+        addr, partner = self._placement_decision(z, list(cand))
         self.addresses[z] = addr
         if partner is None:
             self.inplace_reuse.pop(z, None)

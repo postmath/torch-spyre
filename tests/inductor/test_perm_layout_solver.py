@@ -14,6 +14,7 @@
 
 """Tests for the capacity-bounded allocation plans."""
 
+import itertools
 import os
 import random
 import unittest
@@ -457,6 +458,73 @@ class ContactProfileTests(TestCase):
         self.assertEqual(plan.contact_at(ih, 4), (ip, ic))  # slot below = pair
         self.assertEqual(plan.contact_at(ih, 5), ic)  # p dead -> plain child
         self.assertEqual(plan.contact_at(ip, 4), ic)  # p's own order-below is c
+
+    def test_contact_candidates_sufficient_exhaustive(self):
+        """Exhaustively (all small configurations) verify the property that
+        justifies the contact-based ``_recompute_address``: the candidate set
+        built from ``contact_at`` over ``z``'s below-profile breakpoints yields
+        the same ``_placement_decision`` as the full earlier-overlapping set.
+
+        Placement reads neither capacity nor alignment, so the equivalence is
+        independent of both and one of each suffices. ~40k configs, well under
+        a second. The heavier validation (n up to 4, larger sizes, live swap
+        propagation) lives in StressTests and the one-off exhaustive sweep.
+        """
+
+        def contact_cands(plan, z):
+            s: set[int] = set()
+            for t in plan.below_profile[z].starts[:-1]:
+                co = plan.contact_at(z, t)
+                if isinstance(co, tuple):
+                    s.update(co)
+                elif co is not None:
+                    s.add(co)
+            return list(s)
+
+        def full_cands(plan, z):
+            pz = plan.position[z]
+            return [w for w in plan.overlaps[z] if plan.position[w] < pz]
+
+        horizon = 3
+        lifetimes = [(s, e) for s in range(horizon) for e in range(s + 1, horizon + 1)]
+        for n in (2, 3):
+            for life in itertools.product(lifetimes, repeat=n):
+                starts = [s for s, _ in life]
+                ends = [e for _, e in life]
+                # in-place parent options: any other buffer whose lifetime makes
+                # it a geometrically valid parent (parent.end == child.start + 1).
+                parent_opts = [
+                    [None]
+                    + [j for j in range(n) if j != i and ends[j] == starts[i] + 1]
+                    for i in range(n)
+                ]
+                for sizes in itertools.product((1, 2), repeat=n):
+                    for wiring in itertools.product(*parent_opts):
+                        ipp = [[f"b{j}"] if j is not None else [] for j in wiring]
+                        for perm in itertools.permutations(range(n)):
+                            bufs = [
+                                _buf(
+                                    f"b{i}",
+                                    sizes[i],
+                                    starts[i],
+                                    ends[i],
+                                    in_place_parents=list(ipp[i]),
+                                )
+                                for i in range(n)
+                            ]
+                            plan = PermutationBasedLayoutSolver(
+                                bufs, list(perm), 10**9, 1
+                            )
+                            for z in range(n):
+                                tag = (
+                                    f"life={life} sizes={sizes} wiring={wiring} "
+                                    f"perm={perm} z={z}"
+                                )
+                                self.assertEqual(
+                                    plan._placement_decision(z, contact_cands(plan, z)),
+                                    plan._placement_decision(z, full_cands(plan, z)),
+                                    tag,
+                                )
 
     # --- randomized differential checks ------------------------------------
 
