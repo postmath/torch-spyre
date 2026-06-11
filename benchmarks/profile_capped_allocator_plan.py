@@ -28,9 +28,9 @@ See capped_allocator_plan_results.md for a sample run and analysis.
 import random
 import time
 
-from torch_spyre._inductor.scratchpad.plan_solver import (
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
-    LifetimeBoundBuffer,
     ReferencePermutationBasedLayoutSolver,
 )
 

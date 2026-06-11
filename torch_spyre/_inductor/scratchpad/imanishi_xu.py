@@ -39,10 +39,12 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    PermutationBasedLayoutSolver,
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
+)
+from torch_spyre._inductor.scratchpad.permutation_layout import (
+    PermutationBasedLayoutSolver,
 )
 
 

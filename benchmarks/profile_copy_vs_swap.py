@@ -30,8 +30,8 @@ Run from the repository root::
 import random
 import time
 
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    LifetimeBoundBuffer,
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
 )
 

@@ -21,8 +21,10 @@ from unittest import TestCase
 from typing import TYPE_CHECKING
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    PermutationBasedLayoutSolver,
     LifetimeBoundBuffer,
+)
+from torch_spyre._inductor.scratchpad.permutation_layout import (
+    PermutationBasedLayoutSolver,
     Profile,
     ReferencePermutationBasedLayoutSolver,
 )

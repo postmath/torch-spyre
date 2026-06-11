@@ -22,6 +22,8 @@ from unittest import TestCase
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
+)
+from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.imanishi_xu import (
