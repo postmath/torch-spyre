@@ -230,6 +230,10 @@ class PermutationBasedLayoutSolverBase(ABC):
         self.alignment = alignment
         self._name_to_idx = {buf.name: i for i, buf in enumerate(buffers)}
 
+        # Per-buffer size as a flat list, for fast access in the placement hot
+        # loop (avoids a dataclass attribute lookup per candidate). Immutable.
+        self._sizes = [buf.size for buf in buffers]
+
         # Per-buffer set of possible in-place partners (its declared parents and
         # the children that declare it). Static -- a function of names and
         # in_place_parents -- so computed once and consulted instead of probing
@@ -297,13 +301,11 @@ class PermutationBasedLayoutSolverBase(ABC):
 
     def _top(self, idx: int) -> int:
         """Return ``address + size`` for a placed buffer (its exclusive top)."""
-        addr = self.addresses[idx]
-        return addr + self.buffers[idx].size
+        return self.addresses[idx] + self._sizes[idx]
 
     def _is_fully_allocated(self, idx: int) -> bool:
         """True if buffer ``idx`` has an address and fits below ``capacity``."""
-        addr = self.addresses[idx]
-        return addr + self.buffers[idx].size <= self.capacity
+        return self.addresses[idx] + self._sizes[idx] <= self.capacity
 
     def _overlaps(self, i: int, j: int) -> bool:
         """True if buffers ``i`` and ``j`` are alive at a common tick.
@@ -382,7 +384,11 @@ class PermutationBasedLayoutSolverBase(ABC):
         """
         if not candidates:
             return 0, None
-        max_top = max(self._top(p) for p in candidates)
+        # _top inlined as addr[p] + sizes[p] on locals: this max runs once per
+        # placed buffer over all its candidates and is the placement hot loop.
+        addr = self.addresses
+        sizes = self._sizes
+        max_top = max(addr[p] + sizes[p] for p in candidates)
         # Try to drop into an in-place partner's slot. Only ``idx``'s precomputed
         # in-place partners can qualify, so probe those that are present among
         # the candidates rather than testing every candidate. At most one can
@@ -395,9 +401,10 @@ class PermutationBasedLayoutSolverBase(ABC):
                 assert pair is not None  # partner came from the in-place set
                 if not self._can_inplace(*pair):
                     continue
-                partner_addr = self.addresses[partner]
+                partner_addr = addr[partner]
                 others_top = max(
-                    (self._top(q) for q in candidates if q != partner), default=0
+                    (addr[q] + sizes[q] for q in candidates if q != partner),
+                    default=0,
                 )
                 if others_top <= partner_addr:
                     return partner_addr, partner
@@ -772,6 +779,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.capacity = self.capacity
         clone.alignment = self.alignment
         clone.overlaps = self.overlaps
+        clone._sizes = self._sizes
         clone._inplace_partners = self._inplace_partners
         # Deep-copied dynamic state.
         clone.permutation = list(self.permutation)
