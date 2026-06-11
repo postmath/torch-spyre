@@ -528,10 +528,17 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                     self.overlaps[b].add(a)
         # Minimum |i - j| at which rotate() uses the remove/reinsert fast path
         # (_fast_rotate) instead of the adjacent-swap chain; below it the chain
-        # is cheaper because most of its swaps are O(1) no-ops. The default is a
-        # fraction of n derived from prototype measurements (see the rotate
-        # docstring); it is an instance attribute so callers/tests can override
-        # it -- set it to 1 to force the fast path on every rotation.
+        # is cheaper because most of its swaps are O(1) no-ops. n//8 (~0.125n) is
+        # picked from the measured crossover -- the fraction of n above which the
+        # fast path wins -- which is ~0.04-0.15n at medium overlap density and
+        # ~0.13-0.37n at low density (it falls as density rises, since the swap
+        # chain's per-overlap propagation grows super-linearly while the fast
+        # path is ~independent of distance). So n//8 sits below the
+        # medium-density crossover (engaging the fast path where it clearly pays)
+        # and is mildly conservative at low density (it may engage a touch early,
+        # but both paths are sub-millisecond there). It is an instance attribute
+        # so callers/tests can override it -- set it to 1 to force the fast path
+        # on every rotation.
         self._rotate_remove_insert_threshold = max(2, n // 8)
         # How the fast path updates the contact profiles after a move:
         #   "patch"   -- incremental single-move splice (Stage 2; default), or
@@ -844,6 +851,13 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         Rebuilds ``addresses``, ``inplace_reuse``, ``total_allocated_size`` and
         ``total_allocated_count`` from scratch but in O(sum of overlap degrees),
         which is what makes the long-move rotate independent of ``|i - j|``.
+
+        Unlike :meth:`_recompute_address` (the swap path), this builds candidates
+        from the static, order-independent ``overlaps`` set rather than the
+        contact profiles. It runs inside :meth:`_fast_rotate` *before* the
+        profiles are patched for the move, so at this point ``below_profile``
+        still describes the pre-move order and cannot be trusted as a candidate
+        source; ``overlaps`` is valid regardless of order.
         """
         perm = self.permutation
         pos = self.position
