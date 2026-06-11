@@ -605,6 +605,9 @@ class RotateTests(TestCase):
             cap = rng.choice([150, 400, 10_000])
             align = rng.choice([1, 64, 128])
             fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            # Force the remove/reinsert fast path on every rotation (small n
+            # gives small distances otherwise, so the chain would always win).
+            fast._rotate_remove_insert_threshold = 1
 
             for step in range(rng.randint(1, 2 * n)):
                 i, j = rng.randrange(n), rng.randrange(n)
@@ -643,6 +646,7 @@ class RotateTests(TestCase):
             cap = rng.choice([150, 400, 10_000])
             align = rng.choice([1, 64, 128])
             fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            fast._rotate_remove_insert_threshold = 1  # exercise the fast path
 
             orig_perm = list(fast.permutation)
             orig_addr = list(fast.addresses)
@@ -674,6 +678,116 @@ class RotateTests(TestCase):
             self.assertEqual(fast.above_profile, rebuilt.above_profile, f"{seed}")
             self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, f"{seed}")
             _check_consistency(self, fast, f"seed={seed}")
+
+
+class FastRotateTests(TestCase):
+    """The remove-one / reinsert-elsewhere fast rotate in
+    :class:`PermutationBasedLayoutSolver`, forced on for every rotation.
+
+    The fast path is distance-gated in production; here we pin
+    ``_rotate_remove_insert_threshold = 1`` so it fires on *every* rotate --
+    including the large ``|i - j|`` moves it exists for -- and check it against
+    both oracles (a from-scratch reference build and a fresh rebuild). Both
+    profile modes are covered: ``"patch"`` (the incremental single-move splice)
+    and ``"rebuild"`` (full ``_build_profiles``), which must agree exactly.
+    """
+
+    def _assert_matches(self, fast, cap, align, delta, before, tag):
+        ref = ReferencePermutationBasedLayoutSolver(
+            fast.buffers, list(fast.permutation), cap, align
+        )
+        self.assertEqual(fast.addresses, ref.addresses, tag)
+        self.assertEqual(fast.quality(), ref.quality(), tag)
+        self.assertEqual(fast.count_allocated(), ref.count_allocated(), tag)
+        self.assertEqual(delta, fast.quality() - before, tag)
+        rebuilt = PermutationBasedLayoutSolver(
+            fast.buffers, list(fast.permutation), cap, align
+        )
+        self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
+        self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
+        self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+        _check_consistency(self, fast, tag)
+        _check_contact_faithful(self, fast, tag)
+
+    def test_long_rotations_both_directions(self):
+        # A handful of mutually overlapping buffers; sweep every (i, j) pair,
+        # which includes the full-distance moves in both directions, for both
+        # profile modes. Each rotate is applied to a fresh plan.
+        n = 7
+        buffers = [_buf(f"b{k}", 10 * (k + 1), 0, 5) for k in range(n)]
+        for mode in ("patch", "rebuild"):
+            for i in range(n):
+                for j in range(n):
+                    for cap, align in ((10_000, 1), (250, 64)):
+                        fast = PermutationBasedLayoutSolver(
+                            buffers, list(range(n)), cap, align
+                        )
+                        fast._rotate_remove_insert_threshold = 1
+                        fast._rotate_profile_mode = mode
+                        before = fast.quality()
+                        delta = fast.rotate(i, j)
+                        expected = list(range(n))
+                        x = expected.pop(i)
+                        expected.insert(j, x)
+                        self.assertEqual(fast.permutation, expected)
+                        self._assert_matches(
+                            fast, cap, align, delta, before, f"{mode} i={i} j={j}"
+                        )
+
+    def test_dense_inplace_random(self):
+        # Dense in-place wiring (inplace_prob up to ~0.7), random rotations
+        # forced through the fast path, both profile modes.
+        for mode in ("patch", "rebuild"):
+            for seed in range(1500):
+                rng = random.Random(seed)
+                n = rng.randint(2, 12)
+                buffers = _random_buffers(
+                    rng, n, horizon=15, max_size=300, inplace_prob=0.7
+                )
+                perm = list(range(n))
+                rng.shuffle(perm)
+                cap = rng.choice([150, 400, 800, 10**9])
+                align = rng.choice([1, 32, 64, 128])
+                fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+                fast._rotate_remove_insert_threshold = 1
+                fast._rotate_profile_mode = mode
+                for step in range(rng.randint(1, 2 * n)):
+                    i, j = rng.randrange(n), rng.randrange(n)
+                    before = fast.quality()
+                    delta = fast.rotate(i, j)
+                    tag = f"{mode} seed={seed} step={step} i={i} j={j}"
+                    self._assert_matches(fast, cap, align, delta, before, tag)
+
+    def test_threshold_dispatch_agrees_with_chain(self):
+        # The fast path and the swap-chain must produce identical results for
+        # the same move. Run the same rotation on two clones, one forced to the
+        # fast path and one forced to the chain, and compare.
+        for seed in range(800):
+            rng = random.Random(seed)
+            n = rng.randint(3, 12)
+            buffers = _random_buffers(rng, n, horizon=15, inplace_prob=0.5)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10**9])
+            align = rng.choice([1, 64, 128])
+            base = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            i, j = rng.randrange(n), rng.randrange(n)
+
+            chain = base.copy()
+            chain._rotate_remove_insert_threshold = n + 1  # never fast
+            d_chain = chain.rotate(i, j)
+
+            fast = base.copy()
+            fast._rotate_remove_insert_threshold = 1  # always fast
+            d_fast = fast.rotate(i, j)
+
+            tag = f"seed={seed} i={i} j={j}"
+            self.assertEqual(fast.permutation, chain.permutation, tag)
+            self.assertEqual(fast.addresses, chain.addresses, tag)
+            self.assertEqual(d_fast, d_chain, tag)
+            self.assertEqual(fast.below_profile, chain.below_profile, tag)
+            self.assertEqual(fast.above_profile, chain.above_profile, tag)
+            self.assertEqual(fast.inplace_reuse, chain.inplace_reuse, tag)
 
 
 class CopyTests(TestCase):
@@ -788,6 +902,7 @@ class StressTests(TestCase):
     def test_rotation_sequences(self):
         for seed, rng, n, buffers, perm, cap, align in self._cases(10000):
             fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            fast._rotate_remove_insert_threshold = 1  # force the fast path
             for step in range(rng.randint(1, 3 * n)):
                 i, j = rng.randrange(n), rng.randrange(n)
                 before = fast.quality()
@@ -799,6 +914,7 @@ class StressTests(TestCase):
     def test_single_element_sweeps(self):
         for seed, rng, n, buffers, perm, cap, align in self._cases(3000):
             fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            fast._rotate_remove_insert_threshold = 1  # force the fast path
             orig_perm = list(fast.permutation)
             orig_addr = list(fast.addresses)
             i = rng.randrange(n)
