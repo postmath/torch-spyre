@@ -526,6 +526,19 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 if self._overlaps(a, b):
                     self.overlaps[a].add(b)
                     self.overlaps[b].add(a)
+        # Minimum |i - j| at which rotate() uses the remove/reinsert fast path
+        # (_fast_rotate) instead of the adjacent-swap chain; below it the chain
+        # is cheaper because most of its swaps are O(1) no-ops. The default is a
+        # fraction of n derived from prototype measurements (see the rotate
+        # docstring); it is an instance attribute so callers/tests can override
+        # it -- set it to 1 to force the fast path on every rotation.
+        self._rotate_remove_insert_threshold = max(2, n // 8)
+        # How the fast path updates the contact profiles after a move:
+        #   "patch"   -- incremental single-move splice (Stage 2; default), or
+        #   "rebuild" -- a full _build_profiles() from scratch (Stage 1).
+        # Both produce byte-identical profiles; "rebuild" is kept for
+        # measurement and as a safety net.
+        self._rotate_profile_mode = "patch"
         self._build_profiles()
 
     def _build_profiles(self) -> None:
@@ -729,6 +742,185 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         else:
             self.inplace_reuse[z] = partner
 
+    # --- rotate: remove-one / reinsert-elsewhere fast path ------------------
+
+    def rotate(self, i: int, j: int) -> int:
+        """Take ``permutation[i]`` out of the permutation and reinsert it at
+        position ``j``; return the change in :meth:`quality` (new minus old).
+
+        Two strategies, chosen by distance ``|i - j|``:
+
+        - **Swap chain (short moves).** ``super().rotate`` walks the element to
+          its destination by adjacent :meth:`swap` calls. Most of those swaps
+          are O(1) no-ops, so for a short hop this is far cheaper than touching
+          the whole permutation.
+        - **Remove / reinsert (long moves), :meth:`_fast_rotate`.** For a long
+          hop the swap chain re-places the moved element (and the buffers it
+          passes) over and over. Instead we edit the permutation once, recompute
+          every address in the new order (reusing the static ``overlaps`` sets,
+          never the O(n^2) reference scan), and patch the contact profiles for
+          the single move -- all in time independent of ``|i - j|``.
+
+        The crossover ``|i - j| >=`` :attr:`_rotate_remove_insert_threshold`
+        selects the fast path; the threshold is a tunable instance attribute
+        (set it to 1 to force the fast path on every rotation).
+        """
+        if i == j:
+            return 0
+        if abs(i - j) < self._rotate_remove_insert_threshold:
+            return super().rotate(i, j)
+        return self._fast_rotate(i, j)
+
+    def _fast_rotate(self, i: int, j: int) -> int:
+        """Remove ``permutation[i]`` and reinsert it at ``j`` in one shot.
+
+        Edits the permutation and ``position`` index, recomputes all addresses
+        in the new order (:meth:`_recompute_all_addresses`), then updates the
+        contact profiles -- either by an incremental single-move patch
+        (:meth:`_patch_profiles_for_move`, the default) or, when
+        ``_rotate_profile_mode == "rebuild"``, by a full rebuild. Returns the
+        quality delta.
+        """
+        old_total = self.total_allocated_size
+        x = self.permutation[i]
+        if self._rotate_profile_mode == "patch":
+            # Capture x's pre-move contact profiles; the patch needs the old
+            # adjacency to stitch x's former neighbours back together. (Cheap
+            # shallow copies of the two step functions.)
+            old_below = Profile(
+                list(self.below_profile[x].starts), list(self.below_profile[x].labels)
+            )
+            old_above = Profile(
+                list(self.above_profile[x].starts), list(self.above_profile[x].labels)
+            )
+        self._move_in_permutation(i, j)
+        self._recompute_all_addresses()
+        if self._rotate_profile_mode == "rebuild":
+            self._build_profiles()
+        else:
+            self._patch_profiles_for_move(x, old_below, old_above)
+        return self.total_allocated_size - old_total
+
+    def _move_in_permutation(self, i: int, j: int) -> None:
+        """Pop ``permutation[i]`` and reinsert it at ``j``; refresh ``position``
+        over the affected range."""
+        perm = self.permutation
+        x = perm.pop(i)
+        perm.insert(j, x)
+        lo, hi = (i, j) if i < j else (j, i)
+        for p in range(lo, hi + 1):
+            self.position[perm[p]] = p
+
+    def _recompute_all_addresses(self) -> None:
+        """Re-place every buffer in the current permutation order, reusing the
+        static ``overlaps`` sets (never the O(n^2) reference scan).
+
+        Rebuilds ``addresses``, ``inplace_reuse``, ``total_allocated_size`` and
+        ``total_allocated_count`` from scratch but in O(sum of overlap degrees),
+        which is what makes the long-move rotate independent of ``|i - j|``.
+        """
+        perm = self.permutation
+        pos = self.position
+        self.inplace_reuse = {}
+        self.total_allocated_size = 0
+        self.total_allocated_count = 0
+        for p, idx in enumerate(perm):
+            cand = [w for w in self.overlaps[idx] if pos[w] < p]
+            addr, partner = self._placement_decision(idx, cand)
+            self.addresses[idx] = addr
+            if partner is not None:
+                self.inplace_reuse[idx] = partner
+            if self._is_fully_allocated(idx):
+                self.total_allocated_size += self._sizes[idx]
+                self.total_allocated_count += 1
+
+    @staticmethod
+    def _iter_common(
+        prof_a: Profile, prof_b: Profile
+    ) -> "list[tuple[int, int, Optional[int], Optional[int]]]":
+        """Walk two profiles over their shared span, yielding ``(lo, hi, a, b)``
+        for each maximal sub-interval on which both labels are constant."""
+        assert prof_a.span_start == prof_b.span_start
+        assert prof_a.span_end == prof_b.span_end
+        cuts = sorted(set(prof_a.starts) | set(prof_b.starts))
+        out: list[tuple[int, int, Optional[int], Optional[int]]] = []
+        for lo, hi in zip(cuts[:-1], cuts[1:]):
+            out.append((lo, hi, prof_a.label_at(lo), prof_b.label_at(lo)))
+        return out
+
+    def _patch_profiles_for_move(
+        self, x: int, old_below: Profile, old_above: Profile
+    ) -> None:
+        """Update the contact profiles for the single move of ``x`` to its new
+        position, producing profiles byte-identical to a from-scratch rebuild.
+
+        Two stages, both order-based (in-place placement is irrelevant here):
+
+        1. **Remove x.** Over each column x used to occupy, its old below
+           neighbour ``a`` and above neighbour ``b`` become adjacent: splice
+           ``above_profile[a] := b`` and ``below_profile[b] := a`` (handling the
+           ``None`` ends, where the survivor becomes bottom/top).
+        2. **Reinsert x.** x's contact neighbours can only be members of
+           ``overlaps[x]``; sweep the breakpoints those members induce across
+           x's lifetime. On each sub-interval the alive subset is constant, so
+           x's new below neighbour is the alive member with the greatest
+           ``position < position[x]`` and its above neighbour the one with the
+           least greater position (``None`` if none). Rebuild x's own profiles
+           and splice x into each neighbour's profile.
+        """
+        bufs = self.buffers
+        s_x, e_x = bufs[x].start_time, bufs[x].end_time
+
+        # --- 1. Remove x: stitch its former below/above neighbours together. --
+        for lo, hi, a, b in self._iter_common(old_below, old_above):
+            if a is not None:
+                self.above_profile[a].splice(lo, hi, [lo, hi], [b])
+            if b is not None:
+                self.below_profile[b].splice(lo, hi, [lo, hi], [a])
+
+        # --- 2. Reinsert x at its new position. ------------------------------
+        pos = self.position
+        pos_x = pos[x]
+        members = self.overlaps[x]
+        cuts = {s_x, e_x}
+        for w in members:
+            if bufs[w].start_time > s_x:
+                cuts.add(bufs[w].start_time)
+            if bufs[w].end_time < e_x:
+                cuts.add(bufs[w].end_time)
+        cut_list = sorted(c for c in cuts if s_x <= c <= e_x)
+
+        below_starts: list[int] = []
+        below_labels: list[Optional[int]] = []
+        above_starts: list[int] = []
+        above_labels: list[Optional[int]] = []
+        for lo, hi in zip(cut_list[:-1], cut_list[1:]):
+            below = None  # greatest position below pos_x among alive members
+            below_pos = -1
+            above = None  # least position above pos_x among alive members
+            above_pos = len(self.permutation)
+            for w in members:
+                if bufs[w].start_time <= lo < bufs[w].end_time:
+                    pw = pos[w]
+                    if pw < pos_x:
+                        if pw > below_pos:
+                            below_pos, below = pw, w
+                    elif above is None or pw < above_pos:
+                        above_pos, above = pw, w
+            below_starts.append(lo)
+            below_labels.append(below)
+            above_starts.append(lo)
+            above_labels.append(above)
+            # Splice x into each new neighbour's profile over [lo, hi).
+            if below is not None:
+                self.above_profile[below].splice(lo, hi, [lo, hi], [x])
+            if above is not None:
+                self.below_profile[above].splice(lo, hi, [lo, hi], [x])
+        below_starts.append(e_x)
+        above_starts.append(e_x)
+        self.below_profile[x] = Profile.from_segments(below_starts, below_labels)
+        self.above_profile[x] = Profile.from_segments(above_starts, above_labels)
+
     def contact_at(self, c: int, t: int) -> Optional[int] | tuple[int, int]:
         """What buffer ``c`` rests on at column ``t``, surfacing in-place reuse.
 
@@ -781,6 +973,10 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.overlaps = self.overlaps
         clone._sizes = self._sizes
         clone._inplace_partners = self._inplace_partners
+        # Rotate-policy knobs (cheap scalars; carried so a clone rotates the
+        # same way as its source and tests can flip them on a clone).
+        clone._rotate_remove_insert_threshold = self._rotate_remove_insert_threshold
+        clone._rotate_profile_mode = self._rotate_profile_mode
         # Deep-copied dynamic state.
         clone.permutation = list(self.permutation)
         clone.addresses = list(self.addresses)
