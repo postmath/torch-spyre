@@ -230,6 +230,12 @@ class PermutationBasedLayoutSolverBase(ABC):
         self.alignment = alignment
         self._name_to_idx = {buf.name: i for i, buf in enumerate(buffers)}
 
+        # Per-buffer set of possible in-place partners (its declared parents and
+        # the children that declare it). Static -- a function of names and
+        # in_place_parents -- so computed once and consulted instead of probing
+        # every candidate during placement. See _placement_decision.
+        self._inplace_partners = self._compute_inplace_partners()
+
         # Internal address per buffer index; None means unplaced. Populated by
         # _build and kept in sync by swap. Not written to buffer objects until
         # finalize.
@@ -323,6 +329,24 @@ class PermutationBasedLayoutSolverBase(ABC):
             return (i, j)  # i is the parent of j
         return None
 
+    def _compute_inplace_partners(self) -> list[set[int]]:
+        """For each buffer index, the set of buffers it could share a slot with
+        in-place: ``{j : _in_place_pair(i, j) is not None}``. This is exactly its
+        declared parents plus the children that declare it -- a static function
+        of names and ``in_place_parents``, so it is computed once and lets
+        :meth:`_placement_decision` probe only real partners instead of testing
+        every candidate.
+        """
+        n = len(self.buffers)
+        partners: list[set[int]] = [set() for _ in range(n)]
+        for child, buf in enumerate(self.buffers):
+            for pname in buf.in_place_parents:
+                parent = self._name_to_idx.get(pname)
+                if parent is not None:
+                    partners[child].add(parent)
+                    partners[parent].add(child)
+        return partners
+
     def _can_inplace(self, parent: int, child: int) -> bool:
         """True if ``child`` is allowed to share ``parent``'s address.
 
@@ -359,19 +383,24 @@ class PermutationBasedLayoutSolverBase(ABC):
         if not candidates:
             return 0, None
         max_top = max(self._top(p) for p in candidates)
-        # Try to drop into an in-place partner's slot. At most one partner can
+        # Try to drop into an in-place partner's slot. Only ``idx``'s precomputed
+        # in-place partners can qualify, so probe those that are present among
+        # the candidates rather than testing every candidate. At most one can
         # qualify: if two did, each would have to top out below the other's
-        # address, which is impossible.
-        for partner in candidates:
-            pair = self._in_place_pair(idx, partner)
-            if pair is None or not self._can_inplace(*pair):
-                continue
-            partner_addr = self.addresses[partner]
-            others_top = max(
-                (self._top(q) for q in candidates if q != partner), default=0
-            )
-            if others_top <= partner_addr:
-                return partner_addr, partner
+        # address, which is impossible -- so iteration order does not matter.
+        partners = self._inplace_partners[idx]
+        if partners:
+            for partner in partners.intersection(candidates):
+                pair = self._in_place_pair(idx, partner)
+                assert pair is not None  # partner came from the in-place set
+                if not self._can_inplace(*pair):
+                    continue
+                partner_addr = self.addresses[partner]
+                others_top = max(
+                    (self._top(q) for q in candidates if q != partner), default=0
+                )
+                if others_top <= partner_addr:
+                    return partner_addr, partner
         return self._align_up(max_top), None
 
     def _address_from_candidates(self, idx: int, candidates: list[int]) -> int:
@@ -743,6 +772,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.capacity = self.capacity
         clone.alignment = self.alignment
         clone.overlaps = self.overlaps
+        clone._inplace_partners = self._inplace_partners
         # Deep-copied dynamic state.
         clone.permutation = list(self.permutation)
         clone.addresses = list(self.addresses)

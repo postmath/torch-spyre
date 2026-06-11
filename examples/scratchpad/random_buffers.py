@@ -86,7 +86,7 @@ solver = ImanishiXuSolverWithBuffers(
     initial="first_fit",
     random=random,
     schedule=ExponentialCoolingSchedule(
-        t0=500000.0, t_end=50000.0, steps_per_epoch=10, epochs=10
+        t0=500000.0, t_end=50000.0, steps_per_epoch=30, epochs=100
     ),
 )
 solver.solve()
