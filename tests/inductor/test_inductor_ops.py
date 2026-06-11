@@ -2415,23 +2415,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_no_bias": (
                     cached_randn((67, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     None,
                 ),
                 "2d_bias": (
                     cached_randn((67, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     cached_randn((128,)),
                 ),
                 "3d_no_bias": (
                     cached_randn((3, 17, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     None,
                 ),
                 "3d_bias": (
                     cached_randn((3, 17, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     cached_randn((128,)),
+                ),
+                # down_proj-shaped cases : large reduction dim
+                # (32768) is numerically unstable with plain randn weights.
+                "down_proj_prefill_12800": (
+                    cached_randn((1, 11, 32768)),
+                    cached_xavier((12800, 32768)),
+                    cached_randn((12800,)),
+                ),
+                "down_proj_prefill_4096": (
+                    cached_randn((1, 11, 32768)),
+                    cached_xavier((4096, 32768)),
+                    cached_randn((4096,)),
+                ),
+                "down_proj_decode_12800": (
+                    cached_randn((1, 1, 32768)),
+                    cached_xavier((12800, 32768)),
+                    cached_randn((12800,)),
+                ),
+                "down_proj_decode_4096": (
+                    cached_randn((1, 1, 32768)),
+                    cached_xavier((4096, 32768)),
+                    cached_randn((4096,)),
                 ),
             }
         },
@@ -3611,6 +3633,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
         },
+        ("test_eq_scalar", "test_scalar_comparison_base"): {
+            "param_sets": {
+                "int_42": (
+                    42,
+                    torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float16),
+                ),
+                "int_10": (
+                    10,
+                    torch.tensor([1.0, 10.0, 5.0, 10.0, 3.0], dtype=torch.float16),
+                ),
+                "float_3_5": (
+                    3.5,
+                    torch.tensor([1.0, 3.5, 2.5, 3.1, 5.0], dtype=torch.float16),
+                ),
+                "negative_5": (
+                    -5,
+                    torch.tensor([-5, 0.0, 5.0, -5.0, 10.0], dtype=torch.float16),
+                ),
+                "zero": (
+                    0,
+                    torch.tensor([0.0, 1.0, -1.0, 0.0, 5.0], dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_eq_scalar_multidim", "test_scalar_multidim_base"): {
+            "param_sets": {
+                "2d": (
+                    7,
+                    torch.tensor(
+                        [[1.0, 7.0, 3.0], [7.0, 5.0, 7.0]], dtype=torch.float16
+                    ),
+                ),
+                "3d": (7, torch.randint(0, 15, (3, 4, 5)).to(torch.float16)),
+                "4d": (7, torch.randint(0, 15, (2, 3, 4, 5)).to(torch.float16)),
+                "large": (42, torch.randn(100, 50, dtype=torch.float16)),
+            },
+        },
+        ("test_eq_scalar_vs_tensor", "test_scalar_vs_tensor_base"): {
+            "param_sets": {
+                "mixed": (
+                    torch.tensor([1.0, 5.0, 3.0, 5.0], dtype=torch.float16),
+                    torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16),
+                    5,
+                ),
+            },
+        },
         ("test_where_default", "test_where_eager_default_fallback"): {
             "ops_dict": {"where": torch.where},
             "param_sets": {
@@ -3878,6 +3946,62 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def compare(self, *args, **kwargs):
         return utils_inductor.compare(*args, **kwargs)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_comparison_base(self, scalar, x):
+        """Base method for testing equality comparison with scalar constants"""
+
+        def fn(tensor, scalar_val):
+            return tensor == scalar_val
+
+        _compare_op_with_cpu(fn, None, x, scalar)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_multidim_base(self, scalar, x):
+        """Base method for testing equality comparison on multi-dimensional tensors"""
+
+        def fn(tensor, scalar_val):
+            return tensor == scalar_val
+
+        _compare_op_with_cpu(fn, None, x, scalar)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_vs_tensor_base(self, x, y, scalar):
+        """Base method for testing both scalar and tensor comparisons work"""
+
+        def fn(tensor_x, tensor_y, scalar_val):
+            scalar_result = tensor_x == scalar_val
+            tensor_result = tensor_x == tensor_y
+            return scalar_result, tensor_result
+
+        _compare_op_with_cpu(fn, None, x, y, scalar)
+
+    def test_scalar_comparison(self):
+        self.test_eq_scalar_int_42()
+
+    def test_eq_scalar_constant_int(self):
+        self.test_eq_scalar_int_10()
+
+    def test_eq_scalar_constant_float(self):
+        self.test_eq_scalar_float_3_5()
+
+    def test_eq_scalar_constant_negative(self):
+        self.test_eq_scalar_negative_5()
+
+    def test_eq_scalar_constant_zero(self):
+        self.test_eq_scalar_zero()
+
+    def test_eq_scalar_constant_multidim(self):
+        self.test_eq_scalar_multidim_2d()
+
+    def test_eq_scalar_constant_large_tensor(self):
+        self.test_eq_scalar_multidim_large()
+
+    def test_eq_scalar_vs_tensor_comparison(self):
+        self.test_eq_scalar_vs_tensor_mixed()
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):
@@ -5020,6 +5144,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert not torch.all(x_cpu == x_cpu[0]), (
             "uniform_ produced all identical values"
         )
+
+    def test_random_from_cpu(self):
+        """Test that tensor.random_(-5, 5) fills a tensor with random values in [-5, 5)."""
+        gen = torch.manual_seed(42)
+        x_spyre = torch.zeros(3, 5, dtype=torch.float16, device="spyre")
+        y_cpu = torch.zeros(3, 5, dtype=torch.float16, device="cpu")
+        y_cpu.random_(-5, 5, generator=gen)
+        gen.manual_seed(42)
+        x_spyre.random_(-5, 5, generator=gen)
+        x_cpu = x_spyre.to("cpu")
+
+        assert torch.all(x_cpu >= -5) and torch.all(x_cpu < 5), (
+            f"random_ values out of range [-5, 5): {x_cpu}"
+        )
+        assert not torch.all(x_cpu == x_cpu[0]), "random_ produced all identical values"
+        torch.testing.assert_close(x_cpu, y_cpu, rtol=0.0, atol=0.0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_tril_cpu(self, x):
