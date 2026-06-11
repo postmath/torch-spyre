@@ -113,6 +113,7 @@ def line_level():
         IX.annealing_step_swap,
         PBLS.swap,
         PBLS._recompute_address,
+        PBLS.contact_at,
         PBLS.copy,
         PBLS._update_profiles_for_swap,
         PBLS._splice_half,
