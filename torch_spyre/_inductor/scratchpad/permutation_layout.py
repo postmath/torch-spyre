@@ -922,23 +922,26 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         self.above_profile[x] = Profile.from_segments(above_starts, above_labels)
 
     def contact_at(self, c: int, t: int) -> Optional[int] | tuple[int, int]:
-        """What buffer ``c`` rests on at column ``t``, surfacing in-place reuse.
+        """What occupies the address slot directly below ``c`` at column ``t``,
+        derived on demand from the order ``below_profile`` and
+        :attr:`inplace_reuse` (nothing extra is stored). Three outcomes:
 
-        The stored ``below_profile`` records only the *order*-below neighbour,
-        which is not always what ``c`` physically rests on: across an active
-        in-placement the order-below buffer is a transparent child reusing its
-        parent's address, and the taller parent pokes through to actually carry
-        ``c``. This is the faithful view, derived on demand from the order
-        profile and :attr:`inplace_reuse` (nothing extra is stored):
+        - ``None`` -- nothing is below ``c`` at ``t`` (``c`` is on the floor).
+        - ``int m`` -- a single buffer ``m`` is directly below ``c``; ``c`` rests
+          on ``m``.
+        - ``(parent, child)`` -- the slot directly below ``c`` is shared by an
+          in-place pair at *their* transition column (the one tick on which
+          ``parent`` and ``child`` are both alive and co-located at the same
+          address). ``c`` rests on ``parent`` (the larger member -- in-place
+          requires ``child.size <= parent.size``, so it tops out highest);
+          ``child`` is the smaller buffer buried in the same slot.
 
-        - ``None`` -- ``c`` is on the floor at ``t`` (no buffer below).
-        - ``int m`` -- ``c`` rests on buffer ``m``.
-        - ``(parent, child)`` -- the slot directly below ``c`` is held by an
-          active in-place pair: ``c`` rests on ``parent`` while ``child`` (which
-          reuses ``parent``'s address and is ``c``'s order-below neighbour) sits
-          transparently inside it. Reported only at the single tick where parent
-          and child overlap; elsewhere the parent is gone and ``c`` rests on the
-          (former) child as a plain ``int``.
+        The tuple's meaning is role-based, not position-based: which member is
+        ``c``'s order-below neighbour depends on the reuse direction. When the
+        child reused the parent, the child is the order-below neighbour and the
+        parent pokes up from beneath it; when the parent reused the child, the
+        parent is the order-below neighbour and the child is buried below it.
+        Either way ``parent`` is what ``c`` rests on and both are returned.
         """
         m = self.below_profile[c].label_at(t)
         if m is None:
@@ -947,10 +950,11 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         if partner is not None:
             pair = self._in_place_pair(m, partner)
             assert pair is not None  # m reuses partner: they form a pair
-            parent, child = pair
-            pbuf = self.buffers[parent]
-            if m == child and pbuf.start_time <= t < pbuf.end_time:
-                return (parent, child)
+            # m is always alive at t (it is c's order-below), so the pair is at
+            # its transition column iff the other member (partner) is alive too.
+            obuf = self.buffers[partner]
+            if obuf.start_time <= t < obuf.end_time:
+                return pair  # (parent, child)
         return m
 
     def copy(self) -> "PermutationBasedLayoutSolver":

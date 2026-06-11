@@ -90,11 +90,14 @@ def _check_consistency(test, plan, tag=""):
 
 
 def _check_contact_faithful(test, plan, tag=""):
-    """Verify ``contact_at(c, t)`` names what ``c`` physically rests on at every
-    column ``t``: the max-top buffer among ``c``'s earlier-positioned candidates
-    alive there. A ``(parent, child)`` tuple appears iff that buffer is reached
-    through an active in-place pair -- ``child`` is ``c``'s order-below neighbour
-    and reuses ``parent``'s address, and ``parent`` is the buffer ``c`` rests on.
+    """Verify ``contact_at(c, t)`` describes the slot directly below ``c`` at
+    every column ``t``. In all cases ``c`` rests on the named buffer (the
+    ``parent`` of a tuple), i.e. the max-top among ``c``'s earlier-positioned
+    candidates alive there. A ``(parent, child)`` tuple appears iff that slot is
+    shared by an in-place pair at its transition column: ``parent`` and ``child``
+    are co-located (same address), both alive at ``t``, linked by reuse, and
+    ``c``'s order-below neighbour is the higher-positioned of the two (which one
+    that is depends on the reuse direction).
     """
     n = len(plan.buffers)
     pos = plan.position
@@ -102,28 +105,42 @@ def _check_contact_faithful(test, plan, tag=""):
     def top(w):
         return plan.addresses[w] + plan.buffers[w].size
 
+    def alive(w):
+        return plan.buffers[w].start_time <= t < plan.buffers[w].end_time
+
     for c in range(n):
         bc = plan.buffers[c]
         for t in range(bc.start_time, bc.end_time):
             contact = plan.contact_at(c, t)
-            cand = [
-                w
-                for w in plan.overlaps[c]
-                if pos[w] < pos[c]
-                and plan.buffers[w].start_time <= t < plan.buffers[w].end_time
-            ]
+            cand = [w for w in plan.overlaps[c] if pos[w] < pos[c] and alive(w)]
             if not cand:
                 test.assertIsNone(contact, f"{tag} c={c} t={t}")
                 continue
             max_top = max(top(w) for w in cand)
             if isinstance(contact, tuple):
                 parent, child = contact
+                # c rests on the parent (the larger, max-top co-located buffer).
                 test.assertEqual(top(parent), max_top, f"{tag} c={c} t={t} parent")
+                # parent/child are an in-place pair, co-located, both alive at t,
+                # linked by reuse, and one of them is c's order-below neighbour.
                 test.assertEqual(
-                    plan.inplace_reuse.get(child), parent, f"{tag} c={c} t={t} reuse"
+                    plan._in_place_pair(parent, child),
+                    (parent, child),
+                    f"{tag} c={c} t={t} pair",
                 )
                 test.assertEqual(
-                    plan.below_profile[c].label_at(t), child, f"{tag} c={c} t={t} order"
+                    plan.addresses[parent], plan.addresses[child], f"{tag} colocated"
+                )
+                test.assertTrue(alive(parent) and alive(child), f"{tag} both-alive")
+                test.assertTrue(
+                    plan.inplace_reuse.get(parent) == child
+                    or plan.inplace_reuse.get(child) == parent,
+                    f"{tag} c={c} t={t} reuse-link",
+                )
+                test.assertIn(
+                    plan.below_profile[c].label_at(t),
+                    (parent, child),
+                    f"{tag} c={c} t={t} order-below",
                 )
             else:
                 test.assertEqual(top(contact), max_top, f"{tag} c={c} t={t} int")
@@ -422,6 +439,24 @@ class ContactProfileTests(TestCase):
         self.assertEqual(plan.contact_at(ih, 9), ic)
         self.assertEqual(plan.contact_at(ic, 4), ip)  # c's own contact is p
         self.assertIsNone(plan.contact_at(ip, 0))  # p on the floor
+
+    def test_contact_at_parent_reused_child_tuple(self):
+        # The other reuse direction: the child is placed first and the parent
+        # reuses its slot, so the parent (larger) is h's order-below and the
+        # child is buried inside it. At the transition tick the slot below h is
+        # the pair (parent, child) -- the case the old semantics hid behind a
+        # bare int. h still rests on the parent.
+        p = _buf("p", 128, 0, 5)
+        c = _buf("c", 64, 4, 10, in_place_parents=["p"])
+        h = _buf("h", 32, 4, 6)
+        plan = self.plan([p, c, h], [1, 0, 2])  # order: c, then p, then h
+        ip, ic, ih = (plan._name_to_idx[n] for n in ("p", "c", "h"))
+        self.assertEqual(_addr(plan, "c"), 0)
+        self.assertEqual(_addr(plan, "p"), 0)  # parent reuses child's slot
+        self.assertEqual(_addr(plan, "h"), 128)  # rests on the parent p
+        self.assertEqual(plan.contact_at(ih, 4), (ip, ic))  # slot below = pair
+        self.assertEqual(plan.contact_at(ih, 5), ic)  # p dead -> plain child
+        self.assertEqual(plan.contact_at(ip, 4), ic)  # p's own order-below is c
 
     # --- randomized differential checks ------------------------------------
 
