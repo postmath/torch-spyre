@@ -193,7 +193,7 @@ class PermutationBasedLayoutSolverBase(ABC):
     exception of an in-place parent/child pair, which may share an identical
     address (``P.end_time == C.start_time + 1``).
 
-    The objective being optimized is :meth:`total_size`: the summed size of
+    The objective being optimized is :meth:`quality`: the summed size of
     every buffer that fits *entirely* below ``capacity``. Buffers whose
     placement would cross the capacity line keep their (notional) address for
     ordering purposes but are neither counted nor written back on
@@ -260,7 +260,6 @@ class PermutationBasedLayoutSolverBase(ABC):
         Populates ``self.addresses`` and ``self.total_allocated_size`` (and any
         subclass-specific structures). Called once from ``__init__``.
         """
-        pass
 
     @abstractmethod
     def swap(self, i: int) -> int:
@@ -273,7 +272,6 @@ class PermutationBasedLayoutSolverBase(ABC):
         Returns:
             The change in :meth:`quality` caused by the swap (new minus old).
         """
-        pass
 
     # --- shared helpers -----------------------------------------------------
 
@@ -303,11 +301,11 @@ class PermutationBasedLayoutSolverBase(ABC):
         """Return ``address + size`` for a placed buffer (its exclusive top)."""
         return self.addresses[idx] + self._sizes[idx]
 
-    def _is_fully_allocated(self, idx: int) -> bool:
+    def is_fully_allocated(self, idx: int) -> bool:
         """True if buffer ``idx`` has an address and fits below ``capacity``."""
         return self.addresses[idx] + self._sizes[idx] <= self.capacity
 
-    def _overlaps(self, i: int, j: int) -> bool:
+    def overlaps(self, i: int, j: int) -> bool:
         """True if buffers ``i`` and ``j`` are alive at a common tick.
 
         Lifetimes are half-open intervals ``[start_time, end_time)``, so an
@@ -429,7 +427,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         ``address`` set to ``None`` and are not committed.
         """
         for idx, buf in enumerate(self.buffers):
-            if self._is_fully_allocated(idx):
+            if self.is_fully_allocated(idx):
                 buf.address = self.addresses[idx]
             else:
                 buf.address = None
@@ -452,9 +450,9 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         for pos in range(n):
             idx = self.permutation[pos]
             prior = self.permutation[:pos]
-            candidates = [p for p in prior if self._overlaps(idx, p)]
+            candidates = [p for p in prior if self.overlaps(idx, p)]
             self.addresses[idx] = self._address_from_candidates(idx, candidates)
-            if self._is_fully_allocated(idx):
+            if self.is_fully_allocated(idx):
                 self.total_allocated_size += self.buffers[idx].size
                 self.total_allocated_count += 1
 
@@ -505,12 +503,12 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         for pos in range(n):
             idx = self.permutation[pos]
             prior = self.permutation[:pos]
-            candidates = [p for p in prior if self._overlaps(idx, p)]
+            candidates = [p for p in prior if self.overlaps(idx, p)]
             addr, partner = self._placement_decision(idx, candidates)
             self.addresses[idx] = addr
             if partner is not None:
                 self.inplace_reuse[idx] = partner
-            if self._is_fully_allocated(idx):
+            if self.is_fully_allocated(idx):
                 self.total_allocated_size += self.buffers[idx].size
                 self.total_allocated_count += 1
         # Persistent position index, maintained in O(1) by swap().
@@ -520,12 +518,12 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         # Time-overlap sets. Lifetimes never change, so this is computed once
         # and lets the address recompute find a buffer's candidates in O(degree)
         # instead of scanning all n buffers.
-        self.overlaps: dict[int, set[int]] = {i: set() for i in range(n)}
+        self.overlap_dict: dict[int, set[int]] = {i: set() for i in range(n)}
         for a in range(n):
             for b in range(a + 1, n):
-                if self._overlaps(a, b):
-                    self.overlaps[a].add(b)
-                    self.overlaps[b].add(a)
+                if self.overlaps(a, b):
+                    self.overlap_dict[a].add(b)
+                    self.overlap_dict[b].add(a)
         # Minimum |i - j| at which rotate() uses the remove/reinsert fast path
         # (_fast_rotate) instead of the adjacent-swap chain; below it the chain
         # is cheaper because most of its swaps are O(1) no-ops. n//8 (~0.125n) is
@@ -627,7 +625,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
              loses the poke-through.
 
         Returns:
-            The change in :meth:`total_size` (new minus old).
+            The change in :meth:`quality` (new minus old).
         """
         n = len(self.buffers)
         assert 0 <= i < n - 1
@@ -635,7 +633,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         x, y = perm[i], perm[i + 1]
         perm[i], perm[i + 1] = y, x
         self.position[x], self.position[y] = i + 1, i
-        if not self._overlaps(x, y):
+        if not self.overlaps(x, y):
             # Independent buffers: their order does not affect any address.
             return 0
 
@@ -669,11 +667,11 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             pos_z = self.position[z]
             old_addr = self.addresses[z]
             old_partner = self.inplace_reuse.get(z)
-            if self._is_fully_allocated(z):
+            if self.is_fully_allocated(z):
                 self.total_allocated_size -= self.buffers[z].size
                 self.total_allocated_count -= 1
             self._recompute_address(z)
-            if self._is_fully_allocated(z):
+            if self.is_fully_allocated(z):
                 self.total_allocated_size += self.buffers[z].size
                 self.total_allocated_count += 1
             new_partner = self.inplace_reuse.get(z)
@@ -865,12 +863,12 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         self.total_allocated_size = 0
         self.total_allocated_count = 0
         for p, idx in enumerate(perm):
-            cand = [w for w in self.overlaps[idx] if pos[w] < p]
+            cand = [w for w in self.overlap_dict[idx] if pos[w] < p]
             addr, partner = self._placement_decision(idx, cand)
             self.addresses[idx] = addr
             if partner is not None:
                 self.inplace_reuse[idx] = partner
-            if self._is_fully_allocated(idx):
+            if self.is_fully_allocated(idx):
                 self.total_allocated_size += self._sizes[idx]
                 self.total_allocated_count += 1
 
@@ -921,7 +919,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         # --- 2. Reinsert x at its new position. ------------------------------
         pos = self.position
         pos_x = pos[x]
-        members = self.overlaps[x]
+        members = self.overlap_dict[x]
         cuts = {s_x, e_x}
         for w in members:
             if bufs[w].start_time > s_x:
@@ -1014,7 +1012,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone._name_to_idx = self._name_to_idx
         clone.capacity = self.capacity
         clone.alignment = self.alignment
-        clone.overlaps = self.overlaps
+        clone.overlap_dict = self.overlap_dict
         clone._sizes = self._sizes
         clone._inplace_partners = self._inplace_partners
         # Rotate-policy knobs (cheap scalars; carried so a clone rotates the

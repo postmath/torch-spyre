@@ -38,6 +38,7 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
     ExponentialCoolingSchedule,
     ImanishiXuSolverWithBuffers,
 )
+from torch_spyre._inductor.scratchpad.utils import plot_buffers
 
 # Lifetimes are half-open: end_time = last_inclusive_tick + 1.
 buffers = [
@@ -66,7 +67,9 @@ N_STARTS = 10
 
 
 def _schedule() -> ExponentialCoolingSchedule:
-    return ExponentialCoolingSchedule(t0=10.0, t_end=1.0, steps_per_epoch=1, epochs=150)
+    return ExponentialCoolingSchedule(
+        t_initial=10.0, t_final=1.0, steps_per_epoch=1, epochs=150
+    )
 
 
 rng = rnd.Random(0)
@@ -101,5 +104,5 @@ assert last_solver is not None
 # quality_plot uses the last solver's logs; the temperature overlay matches.
 last_solver.quality_plot().savefig("inplace_quality.png", dpi=300)
 last_solver.finalize()
-last_solver.plot().savefig("inplace_layout.png", dpi=300)
+plot_buffers(buffers, CAPACITY).savefig("inplace_layout.png", dpi=300)
 print("Saved inplace_quality.png, inplace_layout.png")

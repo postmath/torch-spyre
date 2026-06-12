@@ -45,7 +45,7 @@ import math
 import copy
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Iterable, Iterator, Optional, override
+from typing import Literal, Optional, TypeAlias, override
 import random as rnd
 from heapq import heappush, heappop
 
@@ -101,6 +101,17 @@ class CoolingSchedule(ABC):
         annealing, so a schedule may derive parameters (e.g. an initial
         temperature from the peak load). Default: no-op."""
 
+    @abstractmethod
+    def reset(self) -> Optional[float]:
+        """Reinitialize and return the first temperature (None for no steps)."""
+
+    @abstractmethod
+    def update(self, accepted: bool) -> Optional[float]:
+        """Return the next temperature given the last step's acceptance, or None
+        to stop."""
+
+
+class Calibratable(ABC):
     def warmup_steps_requested(self) -> int:
         """How many warm-up moves the solver should sample (on a throwaway plan
         copy) to calibrate this schedule. Default 0 -- no calibration needed."""
@@ -112,31 +123,31 @@ class CoolingSchedule(ABC):
         deltas here, so a schedule may size its temperatures to the instance's
         move scale before :meth:`reset` is first called. Default: no-op."""
 
-    @abstractmethod
-    def reset(self) -> Optional[float]:
-        """Reinitialize and return the first temperature (None for no steps)."""
-
-    @abstractmethod
-    def update(self, accepted: bool) -> Optional[float]:
-        """Return the next temperature given the last step's acceptance, or None
-        to stop."""
-
 
 class ExponentialCoolingSchedule(CoolingSchedule):
     """Geometric cooling over ``steps_per_epoch * epochs`` steps, dropping by a
     constant factor once per epoch. Ignores acceptance."""
 
-    def __init__(self, *, t0: float, t_end: float, steps_per_epoch: int, epochs: int):
-        self.t0 = t0
-        self.alpha = (t_end / t0) ** (1 / epochs)
+    def __init__(
+        self, *, t_initial: float, t_final: float, steps_per_epoch: int, epochs: int
+    ):
+        """A schedule that starts at temperature `t_initial` and ends at `t_final`, cooling down by
+        a constant factor every `steps_per_epoch` steps. There are `epochs` such epochs.
+
+        If `epochs == 1`, then the temperature stays at `t_initial`."""
+        self.t_initial = t_initial
+        if epochs <= 1:
+            self.alpha = 1.0
+        else:
+            self.alpha = (t_final / t_initial) ** (1 / (epochs - 1))
         self.steps_per_epoch = steps_per_epoch
         self.epochs = epochs
-        self._t = t0
+        self._t = t_initial
         self._i = 0
 
     @override
     def reset(self) -> Optional[float]:
-        self._t = self.t0
+        self._t = self.t_initial
         self._i = 0
         return self._t
 
@@ -150,7 +161,7 @@ class ExponentialCoolingSchedule(CoolingSchedule):
         return self._t
 
 
-class AutoExponentialCoolingSchedule(CoolingSchedule):
+class SelfCalibratingCoolingSchedule(CoolingSchedule, Calibratable):
     """Geometric cooling whose start/end temperatures are auto-calibrated to the
     instance from a short warm-up. This is the default schedule.
 
@@ -244,7 +255,7 @@ class AutoExponentialCoolingSchedule(CoolingSchedule):
             # to avoid a zero temperature (the acceptance test divides by it).
             t0 = t_end = 1.0
         self._geom = ExponentialCoolingSchedule(
-            t0=t0, t_end=t_end, steps_per_epoch=1, epochs=self.total_steps
+            t_initial=t0, t_final=t_end, steps_per_epoch=1, epochs=self.total_steps
         )
 
     @override
@@ -267,17 +278,26 @@ class CoolingScheduleFromPaper(CoolingSchedule):
     """Log-linear schedule between tau_s and tau_e derived from the peak memory
     load, as in the paper. Ignores acceptance."""
 
-    def __init__(self, *, buffers: list[LifetimeBoundBuffer], n: int = 1000000):
+    def __init__(self, *, n: int = 1000000):
+        self.n = n
+        self._i = 0
+        self.log_tau_s: Optional[float] = None
+        self.log_tau_e: Optional[float] = None
+
+    @override
+    def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
         tau_s = default_initial_temperature(buffers)
         tau_e = min(100.0, tau_s / 1000.0)
         self.log_tau_s = math.log(tau_s)
         self.log_tau_e = math.log(tau_e)
-        self.n = n
-        self._i = 0
 
     @override
     def reset(self) -> Optional[float]:
         self._i = 0
+        if self.log_tau_s is None:
+            raise RuntimeError(
+                "need to set buffers before extracting values from this schedule"
+            )
         return math.exp(self.log_tau_s)
 
     @override
@@ -285,29 +305,13 @@ class CoolingScheduleFromPaper(CoolingSchedule):
         self._i += 1
         if self._i >= self.n:
             return None
+        if self.log_tau_s is None or self.log_tau_e is None:
+            raise RuntimeError(
+                "need to set buffers before extracting values from this schedule"
+            )
         return math.exp(
             (self.log_tau_e - self.log_tau_s) * self._i / self.n + self.log_tau_s
         )
-
-
-class IterableCoolingSchedule(CoolingSchedule):
-    """Adapts a plain iterable of temperatures to the responsive interface,
-    ignoring acceptance. ``reset`` restarts iteration from the source, so the
-    source should be re-iterable (a list, not a one-shot generator)."""
-
-    def __init__(self, temperatures: Iterable[float]):
-        self._source = temperatures
-        self._it: Optional[Iterator[float]] = None
-
-    @override
-    def reset(self) -> Optional[float]:
-        self._it = iter(self._source)
-        return next(self._it, None)
-
-    @override
-    def update(self, accepted: bool) -> Optional[float]:
-        assert self._it is not None
-        return next(self._it, None)
 
 
 class ReheatingSchedule(CoolingSchedule):
@@ -451,6 +455,12 @@ class SolverToPermutation:
         )
 
 
+SolverInitialOption: TypeAlias = (
+    list[int] | Literal["first_fit", "best_fit", "greedy"] | MemoryPlanSolver
+)
+SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto", "from_paper"]
+
+
 class ImanishiXuLayoutSolver(MemoryPlanSolver):
     """We can only do the full initialization when we know the list of buffers, so this class is
     just a shim to create the actual solver."""
@@ -460,8 +470,8 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         size: int,
         alignment: int = 128,
         *,
-        initial: list[int] | str | MemoryPlanSolver = "first_fit",
-        schedule: "CoolingSchedule | Iterable[float] | str" = "auto",
+        initial: SolverInitialOption = "first_fit",
+        schedule: SolverScheduleOption = "auto",
         random: Optional[rnd.Random] = None,
         starts: int = 1,
     ):
@@ -495,7 +505,7 @@ class ImanishiXuSolverWithBuffers:
     each reinsertion sweep run on a throwaway ``plan.copy()`` while the live plan
     only ever performs the single rotation that is actually accepted (and the
     cleanup swaps) -- so the live layout is never churned through a full sweep
-    and restored.
+       initial: 'list[int] | Literal["first_fit", "best_fit", "greedy"] | MemoryPlanSolver' = "first_fit",
     """
 
     def __init__(
@@ -504,17 +514,17 @@ class ImanishiXuSolverWithBuffers:
         size: int,
         alignment: int = 128,
         *,
-        initial: list[int] | str | MemoryPlanSolver = "first_fit",
-        schedule: "CoolingSchedule | Iterable[float] | str" = "auto",
+        initial: SolverInitialOption = "first_fit",
+        schedule: SolverScheduleOption = "auto",
         random: Optional[rnd.Random] = None,
         starts: int = 1,
     ):
         if isinstance(initial, list):
-            self.initial = initial
-            if not sorted(self.initial) == list(range(len(buffers))):
+            if sorted(initial) != list(range(len(buffers))):
                 raise ValueError(
                     f"given initial list is not a permutation of range({len(buffers)})"
                 )
+            self.initial = initial
         else:
             if initial == "first_fit":
                 initial = FirstFitLayoutSolver(size, alignment)
@@ -522,10 +532,6 @@ class ImanishiXuSolverWithBuffers:
                 initial = BestFitLayoutSolver(size, alignment)
             elif initial == "greedy":
                 initial = GreedyLayoutSolver(size, alignment)
-            elif isinstance(initial, str):
-                raise ValueError(
-                    f"this string does not describe a known solver: {initial}"
-                )
 
             assert isinstance(initial, MemoryPlanSolver)
             convertor = SolverToPermutation(initial)
@@ -544,17 +550,15 @@ class ImanishiXuSolverWithBuffers:
         if isinstance(schedule, str):
             self.schedule: CoolingSchedule
             if schedule == "auto":
-                self.schedule = AutoExponentialCoolingSchedule()
+                self.schedule = SelfCalibratingCoolingSchedule()
             elif schedule == "from_paper":
-                self.schedule = CoolingScheduleFromPaper(buffers=buffers)
+                self.schedule = CoolingScheduleFromPaper()
             else:
                 raise ValueError(
                     f"this string does not describe a known schedule: {schedule}"
                 )
-        elif isinstance(schedule, CoolingSchedule):
-            self.schedule = schedule
         else:
-            self.schedule = IterableCoolingSchedule(schedule)
+            self.schedule = schedule
         # Let the schedule derive any buffer-dependent parameters (e.g. t0).
         self.schedule.set_buffers(buffers)
 
@@ -586,6 +590,8 @@ class ImanishiXuSolverWithBuffers:
         throwaway plan copy and hand it their absolute quality deltas, so it can
         size its temperatures to this instance's move scale. The live plan is
         untouched (the warm-up walks the copy)."""
+        if not isinstance(self.schedule, Calibratable):
+            return
         k = self.schedule.warmup_steps_requested()
         if k <= 0:
             return
@@ -655,7 +661,7 @@ class ImanishiXuSolverWithBuffers:
             pi = perm[i]
             pi1 = perm[i + 1]
 
-            if (not plan._overlaps(pi, pi1)) and plan.addresses[pi] + self.buffers[
+            if (not plan.overlaps(pi, pi1)) and plan.addresses[pi] + self.buffers[
                 pi
             ].size > plan.addresses[pi1] + self.buffers[pi1].size:
                 # Swap buffers pi and pi1. This makes no difference for the quality of the result
@@ -681,7 +687,7 @@ class ImanishiXuSolverWithBuffers:
         any) is applied to the live plan, so the live layout never has to sweep-and-restore."""
         plan = self.plan
         n = len(self.buffers)
-        allocated = [plan._is_fully_allocated(plan.permutation[i]) for i in range(n)]
+        allocated = [plan.is_fully_allocated(plan.permutation[i]) for i in range(n)]
         n_allocated = sum(1 if b else 0 for b in allocated)
         # Choose each allocated buffer with weight n and each non-allocated buffer with weight
         # n_allocated + 1.
@@ -737,121 +743,3 @@ class ImanishiXuSolverWithBuffers:
 
         # Nothing accepted: the live plan was never touched.
         return None
-
-    def plot(self, max_height: Optional[int] = None):
-        """Visualize the current scratchpad allocation layout.
-
-        Allocated buffers are shown in blue; buffers that exceed the capacity
-        limit are shown in gray.  In-place parent/child pairs that share an
-        address are highlighted: a dark overlay spans the combined lifetime and
-        a green marker indicates the handoff tick.
-        """
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-
-        name_to_index = {b.name: i for i, b in enumerate(self.buffers)}
-
-        fig, ax = plt.subplots()
-
-        for i, buffer in enumerate(self.buffers):
-            addr = self.plan.addresses[i]
-            color = "b" if self.plan._is_fully_allocated(i) else "lightgray"
-            rect = patches.Rectangle(
-                xy=(buffer.start_time, addr),
-                width=buffer.end_time - buffer.start_time,
-                height=buffer.size,
-                linewidth=0.3,
-                edgecolor="r",
-                facecolor=color,
-                fill=True,
-            )
-            ax.add_patch(rect)
-
-        for i, buffer in enumerate(self.buffers):
-            if not self.plan._is_fully_allocated(i):
-                continue
-            for p in buffer.in_place_parents:
-                pj = name_to_index.get(p)
-                if pj is None or not self.plan._is_fully_allocated(pj):
-                    continue
-                parent = self.buffers[pj]
-                if self.plan.addresses[i] == self.plan.addresses[pj]:
-                    ax.add_patch(
-                        patches.Rectangle(
-                            xy=(parent.start_time, self.plan.addresses[i]),
-                            width=buffer.end_time - parent.start_time,
-                            height=buffer.size,
-                            linewidth=0.3,
-                            edgecolor="r",
-                            facecolor="k",
-                            fill=True,
-                            alpha=0.25,
-                        )
-                    )
-                    ax.add_patch(
-                        patches.Rectangle(
-                            xy=(buffer.start_time, self.plan.addresses[i]),
-                            width=1,
-                            height=buffer.size,
-                            linewidth=0.3,
-                            edgecolor="r",
-                            facecolor="g",
-                            fill=True,
-                        )
-                    )
-
-        max_time = max((b.end_time for b in self.buffers), default=0)
-        ax.set_xlim(0, max_time)
-        if max_height is None:
-            max_height = max(
-                (
-                    self.plan.addresses[i] + b.size
-                    for i, b in enumerate(self.buffers)
-                    if self.plan._is_fully_allocated(i)
-                ),
-                default=0,
-            )
-        ax.set_ylim(0, max_height)
-        return fig
-
-    def quality_plot(self, quality_logs: Optional[list[list[int]]] = None):
-        """Plot quality (buffers allocated) over annealing steps.
-
-        Each run is drawn as a thin blue line; their smoothed average is drawn
-        in red.  When temperature data is available (recorded by
-        :meth:`anneal`), the first run's temperature schedule is overlaid on a
-        log-scale right axis in green.
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        if quality_logs is None:
-            quality_logs = self.quality_logs
-
-        fig, ax1 = plt.subplots()
-        for log in quality_logs:
-            ax1.plot(log, "b", lw=1, alpha=0.1)
-
-        if quality_logs:
-            average = np.array(quality_logs).mean(axis=0)
-            n_points = len(average)
-            if n_points >= 20:
-                n_smoothing = min(n_points // 10, 10)
-                smoothed = np.convolve(
-                    average, np.ones(n_smoothing) / n_smoothing, "valid"
-                )
-                ax1.plot(
-                    [x + n_smoothing / 2 for x in range(len(smoothed))],
-                    smoothed,
-                    "r",
-                    lw=3,
-                )
-            else:
-                ax1.plot(average, "r", lw=3)
-
-        if self.temperature_logs:
-            ax2 = ax1.twinx()
-            ax2.set_yscale("log")
-            ax2.plot(self.temperature_logs[0], "g", lw=1)
-
-        return fig

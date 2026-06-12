@@ -33,6 +33,7 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
     ExponentialCoolingSchedule,
     ImanishiXuSolverWithBuffers,
 )
+from torch_spyre._inductor.scratchpad.utils import plot_buffers
 
 buffers = [
     LifetimeBoundBuffer("B0", 8, 0, 2),
@@ -47,10 +48,10 @@ solver = ImanishiXuSolverWithBuffers(
     alignment=1,
     initial=[0, 1, 2, 3],
     schedule=ExponentialCoolingSchedule(
-        t0=10.0, t_end=1.0, steps_per_epoch=10, epochs=10
+        t_initial=10.0, t_final=1.0, steps_per_epoch=10, epochs=10
     ),
 )
 print("Solving...")
 solver.solve()
-solver.plot(max_height=22).savefig("toy_layout.png", dpi=300)
+plot_buffers(buffers, 22).savefig("toy_layout.png", dpi=300)
 print("Saved toy_layout.png")

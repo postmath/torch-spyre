@@ -42,6 +42,7 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
+from torch_spyre._inductor.scratchpad.utils import plot_buffers
 
 
 def _random_buffer(
@@ -86,7 +87,7 @@ solver = ImanishiXuSolverWithBuffers(
     initial="first_fit",
     random=random,
     schedule=ExponentialCoolingSchedule(
-        t0=500000.0, t_end=50000.0, steps_per_epoch=30, epochs=100
+        t_initial=500000.0, t_final=50000.0, steps_per_epoch=30, epochs=100
     ),
 )
 solver.solve()
@@ -94,7 +95,5 @@ solver.finalize()
 print(f"ImanishiXu quality: {solver.best_quality}/{total_size}")
 
 solver.quality_plot().savefig("random_buffers_quality.png", dpi=300)
-solver.plot(max_height=int(capacity * 1.2)).savefig(
-    "random_buffers_layout.png", dpi=300
-)
+plot_buffers(buffers, capacity).savefig("random_buffers_layout.png", dpi=300)
 print("Saved random_buffers_quality.png, random_buffers_layout.png")

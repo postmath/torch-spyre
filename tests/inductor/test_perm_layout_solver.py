@@ -113,7 +113,7 @@ def _check_contact_faithful(test, plan, tag=""):
         bc = plan.buffers[c]
         for t in range(bc.start_time, bc.end_time):
             contact = plan.contact_at(c, t)
-            cand = [w for w in plan.overlaps[c] if pos[w] < pos[c] and alive(w)]
+            cand = [w for w in plan.overlap_dict[c] if pos[w] < pos[c] and alive(w)]
             if not cand:
                 test.assertIsNone(contact, f"{tag} c={c} t={t}")
                 continue
@@ -236,10 +236,10 @@ class SkeletonTestsMixin(MixinBase):
         plan = self.make_plan(buffers, [0], capacity=100)
         # Fits exactly at the boundary.
         plan.addresses[0] = 36
-        self.assertTrue(plan._is_fully_allocated(0))
+        self.assertTrue(plan.is_fully_allocated(0))
         # One byte over capacity.
         plan.addresses[0] = 37
-        self.assertFalse(plan._is_fully_allocated(0))
+        self.assertFalse(plan.is_fully_allocated(0))
 
     def test_quality_accessor(self):
         buffers = [_buf("a", 64, 0, 1)]
@@ -483,7 +483,7 @@ class ContactProfileTests(TestCase):
 
         def full_cands(plan, z):
             pz = plan.position[z]
-            return [w for w in plan.overlaps[z] if plan.position[w] < pz]
+            return [w for w in plan.overlap_dict[z] if plan.position[w] < pz]
 
         horizon = 3
         lifetimes = [(s, e) for s in range(horizon) for e in range(s + 1, horizon + 1)]
@@ -905,7 +905,7 @@ class CopyTests(TestCase):
         clone = plan.copy()
         # Static structures are shared by reference.
         self.assertIs(clone.buffers, plan.buffers)
-        self.assertIs(clone.overlaps, plan.overlaps)
+        self.assertIs(clone.overlap_dict, plan.overlap_dict)
         self.assertIs(clone._name_to_idx, plan._name_to_idx)
         # Dynamic state is equal but independent.
         self.assertEqual(clone.addresses, plan.addresses)

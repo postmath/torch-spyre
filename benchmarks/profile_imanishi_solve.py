@@ -74,7 +74,7 @@ def build_solver():
         initial="first_fit",
         random=random,
         schedule=ExponentialCoolingSchedule(
-            t0=500000.0, t_end=50000.0, steps_per_epoch=30, epochs=100
+            t_initial=500000.0, t_final=50000.0, steps_per_epoch=30, epochs=100
         ),
     )
 
@@ -120,9 +120,9 @@ def line_level():
         BASE._placement_decision,
         BASE.rotate,
         BASE._top,
-        BASE._overlaps,
+        BASE.overlaps,
         BASE._in_place_pair,
-        BASE._is_fully_allocated,
+        BASE.is_fully_allocated,
         BASE._align_up,
         PL.Profile.splice,
         PL.Profile.segments,

@@ -28,7 +28,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    AutoExponentialCoolingSchedule,
+    SelfCalibratingCoolingSchedule,
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
     ReheatingSchedule,
@@ -61,7 +61,9 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
 
 
 def _short_schedule():
-    return ExponentialCoolingSchedule(t0=100.0, t_end=1.0, steps_per_epoch=5, epochs=4)
+    return ExponentialCoolingSchedule(
+        t_initial=100.0, t_final=1.0, steps_per_epoch=5, epochs=4
+    )
 
 
 def _assert_feasible(buffers, capacity):
@@ -89,13 +91,15 @@ def _committed_total(buffers):
 class CoolingScheduleTests(TestCase):
     def test_exponential_schedule_sequence(self):
         # alpha = (1/8) ** (1/3) = 0.5; cools once per epoch (at i=2, 4).
-        s = ExponentialCoolingSchedule(t0=8.0, t_end=1.0, steps_per_epoch=2, epochs=3)
+        s = ExponentialCoolingSchedule(
+            t_initial=8.0, t_final=1.0, steps_per_epoch=2, epochs=4
+        )
         traj = [s.reset()]
         t = traj[0]
         while t is not None:
             t = s.update(True)  # ignores acceptance
             traj.append(t)
-        self.assertEqual(traj, [8.0, 8.0, 4.0, 4.0, 2.0, 2.0, None])
+        self.assertEqual(traj, [8.0, 8.0, 4.0, 4.0, 2.0, 2.0, 1.0, 1.0, None])
 
     def test_reheating_schedule_trajectory(self):
         # Cool (halving) until the windowed acceptance rate drops below 0.5,
@@ -145,25 +149,25 @@ class CoolingScheduleTests(TestCase):
             return [LifetimeBoundBuffer(f"b{i}", 1, 0, 1) for i in range(n)]
 
         # n=100 (the random-buffer example size): 30*n = 3000, under the 5000 cap.
-        s = AutoExponentialCoolingSchedule()
+        s = SelfCalibratingCoolingSchedule()
         s.set_buffers(n_buffers(100))
         self.assertEqual(s.total_steps, 3000)
         self.assertLessEqual(s.total_steps, 5000)  # the explicit budget ceiling
         self.assertEqual(s.warmup_steps, 300)  # round(0.1 * total)
         # Large n is capped; tiny n hits the floor.
-        capped = AutoExponentialCoolingSchedule()
+        capped = SelfCalibratingCoolingSchedule()
         capped.set_buffers(n_buffers(1000))
         self.assertEqual(capped.total_steps, 5000)
-        floored = AutoExponentialCoolingSchedule()
+        floored = SelfCalibratingCoolingSchedule()
         floored.set_buffers(n_buffers(5))
         self.assertEqual(floored.total_steps, 500)
         # Explicit overrides win.
-        ex = AutoExponentialCoolingSchedule(total_steps=42, warmup_steps=7)
+        ex = SelfCalibratingCoolingSchedule(total_steps=42, warmup_steps=7)
         ex.set_buffers(n_buffers(100))
         self.assertEqual((ex.total_steps, ex.warmup_steps), (42, 7))
 
     def test_auto_schedule_calibration_endpoints(self):
-        s = AutoExponentialCoolingSchedule(total_steps=4, accept_hi=0.8, accept_lo=0.01)
+        s = SelfCalibratingCoolingSchedule(total_steps=4, accept_hi=0.8, accept_lo=0.01)
         # mean over nonzero deltas = 20; t0/t_end target accept_hi/accept_lo.
         s.calibrate([10.0, 20.0, 30.0, 0.0])
         t0 = 20.0 / -math.log(0.8)
@@ -178,12 +182,12 @@ class CoolingScheduleTests(TestCase):
 
     def test_auto_schedule_degenerate_deltas(self):
         # No sampled move changed quality -> a safe (positive) flat temperature.
-        s = AutoExponentialCoolingSchedule(total_steps=3)
+        s = SelfCalibratingCoolingSchedule(total_steps=3)
         s.calibrate([0.0, 0.0])
         self.assertIsNotNone(s.reset())
 
     def test_auto_schedule_uncalibrated_reset_errors(self):
-        s = AutoExponentialCoolingSchedule(total_steps=10)
+        s = SelfCalibratingCoolingSchedule(total_steps=10)
         s.set_buffers([LifetimeBoundBuffer("a", 1, 0, 1)])
         with self.assertRaises(ValueError):
             s.reset()  # never calibrated
@@ -342,7 +346,7 @@ class ImanishiXuStressTests(TestCase):
             ).quality()
 
             schedule = ExponentialCoolingSchedule(
-                t0=200.0, t_end=0.5, steps_per_epoch=8, epochs=6
+                t_initial=200.0, t_final=0.5, steps_per_epoch=8, epochs=6
             )
             solver = ImanishiXuLayoutSolver(
                 cap,
