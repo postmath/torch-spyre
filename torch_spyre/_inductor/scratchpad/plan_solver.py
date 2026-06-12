@@ -173,6 +173,10 @@ def _assert_in_place_relationships(
                     f"must be <= parent {parent_name}.size={parent.size}"
                 )
 
+    def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
+        """Returns true iff self and other overlap in time."""
+        return self.start_time < other.end_time and other.start_time < self.end_time
+
 
 _BufferT = TypeVar("_BufferT", bound=LifetimeBoundBuffer)
 

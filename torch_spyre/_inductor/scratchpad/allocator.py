@@ -55,6 +55,7 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
 )
+from torch_spyre._inductor.scratchpad.imanishi_xu import ImanishiXuLayoutSolver
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
@@ -1813,6 +1814,7 @@ _PLACEMENT_SOLVERS: dict[str, type[MemoryPlanSolver]] = {
     "greedy": GreedyLayoutSolver,
     "bestfit": BestFitLayoutSolver,
     "firstfit": FirstFitLayoutSolver,
+    "imanishi_xu": ImanishiXuLayoutSolver,
 }
 
 
