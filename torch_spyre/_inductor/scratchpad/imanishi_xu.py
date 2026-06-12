@@ -101,6 +101,17 @@ class CoolingSchedule(ABC):
         annealing, so a schedule may derive parameters (e.g. an initial
         temperature from the peak load). Default: no-op."""
 
+    def warmup_steps_requested(self) -> int:
+        """How many warm-up moves the solver should sample (on a throwaway plan
+        copy) to calibrate this schedule. Default 0 -- no calibration needed."""
+        return 0
+
+    def calibrate(self, abs_quality_deltas: list[float]) -> None:
+        """Calibration hook paired with :meth:`warmup_steps_requested`. The
+        solver runs that many random moves and passes their absolute quality
+        deltas here, so a schedule may size its temperatures to the instance's
+        move scale before :meth:`reset` is first called. Default: no-op."""
+
     @abstractmethod
     def reset(self) -> Optional[float]:
         """Reinitialize and return the first temperature (None for no steps)."""
@@ -137,6 +148,119 @@ class ExponentialCoolingSchedule(CoolingSchedule):
         if self._i % self.steps_per_epoch == 0:
             self._t *= self.alpha
         return self._t
+
+
+class AutoExponentialCoolingSchedule(CoolingSchedule):
+    """Geometric cooling whose start/end temperatures are auto-calibrated to the
+    instance from a short warm-up. This is the default schedule.
+
+    NOTE: this is **not** claimed to be optimal or well-tuned -- it is a
+    reasonable, self-calibrating default for the situation where we do *not* yet
+    have representative example models to tune against. It pairs the universal SA
+    cooling law (a fixed-length geometric cool-down) with temperatures sized from
+    the data, so the same schedule transfers across problems of very different
+    byte scales instead of relying on hand-picked constants (which would silently
+    degenerate into a random walk or a greedy search on a differently-scaled
+    instance). Expect to revisit it -- retune the budget, or move to an
+    acceptance-targeting adaptive schedule -- once we can benchmark on real
+    workloads.
+
+    Calibration: the solver samples ``warmup_steps`` random reinsertions on a
+    throwaway ``plan.copy()`` and passes their ``|Δquality|`` to
+    :meth:`calibrate`. With ``d`` = their mean (over moves that change quality),
+    the start temperature accepts a mean-magnitude *worsening* move with
+    probability ``accept_hi`` and the end temperature with probability
+    ``accept_lo`` -- i.e. ``t0 = d / -ln(accept_hi)`` and
+    ``t_end = d / -ln(accept_lo)`` -- so the run begins exploratory and ends
+    near-greedy. Cooling is then geometric from ``t0`` to ``t_end`` over
+    ``total_steps``.
+
+    Budget knobs:
+        total_steps: the annealing budget. ``None`` -> adaptive,
+            ``clamp(steps_per_buffer * n, min_steps, max_steps)``.
+        warmup_steps: number of calibration moves (extra, cheap work).
+            ``None`` -> ``warmup_fraction`` of ``total_steps``.
+        max_steps: hard cap on the adaptive budget (default 5000, keeping the
+            n=100 random-buffer example bounded).
+    """
+
+    def __init__(
+        self,
+        *,
+        total_steps: Optional[int] = None,
+        warmup_steps: Optional[int] = None,
+        warmup_fraction: float = 0.1,
+        steps_per_buffer: int = 30,
+        min_steps: int = 500,
+        max_steps: int = 5000,
+        accept_hi: float = 0.8,
+        accept_lo: float = 0.01,
+    ):
+        if not 0.0 < accept_lo < accept_hi < 1.0:
+            raise ValueError("need 0 < accept_lo < accept_hi < 1")
+        if not 0.0 < warmup_fraction <= 1.0:
+            raise ValueError("warmup_fraction must be in (0, 1]")
+        self._total_steps = total_steps
+        self._warmup_steps = warmup_steps
+        self.warmup_fraction = warmup_fraction
+        self.steps_per_buffer = steps_per_buffer
+        self.min_steps = min_steps
+        self.max_steps = max_steps
+        self.accept_hi = accept_hi
+        self.accept_lo = accept_lo
+        # Sized in set_buffers; the geometric cooler is built in calibrate.
+        self.total_steps = total_steps or 0
+        self.warmup_steps = warmup_steps or 0
+        self._geom: Optional[ExponentialCoolingSchedule] = None
+
+    @override
+    def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
+        if self._total_steps is None:
+            self.total_steps = min(
+                self.max_steps,
+                max(self.min_steps, self.steps_per_buffer * len(buffers)),
+            )
+        else:
+            self.total_steps = max(1, self._total_steps)
+        if self._warmup_steps is None:
+            self.warmup_steps = max(1, round(self.warmup_fraction * self.total_steps))
+        else:
+            self.warmup_steps = self._warmup_steps
+
+    @override
+    def warmup_steps_requested(self) -> int:
+        return self.warmup_steps
+
+    @override
+    def calibrate(self, abs_quality_deltas: list[float]) -> None:
+        nonzero = [d for d in abs_quality_deltas if d > 0]
+        if nonzero:
+            d = sum(nonzero) / len(nonzero)
+            t0 = d / -math.log(self.accept_hi)
+            t_end = d / -math.log(self.accept_lo)
+        else:
+            # No sampled move changed quality (degenerate instance): every
+            # positive temperature behaves the same near-greedily, so pick 1.0
+            # to avoid a zero temperature (the acceptance test divides by it).
+            t0 = t_end = 1.0
+        self._geom = ExponentialCoolingSchedule(
+            t0=t0, t_end=t_end, steps_per_epoch=1, epochs=self.total_steps
+        )
+
+    @override
+    def reset(self) -> Optional[float]:
+        if self._geom is None:
+            raise ValueError(
+                "AutoExponentialCoolingSchedule must be calibrated before use; "
+                "run it through ImanishiXuSolverWithBuffers, which samples the "
+                "warm-up moves and calls calibrate()."
+            )
+        return self._geom.reset()
+
+    @override
+    def update(self, accepted: bool) -> Optional[float]:
+        assert self._geom is not None
+        return self._geom.update(accepted)
 
 
 class CoolingScheduleFromPaper(CoolingSchedule):
@@ -337,7 +461,7 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         alignment: int = 128,
         *,
         initial: list[int] | str | MemoryPlanSolver = "first_fit",
-        schedule: "CoolingSchedule | Iterable[float] | str" = "from_paper",
+        schedule: "CoolingSchedule | Iterable[float] | str" = "auto",
         random: Optional[rnd.Random] = None,
         starts: int = 1,
     ):
@@ -381,7 +505,7 @@ class ImanishiXuSolverWithBuffers:
         alignment: int = 128,
         *,
         initial: list[int] | str | MemoryPlanSolver = "first_fit",
-        schedule: "CoolingSchedule | Iterable[float] | str" = "from_paper",
+        schedule: "CoolingSchedule | Iterable[float] | str" = "auto",
         random: Optional[rnd.Random] = None,
         starts: int = 1,
     ):
@@ -418,10 +542,11 @@ class ImanishiXuSolverWithBuffers:
         self.best_permutation = copy.copy(self.initial)
 
         if isinstance(schedule, str):
-            if schedule == "from_paper":
-                self.schedule: CoolingSchedule = CoolingScheduleFromPaper(
-                    buffers=buffers
-                )
+            self.schedule: CoolingSchedule
+            if schedule == "auto":
+                self.schedule = AutoExponentialCoolingSchedule()
+            elif schedule == "from_paper":
+                self.schedule = CoolingScheduleFromPaper(buffers=buffers)
             else:
                 raise ValueError(
                     f"this string does not describe a known schedule: {schedule}"
@@ -446,6 +571,7 @@ class ImanishiXuSolverWithBuffers:
         self.plan.finalize()
 
     def solve(self) -> None:
+        self._calibrate_schedule()
         for _ in range(self.starts):
             self.anneal()
         # Commit the best permutation seen, so finalize() writes it rather than
@@ -454,6 +580,29 @@ class ImanishiXuSolverWithBuffers:
             self.plan = PermutationBasedLayoutSolver(
                 self.buffers, list(self.best_permutation), self.size, self.alignment
             )
+
+    def _calibrate_schedule(self) -> None:
+        """If the schedule asks for a warm-up, sample that many random moves on a
+        throwaway plan copy and hand it their absolute quality deltas, so it can
+        size its temperatures to this instance's move scale. The live plan is
+        untouched (the warm-up walks the copy)."""
+        k = self.schedule.warmup_steps_requested()
+        if k <= 0:
+            return
+        n = len(self.buffers)
+        deltas: list[float] = []
+        if n >= 2:  # with <2 buffers there is no non-trivial move to sample
+            probe = self.plan.copy()
+            for _ in range(k):
+                i = self.random.randrange(n)
+                j = self.random.randrange(n)
+                while j == i:
+                    j = self.random.randrange(n)
+                # rotate() returns the quality change; its magnitude is the move
+                # scale we want (a random reinsertion stands in for the real
+                # annealing move for calibration purposes).
+                deltas.append(abs(probe.rotate(i, j)))
+        self.schedule.calibrate(deltas)
 
     def anneal(self) -> None:
         quality_log: list[int] = []

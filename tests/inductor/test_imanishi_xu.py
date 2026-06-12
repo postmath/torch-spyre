@@ -15,6 +15,7 @@
 """End-to-end tests for the Imanishi/Xu simulated-annealing layout solver."""
 
 import copy
+import math
 import os
 import random as rnd
 import unittest
@@ -27,6 +28,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.imanishi_xu import (
+    AutoExponentialCoolingSchedule,
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
     ReheatingSchedule,
@@ -137,6 +139,70 @@ class CoolingScheduleTests(TestCase):
         s.reset()
         self.assertIsNotNone(s.update(False))  # window not full yet
         self.assertIsNone(s.update(False))  # window full, rate 0 < 0.5 -> stop
+
+    def test_auto_schedule_adaptive_budget(self):
+        def n_buffers(n):
+            return [LifetimeBoundBuffer(f"b{i}", 1, 0, 1) for i in range(n)]
+
+        # n=100 (the random-buffer example size): 30*n = 3000, under the 5000 cap.
+        s = AutoExponentialCoolingSchedule()
+        s.set_buffers(n_buffers(100))
+        self.assertEqual(s.total_steps, 3000)
+        self.assertLessEqual(s.total_steps, 5000)  # the explicit budget ceiling
+        self.assertEqual(s.warmup_steps, 300)  # round(0.1 * total)
+        # Large n is capped; tiny n hits the floor.
+        capped = AutoExponentialCoolingSchedule()
+        capped.set_buffers(n_buffers(1000))
+        self.assertEqual(capped.total_steps, 5000)
+        floored = AutoExponentialCoolingSchedule()
+        floored.set_buffers(n_buffers(5))
+        self.assertEqual(floored.total_steps, 500)
+        # Explicit overrides win.
+        ex = AutoExponentialCoolingSchedule(total_steps=42, warmup_steps=7)
+        ex.set_buffers(n_buffers(100))
+        self.assertEqual((ex.total_steps, ex.warmup_steps), (42, 7))
+
+    def test_auto_schedule_calibration_endpoints(self):
+        s = AutoExponentialCoolingSchedule(total_steps=4, accept_hi=0.8, accept_lo=0.01)
+        # mean over nonzero deltas = 20; t0/t_end target accept_hi/accept_lo.
+        s.calibrate([10.0, 20.0, 30.0, 0.0])
+        t0 = 20.0 / -math.log(0.8)
+        temps = []
+        t = s.reset()
+        while t is not None:
+            temps.append(t)
+            t = s.update(True)
+        self.assertEqual(len(temps), 4)  # total_steps temperatures, then stop
+        self.assertAlmostEqual(temps[0], t0)
+        self.assertTrue(all(temps[k] > temps[k + 1] for k in range(len(temps) - 1)))
+
+    def test_auto_schedule_degenerate_deltas(self):
+        # No sampled move changed quality -> a safe (positive) flat temperature.
+        s = AutoExponentialCoolingSchedule(total_steps=3)
+        s.calibrate([0.0, 0.0])
+        self.assertIsNotNone(s.reset())
+
+    def test_auto_schedule_uncalibrated_reset_errors(self):
+        s = AutoExponentialCoolingSchedule(total_steps=10)
+        s.set_buffers([LifetimeBoundBuffer("a", 1, 0, 1)])
+        with self.assertRaises(ValueError):
+            s.reset()  # never calibrated
+
+    def test_default_schedule_is_auto_feasible_and_deterministic(self):
+        # The solver's default schedule is the auto-calibrated exponential; with
+        # the default (seeded) RNG, two runs of the same instance must agree.
+        for seed in range(15):
+            rng = rnd.Random(seed)
+            n = rng.randint(2, 8)
+            buffers = _random_buffers(rng, n)
+            cap = max(b.size for b in buffers) * rng.randint(2, 4)
+            b1, b2 = copy.deepcopy(buffers), copy.deepcopy(buffers)
+            ImanishiXuLayoutSolver(cap, 128).plan_layout(b1)  # default schedule
+            ImanishiXuLayoutSolver(cap, 128).plan_layout(b2)
+            self.assertEqual(
+                [b.address for b in b1], [b.address for b in b2], f"seed={seed}"
+            )
+            _assert_feasible(b1, cap)
 
     def test_peak_memory_load(self):
         # a:[0,2) b:[1,3) c:[2,4); peak live set is {b,c} at tick 2 = 50.
