@@ -43,6 +43,9 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
 )
+from torch_spyre._inductor.scratchpad.exhaustive_solver import (
+    ExhaustiveLayoutSolver,
+)
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
@@ -307,6 +310,8 @@ class DefaultAllocator(ScratchpadAllocator):
                 layout_planning = BestFitLayoutSolver(size)
             elif config.layout_solver == "firstfit":
                 layout_planning = FirstFitLayoutSolver(size)
+            elif config.layout_solver == "exhaustive":
+                layout_planning = ExhaustiveLayoutSolver(size)
             else:
                 raise ValueError(
                     f"Invalid layout_solver config option '{config.layout_solver}'."
