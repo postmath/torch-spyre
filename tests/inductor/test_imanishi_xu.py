@@ -48,13 +48,15 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
         start = rng.randint(0, horizon)
         end = rng.randint(start + 1, horizon + 1)
         size = rng.randint(1, max_size)
-        buffers.append(LifetimeBoundBuffer(f"b{i}", size, start, end))
+        uses = [start] if end == start + 1 else [start, end - 1]
+        buffers.append(LifetimeBoundBuffer(f"b{i}", size, uses))
     for child_i in range(1, n):
         if rng.random() < 0.25:
             parent = buffers[rng.randrange(child_i)]
             child = buffers[child_i]
-            child.start_time = parent.end_time - 1
-            child.end_time = max(child.end_time, parent.end_time)
+            new_start = parent.uses[-1]
+            new_last = max(child.uses[-1], parent.uses[-1])
+            child.uses = [new_start] if new_start == new_last else [new_start, new_last]
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
     return buffers
@@ -146,7 +148,7 @@ class CoolingScheduleTests(TestCase):
 
     def test_auto_schedule_adaptive_budget(self):
         def n_buffers(n):
-            return [LifetimeBoundBuffer(f"b{i}", 1, 0, 1) for i in range(n)]
+            return [LifetimeBoundBuffer(f"b{i}", 1, [0]) for i in range(n)]
 
         # n=100 (the random-buffer example size): 30*n = 3000, under the 5000 cap.
         s = SelfCalibratingCoolingSchedule()
@@ -188,7 +190,7 @@ class CoolingScheduleTests(TestCase):
 
     def test_auto_schedule_uncalibrated_reset_errors(self):
         s = SelfCalibratingCoolingSchedule(total_steps=10)
-        s.set_buffers([LifetimeBoundBuffer("a", 1, 0, 1)])
+        s.set_buffers([LifetimeBoundBuffer("a", 1, [0])])
         with self.assertRaises(ValueError):
             s.reset()  # never calibrated
 
@@ -211,18 +213,18 @@ class CoolingScheduleTests(TestCase):
     def test_peak_memory_load(self):
         # a:[0,2) b:[1,3) c:[2,4); peak live set is {b,c} at tick 2 = 50.
         buffers = [
-            LifetimeBoundBuffer("a", 10, 0, 2),
-            LifetimeBoundBuffer("b", 20, 1, 3),
-            LifetimeBoundBuffer("c", 30, 2, 4),
+            LifetimeBoundBuffer("a", 10, [0, 1]),
+            LifetimeBoundBuffer("b", 20, [1, 2]),
+            LifetimeBoundBuffer("c", 30, [2, 3]),
         ]
         self.assertEqual(peak_memory_load(buffers), 50)
         self.assertAlmostEqual(default_initial_temperature(buffers), 50 / 300.0)
 
     def test_reheating_t0_derived_from_buffers(self):
         buffers = [
-            LifetimeBoundBuffer("a", 10, 0, 2),
-            LifetimeBoundBuffer("b", 20, 1, 3),
-            LifetimeBoundBuffer("c", 30, 2, 4),
+            LifetimeBoundBuffer("a", 10, [0, 1]),
+            LifetimeBoundBuffer("b", 20, [1, 2]),
+            LifetimeBoundBuffer("c", 30, [2, 3]),
         ]
         s = ReheatingSchedule(
             alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
@@ -235,7 +237,7 @@ class CoolingScheduleTests(TestCase):
         s = ReheatingSchedule(
             t0=99.0, alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
         )
-        s.set_buffers([LifetimeBoundBuffer("a", 10, 0, 2)])
+        s.set_buffers([LifetimeBoundBuffer("a", 10, [0, 1])])
         self.assertEqual(s.t0, 99.0)
 
     def test_reheating_no_t0_errors(self):

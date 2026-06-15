@@ -56,8 +56,10 @@ def _random_buffers(rng, n, horizon=12, max_size=200, inplace_prob=0.25):
             parent_i = rng.randrange(child_i)
             parent = buffers[parent_i]
             child = buffers[child_i]
-            child.start_time = parent.end_time - 1
-            child.end_time = max(child.end_time, parent.end_time)
+            if parent.end_time > child.end_time:
+                child.uses = [parent.end_time - 1]
+            else:
+                child.uses = [parent.end_time - 1, child.end_time - 1]
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
     return buffers
@@ -171,8 +173,7 @@ def _buf(name, size, start, end, in_place_parents=None):
     return LifetimeBoundBuffer(
         name=name,
         size=size,
-        start_time=start,
-        end_time=end,
+        uses=[start, end - 1],
         in_place_parents=in_place_parents or [],
     )
 
