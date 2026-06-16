@@ -26,6 +26,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
+    buffer_quality,
 )
 from torch_spyre._inductor.scratchpad.imanishi_xu import (
     SelfCalibratingCoolingSchedule,
@@ -87,7 +88,9 @@ def _assert_feasible(buffers, capacity):
 
 
 def _committed_total(buffers):
-    return sum(b.size for b in buffers if b.address is not None)
+    # The annealer optimizes the use-weighted quality, so the committed total it
+    # is compared against must use the same weighting (not raw size).
+    return sum(buffer_quality(b) for b in buffers if b.address is not None)
 
 
 class CoolingScheduleTests(TestCase):

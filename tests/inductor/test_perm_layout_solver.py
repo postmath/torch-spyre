@@ -245,7 +245,7 @@ class SkeletonTestsMixin(MixinBase):
     def test_quality_accessor(self):
         buffers = [_buf("a", 64, 0, 1)]
         plan = self.make_plan(buffers, [0], capacity=128)
-        plan.total_allocated_size = 42
+        plan.total_quality = 42
         plan.total_allocated_count = 3
         self.assertEqual(plan.quality(), 42)
         self.assertEqual(plan.count_allocated(), 3)
@@ -293,14 +293,14 @@ class ReferencePlacementTests(TestCase):
         buffers = [_buf("a", 64, 0, 1), _buf("b", 64, 2, 3), _buf("c", 64, 4, 5)]
         plan = self.plan(buffers, [0, 1, 2])
         self.assertEqual([_addr(plan, n) for n in "abc"], [0, 0, 0])
-        self.assertEqual(plan.quality(), 192)
+        self.assertEqual(plan.quality(), 480)  # 2.5 * (64 + 64 + 64)
 
     def test_overlapping_lifetimes_stack(self):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 1, 3)]
         plan = self.plan(buffers, [0, 1])
         self.assertEqual(_addr(plan, "a"), 0)
         self.assertEqual(_addr(plan, "b"), 64)  # stacked on top of a
-        self.assertEqual(plan.quality(), 114)
+        self.assertEqual(plan.quality(), 285)  # 2.5 * (64 + 50)
 
     def test_permutation_order_changes_layout(self):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 1, 3)]
@@ -334,7 +334,7 @@ class ReferencePlacementTests(TestCase):
         plan = self.plan([parent, child], [0, 1])
         self.assertEqual(_addr(plan, "p"), 0)
         self.assertEqual(_addr(plan, "c"), 0)  # reuses parent's address
-        self.assertEqual(plan.quality(), 192)
+        self.assertEqual(plan.quality(), 480)  # 2.5 * (128 + 64)
 
     def test_in_place_parent_placed_after_child_reuses_address(self):
         # Symmetric case: child allocated first, parent reuses its address.
@@ -372,7 +372,7 @@ class ReferencePlacementTests(TestCase):
         plan = self.plan(buffers, [0, 1], capacity=100)
         self.assertEqual(_addr(plan, "a"), 0)
         self.assertEqual(_addr(plan, "b"), 64)  # 64 + 64 = 128 > 100
-        self.assertEqual(plan.quality(), 64)  # only a counts
+        self.assertEqual(plan.quality(), 160)  # only a counts: 2.5 * 64
 
     def test_finalize_after_build(self):
         buffers = [_buf("a", 64, 0, 3), _buf("b", 64, 1, 3)]
@@ -615,10 +615,10 @@ class SwapTests(TestCase):
         # is placed first changes the total.
         buffers = [_buf("a", 30, 0, 2), _buf("b", 90, 0, 2)]
         plan = self.plan(buffers, [0, 1], capacity=100)
-        self.assertEqual(plan.quality(), 30)  # a@0 fits, b@30 (->120) does not
+        self.assertEqual(plan.quality(), 75)  # a@0 fits (2.5*30); b@30 (->120) does not
         delta = plan.swap(0)  # -> [b, a]: b@0 fits, a@90 (->120) does not
-        self.assertEqual(plan.quality(), 90)
-        self.assertEqual(delta, 60)
+        self.assertEqual(plan.quality(), 225)  # 2.5 * 90
+        self.assertEqual(delta, 150)
 
     def test_swap_back_restores(self):
         buffers = [_buf("a", 30, 0, 2), _buf("b", 90, 0, 2)]
@@ -626,7 +626,7 @@ class SwapTests(TestCase):
         d1 = plan.swap(0)
         d2 = plan.swap(0)
         self.assertEqual(d1 + d2, 0)
-        self.assertEqual(plan.quality(), 30)
+        self.assertEqual(plan.quality(), 75)  # 2.5 * 30
         self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 30])
 
     def test_finalize_after_swaps_end_to_end(self):

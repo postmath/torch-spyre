@@ -542,7 +542,7 @@ class ImanishiXuSolverWithBuffers:
         self.alignment = alignment
         self.plan = PermutationBasedLayoutSolver(buffers, self.initial, size, alignment)
         self.starts = starts
-        self.quality_logs: list[list[int]] = []
+        self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
         self.best_quality = self.plan.quality()
         self.best_permutation = copy.copy(self.initial)
@@ -611,7 +611,7 @@ class ImanishiXuSolverWithBuffers:
         self.schedule.calibrate(deltas)
 
     def anneal(self) -> None:
-        quality_log: list[int] = []
+        quality_log: list[float] = []
         temperature_log: list[float] = []
 
         temperature = self.schedule.reset()
@@ -697,7 +697,7 @@ class ImanishiXuSolverWithBuffers:
 
         # qualities[j] is the quality if we rotate i to position j in the permutation, or None if we
         # don't consider rotating i to position j.
-        qualities: list[Optional[int]] = [None] * n
+        qualities: list[Optional[float]] = [None] * n
         quality_before = plan.quality()
 
         # Probe all reinsertion positions on a copy: rotate i to position 0, then bubble it forward

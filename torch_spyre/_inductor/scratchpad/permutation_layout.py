@@ -34,6 +34,19 @@ import math
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
+def buffer_quality(buf: LifetimeBoundBuffer) -> float:
+    """The contribution buffer ``buf`` makes to a plan's :meth:`quality` when it
+    is fully allocated below capacity.
+
+    Weights the buffer's size by how heavily it is used: each access counts
+    once, plus an extra half for a buffer whose first access is a write (a
+    computed buffer, ``first_use_is_read`` False) since its initial store also
+    touches the slot. Formally
+    ``(len(buf.uses) + (0 if buf.first_use_is_read else 0.5)) * buf.size``.
+    """
+    return (len(buf.uses) + (0.0 if buf.first_use_is_read else 0.5)) * buf.size
+
+
 # ===========================================================================
 # Contact-profile data structure
 # ===========================================================================
@@ -193,11 +206,11 @@ class PermutationBasedLayoutSolverBase(ABC):
     exception of an in-place parent/child pair, which may share an identical
     address (``P.end_time == C.start_time + 1``).
 
-    The objective being optimized is :meth:`quality`: the summed size of
-    every buffer that fits *entirely* below ``capacity``. Buffers whose
-    placement would cross the capacity line keep their (notional) address for
-    ordering purposes but are neither counted nor written back on
-    :meth:`finalize`.
+    The objective being optimized is :meth:`quality`: the summed
+    :func:`buffer_quality` (use-weighted size) of every buffer that fits
+    *entirely* below ``capacity``. Buffers whose placement would cross the
+    capacity line keep their (notional) address for ordering purposes but are
+    neither counted nor written back on :meth:`finalize`.
 
     Subclasses implement :meth:`_build` (initial placement) and :meth:`swap`
     (incremental re-placement after exchanging two adjacent permutation
@@ -234,6 +247,10 @@ class PermutationBasedLayoutSolverBase(ABC):
         # loop (avoids a dataclass attribute lookup per candidate). Immutable.
         self._sizes = [buf.size for buf in buffers]
 
+        # Per-buffer quality contribution (use-weighted size) as a flat list,
+        # summed into total_quality for every fully-allocated buffer. Immutable.
+        self._qualities = [buffer_quality(buf) for buf in buffers]
+
         # Per-buffer set of possible in-place partners (its declared parents and
         # the children that declare it). Static -- a function of names and
         # in_place_parents -- so computed once and consulted instead of probing
@@ -245,10 +262,10 @@ class PermutationBasedLayoutSolverBase(ABC):
         # finalize.
         self.addresses: list[int] = [0] * n
 
-        # Sum of buf.size over all fully-allocated buffers (address + size <=
-        # capacity). Maintained incrementally; exposed via quality(). Also, the
-        # count of these buffers, exposed via count_allocated().
-        self.total_allocated_size: int = 0
+        # Sum of buffer_quality(buf) over all fully-allocated buffers (address +
+        # size <= capacity). Maintained incrementally; exposed via quality().
+        # Also, the count of these buffers, exposed via count_allocated().
+        self.total_quality: float = 0.0
         self.total_allocated_count: int = 0
 
         self._build()
@@ -257,12 +274,12 @@ class PermutationBasedLayoutSolverBase(ABC):
     def _build(self) -> None:
         """Compute addresses for every buffer in permutation order.
 
-        Populates ``self.addresses`` and ``self.total_allocated_size`` (and any
+        Populates ``self.addresses`` and ``self.total_quality`` (and any
         subclass-specific structures). Called once from ``__init__``.
         """
 
     @abstractmethod
-    def swap(self, i: int) -> int:
+    def swap(self, i: int) -> float:
         """Swap permutation entries ``i`` and ``i + 1`` and re-place buffers.
 
         Args:
@@ -275,7 +292,7 @@ class PermutationBasedLayoutSolverBase(ABC):
 
     # --- shared helpers -----------------------------------------------------
 
-    def rotate(self, i: int, j: int) -> int:
+    def rotate(self, i: int, j: int) -> float:
         """Modify the permutation by taking ``self.permutation[i]`` out of the permutation and
         reinserting it at position ``j``. Returns the change in :meth:`quality` caused by the
         rotation (new minus old)."""
@@ -284,7 +301,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
         # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
         # benchmarks/copy_vs_swap_results.md.)
-        delta = 0
+        delta = 0.0
         if i < j:
             for k in range(i, j):
                 delta += self.swap(k)
@@ -412,9 +429,10 @@ class PermutationBasedLayoutSolverBase(ABC):
         """Return only the address from :meth:`_placement_decision`."""
         return self._placement_decision(idx, candidates)[0]
 
-    def quality(self) -> int:
-        """Total size of all buffers fully allocated below capacity (O(1))."""
-        return self.total_allocated_size
+    def quality(self) -> float:
+        """Summed :func:`buffer_quality` of all buffers fully allocated below
+        capacity (O(1))."""
+        return self.total_quality
 
     def count_allocated(self) -> int:
         """Count of all buffers fully allocated below capacity (O(1))."""
@@ -445,7 +463,7 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     def _build(self) -> None:
         n = len(self.buffers)
         self.addresses = [0] * n
-        self.total_allocated_size = 0
+        self.total_quality = 0.0
         self.total_allocated_count = 0
         for pos in range(n):
             idx = self.permutation[pos]
@@ -453,16 +471,16 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             candidates = [p for p in prior if self.overlaps(idx, p)]
             self.addresses[idx] = self._address_from_candidates(idx, candidates)
             if self.is_fully_allocated(idx):
-                self.total_allocated_size += self.buffers[idx].size
+                self.total_quality += self._qualities[idx]
                 self.total_allocated_count += 1
 
-    def swap(self, i: int) -> int:
+    def swap(self, i: int) -> float:
         """Swap permutation entries ``i``/``i+1`` and rebuild from scratch."""
-        old_total = self.total_allocated_size
+        old_total = self.total_quality
         perm = self.permutation
         perm[i], perm[i + 1] = perm[i + 1], perm[i]
         self._build()
-        return self.total_allocated_size - old_total
+        return self.total_quality - old_total
 
 
 class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
@@ -496,7 +514,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     def _build(self) -> None:
         n = len(self.buffers)
         self.addresses = [0] * n
-        self.total_allocated_size = 0
+        self.total_quality = 0.0
         self.total_allocated_count = 0
         # reuser idx -> reused (partner) idx for placements that went in-place.
         self.inplace_reuse: dict[int, int] = {}
@@ -509,7 +527,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             if partner is not None:
                 self.inplace_reuse[idx] = partner
             if self.is_fully_allocated(idx):
-                self.total_allocated_size += self.buffers[idx].size
+                self.total_quality += self._qualities[idx]
                 self.total_allocated_count += 1
         # Persistent position index, maintained in O(1) by swap().
         self.position: list[int] = [0] * n
@@ -590,7 +608,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             as_.append(bufs[i].end_time)
             self.above_profile[i] = Profile.from_segments(as_, al)
 
-    def swap(self, i: int) -> int:
+    def swap(self, i: int) -> float:
         """Swap permutation entries ``i`` and ``i+1`` and re-place incrementally.
 
         A no-op when the swapped buffers do not overlap in time. Otherwise:
@@ -645,7 +663,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         # 2. Re-place affected addresses, propagating along order-above edges and
         # in-place transitions (see the method docstring). Seed with the swapped
         # pair and whatever rested on them before the swap.
-        old_total = self.total_allocated_size
+        old_total = self.total_quality
         seed: set[int] = {x, y}
         for lbl in (
             self.above_profile[x].label_set() | self.above_profile[y].label_set()
@@ -668,11 +686,11 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             old_addr = self.addresses[z]
             old_partner = self.inplace_reuse.get(z)
             if self.is_fully_allocated(z):
-                self.total_allocated_size -= self.buffers[z].size
+                self.total_quality -= self._qualities[z]
                 self.total_allocated_count -= 1
             self._recompute_address(z)
             if self.is_fully_allocated(z):
-                self.total_allocated_size += self.buffers[z].size
+                self.total_quality += self._qualities[z]
                 self.total_allocated_count += 1
             new_partner = self.inplace_reuse.get(z)
             if self.addresses[z] != old_addr:
@@ -690,7 +708,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                     t = self.buffers[child].start_time
                     _dirty(self.above_profile[child].label_at(t), pos_z)
                     _dirty(self.above_profile[parent].label_at(t), pos_z)
-        return self.total_allocated_size - old_total
+        return self.total_quality - old_total
 
     def _update_profiles_for_swap(self, x: int, y: int, a: int, b: int) -> None:
         """Transpose ``x`` (was lower) and ``y`` (was upper) in the contact
@@ -775,7 +793,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
 
     # --- rotate: remove-one / reinsert-elsewhere fast path ------------------
 
-    def rotate(self, i: int, j: int) -> int:
+    def rotate(self, i: int, j: int) -> float:
         """Take ``permutation[i]`` out of the permutation and reinsert it at
         position ``j``; return the change in :meth:`quality` (new minus old).
 
@@ -802,7 +820,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             return super().rotate(i, j)
         return self._fast_rotate(i, j)
 
-    def _fast_rotate(self, i: int, j: int) -> int:
+    def _fast_rotate(self, i: int, j: int) -> float:
         """Remove ``permutation[i]`` and reinsert it at ``j`` in one shot.
 
         Edits the permutation and ``position`` index, recomputes all addresses
@@ -812,7 +830,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         ``_rotate_profile_mode == "rebuild"``, by a full rebuild. Returns the
         quality delta.
         """
-        old_total = self.total_allocated_size
+        old_total = self.total_quality
         x = self.permutation[i]
         if self._rotate_profile_mode == "patch":
             # Capture x's pre-move contact profiles; the patch needs the old
@@ -830,7 +848,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             self._build_profiles()
         else:
             self._patch_profiles_for_move(x, old_below, old_above)
-        return self.total_allocated_size - old_total
+        return self.total_quality - old_total
 
     def _move_in_permutation(self, i: int, j: int) -> None:
         """Pop ``permutation[i]`` and reinsert it at ``j``; refresh ``position``
@@ -846,7 +864,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         """Re-place every buffer in the current permutation order, reusing the
         static ``overlaps`` sets (never the O(n^2) reference scan).
 
-        Rebuilds ``addresses``, ``inplace_reuse``, ``total_allocated_size`` and
+        Rebuilds ``addresses``, ``inplace_reuse``, ``total_quality`` and
         ``total_allocated_count`` from scratch but in O(sum of overlap degrees),
         which is what makes the long-move rotate independent of ``|i - j|``.
 
@@ -860,7 +878,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         perm = self.permutation
         pos = self.position
         self.inplace_reuse = {}
-        self.total_allocated_size = 0
+        self.total_quality = 0.0
         self.total_allocated_count = 0
         for p, idx in enumerate(perm):
             cand = [w for w in self.overlap_dict[idx] if pos[w] < p]
@@ -869,7 +887,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             if partner is not None:
                 self.inplace_reuse[idx] = partner
             if self.is_fully_allocated(idx):
-                self.total_allocated_size += self._sizes[idx]
+                self.total_quality += self._qualities[idx]
                 self.total_allocated_count += 1
 
     @staticmethod
@@ -1014,6 +1032,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.alignment = self.alignment
         clone.overlap_dict = self.overlap_dict
         clone._sizes = self._sizes
+        clone._qualities = self._qualities
         clone._inplace_partners = self._inplace_partners
         # Rotate-policy knobs (cheap scalars; carried so a clone rotates the
         # same way as its source and tests can flip them on a clone).
@@ -1023,7 +1042,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone.permutation = list(self.permutation)
         clone.addresses = list(self.addresses)
         clone.position = list(self.position)
-        clone.total_allocated_size = self.total_allocated_size
+        clone.total_quality = self.total_quality
         clone.total_allocated_count = self.total_allocated_count
         clone.inplace_reuse = dict(self.inplace_reuse)
         clone.below_profile = {
