@@ -86,7 +86,6 @@ unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 #  "bestfit":  BestFitLayoutSolver,
 #  "firstfit": FirstFitLayoutSolver.
 
-# TODO(isuruf): Change to firstfit when deeptools PR4298 lands
-layout_solver: Literal["greedy", "bestfit", "firstfit"] = "greedy"
+layout_solver: Literal["greedy", "bestfit", "firstfit"] = "firstfit"
 
 install_config_module(sys.modules[__name__])
