@@ -106,6 +106,9 @@ def _check_contact_faithful(test, plan, tag=""):
     pos = plan.position
 
     def top(w):
+        # Exclusive top of a placed buffer; +inf for an evicted (None) one.
+        if plan.addresses[w] is None:
+            return float("inf")
         return plan.addresses[w] + plan.buffers[w].size
 
     def alive(w):
@@ -113,6 +116,11 @@ def _check_contact_faithful(test, plan, tag=""):
 
     for c in range(n):
         bc = plan.buffers[c]
+        if plan.addresses[c] is None:
+            # c is evicted: it has no concrete geometry to validate. (Its
+            # order-based contact relation is still checked via _check_consistency
+            # and the placed buffers below.)
+            continue
         for t in range(bc.start_time, bc.end_time):
             contact = plan.contact_at(c, t)
             cand = [w for w in plan.overlap_dict[c] if pos[w] < pos[c] and alive(w)]
@@ -231,15 +239,21 @@ class SkeletonTestsMixin(MixinBase):
         plan = self.make_plan(buffers, [0], capacity=256)
         plan.addresses[0] = 128
         self.assertEqual(plan._top(0), 192)
+        # An evicted buffer (no address) has no top.
+        plan.addresses[0] = None
+        self.assertIsNone(plan._top(0))
 
     def test_is_fully_allocated(self):
         buffers = [_buf("a", 64, 0, 1)]
         plan = self.make_plan(buffers, [0], capacity=100)
-        # Fits exactly at the boundary.
+        # None is the single source of truth for eviction: a concrete address
+        # means allocated, None means evicted (the capacity gate now lives in
+        # placement, not here).
         plan.addresses[0] = 36
         self.assertTrue(plan.is_fully_allocated(0))
-        # One byte over capacity.
-        plan.addresses[0] = 37
+        plan.addresses[0] = 0
+        self.assertTrue(plan.is_fully_allocated(0))
+        plan.addresses[0] = None
         self.assertFalse(plan.is_fully_allocated(0))
 
     def test_quality_accessor(self):
@@ -253,13 +267,13 @@ class SkeletonTestsMixin(MixinBase):
     def test_finalize_writes_back_only_fully_allocated(self):
         buffers = [
             _buf("fits", 64, 0, 1),
-            _buf("over_cap", 64, 0, 1),
-            _buf("also_over", 64, 0, 1),
+            _buf("evicted", 64, 0, 1),
+            _buf("also_evicted", 64, 0, 1),
         ]
         plan = self.make_plan(buffers, [0, 1, 2], capacity=128)
-        # Every buffer has a notional address; only those fitting below capacity
-        # are committed. 100 + 64 = 164 > 128 and 200 + 64 = 264 > 128.
-        plan.addresses = [0, 100, 200]
+        # addresses is already the single source of truth: a concrete address for
+        # a placed buffer, None for an evicted one. finalize is a direct copy.
+        plan.addresses = [0, None, None]
 
         plan.finalize()
 
@@ -365,14 +379,15 @@ class ReferencePlacementTests(TestCase):
         # in-place partner, but reusing addr 0 would hit z -> stack at 50.
         self.assertEqual(_addr(plan, "c"), 50)
 
-    def test_over_capacity_buffer_not_counted_but_still_addressed(self):
-        # b stacks above a and crosses the capacity line: it keeps an address
-        # (so later buffers stack on it) but is excluded from total_size.
+    def test_over_capacity_buffer_evicted(self):
+        # b would stack above a and cross the capacity line, so it is evicted:
+        # its address is None and it contributes nothing to quality/count.
         buffers = [_buf("a", 64, 0, 3), _buf("b", 64, 1, 3)]
         plan = self.plan(buffers, [0, 1], capacity=100)
         self.assertEqual(_addr(plan, "a"), 0)
-        self.assertEqual(_addr(plan, "b"), 64)  # 64 + 64 = 128 > 100
+        self.assertIsNone(_addr(plan, "b"))  # 64 + 64 = 128 > 100 -> evicted
         self.assertEqual(plan.quality(), 160)  # only a counts: 2.5 * 64
+        self.assertEqual(plan.count_allocated(), 1)
 
     def test_finalize_after_build(self):
         buffers = [_buf("a", 64, 0, 3), _buf("b", 64, 1, 3)]
@@ -627,7 +642,8 @@ class SwapTests(TestCase):
         d2 = plan.swap(0)
         self.assertEqual(d1 + d2, 0)
         self.assertEqual(plan.quality(), 75)  # 2.5 * 30
-        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 30])
+        # Back to [a, b]: a@0 fits; b@30 (-> 120) crosses cap 100 -> evicted.
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, None])
 
     def test_finalize_after_swaps_end_to_end(self):
         # Build, optimize via swaps, then commit: only buffers that fit below
@@ -675,6 +691,132 @@ class SwapTests(TestCase):
                 self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
                 _check_consistency(self, fast, tag)
                 _check_contact_faithful(self, fast, tag)
+
+
+class EvictionTests(TestCase):
+    """`None`-as-eviction: the capacity gate in placement and its propagation."""
+
+    def fast(self, buffers, permutation, capacity, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def ref(self, buffers, permutation, capacity, alignment=1):
+        return ReferencePermutationBasedLayoutSolver(
+            buffers, permutation, capacity, alignment
+        )
+
+    def test_lone_buffer_larger_than_capacity_evicted(self):
+        # No candidates, but the buffer alone exceeds capacity -> evicted (the
+        # one hole in the "on the floor => address 0" shortcut).
+        for cls in (self.fast, self.ref):
+            plan = cls([_buf("x", 150, 0, 1)], [0], 100)
+            self.assertIsNone(_addr(plan, "x"))
+            self.assertEqual(plan.quality(), 0)
+            self.assertEqual(plan.count_allocated(), 0)
+        # Exactly at the boundary fits.
+        plan = self.fast([_buf("x", 100, 0, 1)], [0], 100)
+        self.assertEqual(_addr(plan, "x"), 0)
+
+    def test_aligned_address_crossing_capacity_evicted(self):
+        # The capacity gate uses the *aligned* address. a@0 (64), b aligned to
+        # 128; 128 + 64 = 192. cap 191 -> evicted; cap 192 -> fits exactly.
+        buffers = [_buf("a", 64, 0, 2), _buf("b", 64, 1, 3)]
+        evicted = self.fast(buffers, [0, 1], 191, alignment=128)
+        self.assertEqual(_addr(evicted, "a"), 0)
+        self.assertIsNone(_addr(evicted, "b"))
+        fits = self.fast(buffers, [0, 1], 192, alignment=128)
+        self.assertEqual(_addr(fits, "b"), 128)
+
+    def test_two_none_floor_vs_evicted_neighbour(self):
+        # C's below-profile carries both kinds of None: a *floor* segment (label
+        # None, no neighbour) and an *evicted-neighbour* segment (label E whose
+        # address is None). The floor must not evict C; the evicted neighbour
+        # must. E is too big to place, so over [1,2) C rests on the evicted E.
+        E = _buf("E", 200, 1, 2)
+        C = _buf("C", 10, 0, 3)
+        plan = self.fast([E, C], [0, 1], 100)
+        self.assertIsNone(_addr(plan, "E"))  # lone buffer > capacity
+        # The profile literally shows floor (None) | E | floor (None).
+        self.assertEqual(
+            _below_named(plan, "C"), [(0, 1, None), (1, 2, "E"), (2, 3, None)]
+        )
+        self.assertIsNone(_addr(plan, "C"))  # rests on evicted E over [1, 2)
+        # Contrast: the same C-shaped buffer that never overlaps E sits on the
+        # floor at 0 -- a floor (None) neighbour does not evict.
+        C2 = _buf("C2", 10, 0, 1)
+        plan2 = self.fast([E, C2], [0, 1], 100)
+        self.assertEqual(_addr(plan2, "C2"), 0)
+
+    def test_swap_frees_space_refits_and_count_rises(self):
+        # [a, b, c] with cap 100: a@0(60); b rests on a -> 120 evicted; c rests
+        # on the evicted b -> evicted. Only a is allocated. Swapping a/b makes
+        # b@0(60); a evicted; c (disjoint from a) rests on b -> c@60(90) fits.
+        # So count_allocated rises 1 -> 2 and c goes None -> concrete.
+        buffers = [_buf("a", 60, 0, 2), _buf("b", 60, 0, 4), _buf("c", 30, 2, 4)]
+        plan = self.fast(buffers, [0, 1, 2], 100)
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertIsNone(_addr(plan, "c"))
+        self.assertEqual(plan.count_allocated(), 1)
+        plan.swap(0)  # -> [b, a, c]
+        self.assertEqual(_addr(plan, "b"), 0)
+        self.assertIsNone(_addr(plan, "a"))
+        self.assertEqual(_addr(plan, "c"), 60)  # re-fit: None -> concrete
+        self.assertEqual(plan.count_allocated(), 2)
+        # Matches the from-scratch oracle.
+        ref = self.ref(buffers, [1, 0, 2], 100)
+        self.assertEqual(plan.addresses, ref.addresses)
+
+    def test_early_stop_saturated_interior_tail_all_none(self):
+        # Eight buffers all alive over the single interval [0, 2), each size 40,
+        # capacity 100: only the first two fit (0, 40); the third crosses 100 and
+        # evicts, saturating the lone interval. The early-stop then bulk-evicts
+        # the tail. Result is identical to the reference (no early-stop).
+        n = 8
+        buffers = [_buf(f"b{k}", 40, 0, 2) for k in range(n)]
+        fast = self.fast(buffers, list(range(n)), 100)
+        ref = self.ref(buffers, list(range(n)), 100)
+        self.assertEqual(fast.addresses, ref.addresses)
+        self.assertEqual(fast.addresses[:2], [0, 40])
+        self.assertTrue(all(a is None for a in fast.addresses[2:]))
+        self.assertEqual(fast.count_allocated(), 2)
+        # Quality is exactly the placed prefix's contribution.
+        self.assertEqual(fast.quality(), sum(fast._qualities[:2]))
+
+    def test_sparse_end_interval_still_placed_after_saturated_interior(self):
+        # The interior interval [1, 2) saturates (b0@0, b1@40, b2 evicted), but a
+        # buffer H living only in the open head interval [0, 1) appears *last* in
+        # the permutation. The per-interval early-stop keeps going (the head
+        # interval is not yet done) and places H -- a coarse "whole top row None"
+        # check would have stopped and wrongly evicted it.
+        buffers = [
+            _buf("b0", 40, 1, 2),
+            _buf("b1", 40, 1, 2),
+            _buf("b2", 40, 1, 2),
+            _buf("H", 10, 0, 1),
+        ]
+        fast = self.fast(buffers, [0, 1, 2, 3], 100)
+        ref = self.ref(buffers, [0, 1, 2, 3], 100)
+        self.assertEqual(fast.addresses, ref.addresses)
+        self.assertIsNone(_addr(fast, "b2"))  # interior saturated
+        self.assertEqual(_addr(fast, "H"), 0)  # sparse head still placed
+        self.assertEqual(fast.count_allocated(), 3)
+
+    def test_n0_and_n1_edges(self):
+        for cls in (
+            PermutationBasedLayoutSolver,
+            ReferencePermutationBasedLayoutSolver,
+        ):
+            empty = cls([], [], 100)
+            self.assertEqual(empty.addresses, [])
+            self.assertEqual(empty.quality(), 0)
+            self.assertEqual(empty.count_allocated(), 0)
+            empty.finalize()  # no-op, must not raise
+            one_fits = cls([_buf("a", 40, 0, 1)], [0], 100)
+            self.assertEqual(one_fits.addresses, [0])
+            self.assertEqual(one_fits.count_allocated(), 1)
+            one_evicted = cls([_buf("a", 200, 0, 1)], [0], 100)
+            self.assertEqual(one_evicted.addresses, [None])
+            self.assertEqual(one_evicted.count_allocated(), 0)
 
 
 class RotateTests(TestCase):

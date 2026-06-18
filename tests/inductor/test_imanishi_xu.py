@@ -325,6 +325,31 @@ class ImanishiXuTests(TestCase):
         # Broke after the first iteration instead of running all 8 steps.
         self.assertEqual(len(solver.quality_logs[0]), 1)
 
+    def test_annealing_step_swap_handles_evicted_buffers(self):
+        # With None-as-eviction, evicted buffers have address None. The clean-up
+        # sweep compares adjacent *non-overlapping* buffers' tops; this must treat
+        # an evicted buffer as +inf (sorting it last) rather than raising on
+        # `None + size`. Here b stacks on a past capacity and is evicted, while c
+        # is disjoint from both -- so the adjacent pair (b, c) is non-overlapping
+        # with an evicted member, exactly the comparison that used to raise.
+        buffers = [
+            LifetimeBoundBuffer("a", 90, [0, 1]),  # [0, 2)
+            LifetimeBoundBuffer("b", 90, [0, 1]),  # [0, 2), stacks on a -> evicted
+            LifetimeBoundBuffer("c", 10, [5, 6]),  # [5, 7), disjoint
+        ]
+        solver = ImanishiXuSolverWithBuffers(
+            buffers,
+            100,
+            1,
+            initial=[0, 1, 2],
+            schedule=_short_schedule(),
+            random=rnd.Random(0),
+        )
+        self.assertIsNone(solver.plan.addresses[1])  # b is evicted
+        self.assertFalse(solver.plan.overlaps(1, 2))  # b and c do not overlap
+        # Must not raise (the _top_or_inf guard); b (None top) sorts after c.
+        solver.annealing_step_swap(0, 2)
+
     def test_finalized_layout_is_feasible(self):
         for seed in range(60):
             rng = rnd.Random(seed)

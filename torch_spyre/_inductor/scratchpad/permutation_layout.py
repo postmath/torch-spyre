@@ -208,9 +208,11 @@ class PermutationBasedLayoutSolverBase(ABC):
 
     The objective being optimized is :meth:`quality`: the summed
     :func:`buffer_quality` (use-weighted size) of every buffer that fits
-    *entirely* below ``capacity``. Buffers whose placement would cross the
-    capacity line keep their (notional) address for ordering purposes but are
-    neither counted nor written back on :meth:`finalize`.
+    *entirely* below ``capacity``. A buffer whose placement would cross the
+    capacity line is *evicted* -- its address is ``None`` (the single source of
+    truth for eviction) and it is neither counted nor written back on
+    :meth:`finalize`. Eviction is upward-closed: anything that would rest on an
+    evicted buffer is evicted too.
 
     Subclasses implement :meth:`_build` (initial placement) and :meth:`swap`
     (incremental re-placement after exchanging two adjacent permutation
@@ -257,10 +259,15 @@ class PermutationBasedLayoutSolverBase(ABC):
         # every candidate during placement. See _placement_decision.
         self._inplace_partners = self._compute_inplace_partners()
 
-        # Internal address per buffer index; None means unplaced. Populated by
-        # _build and kept in sync by swap. Not written to buffer objects until
-        # finalize.
-        self.addresses: list[int] = [0] * n
+        # Lifetime-interval data for the saturation early-stop (Part 2; used by
+        # the incremental solver's sequential placers, see _sequential_place).
+        # Static -- a function of lifetimes only -- so computed once here.
+        self._build_interval_data()
+
+        # Internal address per buffer index; None means evicted (does not fit
+        # below capacity). Populated by _build and kept in sync by swap. Not
+        # written to buffer objects until finalize.
+        self.addresses: list[Optional[int]] = [0] * n
 
         # Sum of buffer_quality(buf) over all fully-allocated buffers (address +
         # size <= capacity). Maintained incrementally; exposed via quality().
@@ -314,13 +321,22 @@ class PermutationBasedLayoutSolverBase(ABC):
         """Round ``addr`` up to the next multiple of ``self.alignment``."""
         return math.ceil(addr / self.alignment) * self.alignment
 
-    def _top(self, idx: int) -> int:
-        """Return ``address + size`` for a placed buffer (its exclusive top)."""
-        return self.addresses[idx] + self._sizes[idx]
+    def _top(self, idx: int) -> Optional[int]:
+        """Return ``address + size`` for a placed buffer (its exclusive top), or
+        ``None`` if ``idx`` is evicted (has no address)."""
+        if self.addresses[idx] is None:
+            return None
+        return self.addresses[idx] + self._sizes[idx]  # type: ignore
 
     def is_fully_allocated(self, idx: int) -> bool:
-        """True if buffer ``idx`` has an address and fits below ``capacity``."""
-        return self.addresses[idx] + self._sizes[idx] <= self.capacity
+        """True if buffer ``idx`` has an address (and so fits below ``capacity``).
+
+        ``None`` is the single source of truth for eviction: a buffer carries a
+        concrete address iff it fits entirely below ``capacity`` (the capacity
+        gate lives in :meth:`_placement_decision`), so "has an address" and
+        "fully allocated" coincide.
+        """
+        return self.addresses[idx] is not None
 
     def overlaps(self, i: int, j: int) -> bool:
         """True if buffers ``i`` and ``j`` are alive at a common tick.
@@ -375,7 +391,7 @@ class PermutationBasedLayoutSolverBase(ABC):
 
     def _placement_decision(
         self, idx: int, candidates: list[int]
-    ) -> tuple[int, Optional[int]]:
+    ) -> tuple[Optional[int], Optional[int]]:
         """Decide ``idx``'s address given the buffers it must sit on top of.
 
         ``candidates`` are already-placed buffer indices that overlap ``idx`` in
@@ -393,17 +409,33 @@ class PermutationBasedLayoutSolverBase(ABC):
         above all the others (it saves ``P``'s footprint rather than stacking on
         top of it).
 
+        This method is the single eviction authority: ``None`` is returned as the
+        address whenever ``idx`` does not fit entirely below ``capacity``.
+        Eviction is upward-closed, so ``idx`` is evicted if *any* candidate is
+        itself evicted (``idx`` would rest on a buffer that has no address) --
+        detected without computing the ``max``, since a ``None`` candidate
+        dominates. Otherwise ``idx``'s aligned top must not cross ``capacity``.
+
         Returns:
-            ``(address, partner)`` where ``partner`` is the candidate whose
-            address was reused in-place, or ``None`` if ``idx`` was stacked.
+            ``(address, partner)`` where ``address`` is ``None`` when ``idx`` is
+            evicted, and ``partner`` is the candidate whose address was reused
+            in-place (or ``None`` if ``idx`` was stacked / evicted).
         """
         if not candidates:
+            # Lone buffer: it sits on the floor at address 0, but a buffer larger
+            # than the whole scratchpad is evicted (the real hole in "floor => 0").
+            if self._sizes[idx] > self.capacity:
+                return None, None
             return 0, None
-        # _top inlined as addr[p] + sizes[p] on locals: this max runs once per
-        # placed buffer over all its candidates and is the placement hot loop.
         addr = self.addresses
         sizes = self._sizes
-        max_top = max(addr[p] + sizes[p] for p in candidates)
+        # A None (evicted) candidate dominates: idx would rest on it, so idx is
+        # evicted too. Detect this before the max (None has no finite top).
+        if any(addr[p] is None for p in candidates):
+            return None, None
+        # _top inlined as addr[p] + sizes[p] on locals: this max runs once per
+        # placed buffer over all its candidates and is the placement hot loop.
+        max_top = max(addr[p] + sizes[p] for p in candidates)  # type: ignore
         # Try to drop into an in-place partner's slot. Only ``idx``'s precomputed
         # in-place partners can qualify, so probe those that are present among
         # the candidates rather than testing every candidate. At most one can
@@ -417,17 +449,128 @@ class PermutationBasedLayoutSolverBase(ABC):
                 if not self._can_inplace(*pair):
                     continue
                 partner_addr = addr[partner]
+                assert partner_addr is not None  # the partner is allocated
                 others_top = max(
-                    (addr[q] + sizes[q] for q in candidates if q != partner),
+                    (addr[q] + sizes[q] for q in candidates if q != partner),  # type: ignore
                     default=0,
                 )
                 if others_top <= partner_addr:
+                    # In-place reuse fits whenever the partner does (the child is
+                    # no larger than the partner), but gate on capacity uniformly.
+                    if partner_addr + sizes[idx] > self.capacity:
+                        return None, None
                     return partner_addr, partner
-        return self._align_up(max_top), None
+        aligned_addr = self._align_up(max_top)
+        if aligned_addr + sizes[idx] > self.capacity:
+            return None, None
+        return aligned_addr, None
 
-    def _address_from_candidates(self, idx: int, candidates: list[int]) -> int:
+    def _address_from_candidates(
+        self, idx: int, candidates: list[int]
+    ) -> Optional[int]:
         """Return only the address from :meth:`_placement_decision`."""
         return self._placement_decision(idx, candidates)[0]
+
+    # --- saturation early-stop (Part 2; incremental sequential placers) ------
+
+    def _build_interval_data(self) -> None:
+        """Precompute the lifetime-interval structures the saturation early-stop
+        reads. Static (a function of lifetimes only), built once in ``__init__``
+        and shared by reference in :meth:`copy`.
+
+        Reuses the :meth:`_build_profiles` breakpoint idiom: the sorted unique
+        lifetime endpoints cut the timeline into ``K`` half-open intervals
+        ``[interval_starts[k], interval_starts[k + 1])`` (``K`` can be 0 when
+        ``n == 0``). For each:
+
+        - ``_total_at[k]`` -- how many buffers are alive on interval ``k`` (a
+          delta sweep over the endpoints, accumulated into a running count).
+        - ``_buf_intervals[idx]`` -- the half-open range ``[lo, hi)`` of interval
+          indices buffer ``idx`` covers (``bisect`` of its start/end).
+        """
+        bufs = self.buffers
+        starts = sorted({b.start_time for b in bufs} | {b.end_time for b in bufs})
+        self._interval_starts = starts
+        k = max(0, len(starts) - 1)
+        self._num_intervals = k
+        total = [0] * k
+        # Delta sweep: +1 at each start interval, -1 at each end interval; the
+        # prefix sum over intervals is the alive count.
+        deltas = [0] * (k + 1)
+        for b in bufs:
+            deltas[bisect.bisect_left(starts, b.start_time)] += 1
+            deltas[bisect.bisect_left(starts, b.end_time)] -= 1
+        running = 0
+        for i in range(k):
+            running += deltas[i]
+            total[i] = running
+        self._total_at = total
+        self._buf_intervals = [
+            (
+                bisect.bisect_left(starts, b.start_time),
+                bisect.bisect_left(starts, b.end_time),
+            )
+            for b in bufs
+        ]
+
+    def _sequential_place(self, get_candidates) -> None:
+        """Place every buffer in permutation order, with the saturation
+        early-stop. Resets and repopulates ``addresses``, ``inplace_reuse``,
+        ``total_quality`` and ``total_allocated_count``.
+
+        ``get_candidates(pos, idx)`` returns the already-placed candidate list
+        for the buffer at permutation position ``pos`` -- the only thing that
+        differs between the incremental ``_build`` (a ``prior``-scan) and
+        ``_recompute_all_addresses`` (an ``overlap_dict`` lookup).
+
+        Early-stop: an interval is *done* once it can accept nothing more --
+        either it already carries an evicted buffer (``has_none_at``) or every
+        buffer alive on it has been placed (``placed_at == total_at``). Once all
+        intervals are done, every remaining buffer is alive only over saturated
+        intervals and therefore rests (transitively) on an evicted buffer, so it
+        is evicted too; we stop and bulk-set the tail to ``None``. This is
+        result-identical to running the full loop (see the module/plan notes),
+        so it never changes addresses -- only the work to compute them.
+        """
+        n = len(self.buffers)
+        perm = self.permutation
+        self.inplace_reuse: dict[int, int] = {}
+        self.total_quality = 0.0
+        self.total_allocated_count = 0
+
+        k = self._num_intervals
+        total_at = self._total_at
+        buf_intervals = self._buf_intervals
+        placed_at = [0] * k
+        has_none_at = [False] * k
+        done_at = [total_at[t] == 0 for t in range(k)]
+        not_done = k - sum(done_at)
+
+        stop = n  # permutation position at which the early-stop fired (n => none)
+        for pos in range(n):
+            if not_done == 0:
+                stop = pos
+                break
+            idx = perm[pos]
+            addr, partner = self._placement_decision(idx, get_candidates(pos, idx))
+            self.addresses[idx] = addr
+            if partner is not None:
+                self.inplace_reuse[idx] = partner
+            evicted = addr is None
+            if not evicted:
+                self.total_quality += self._qualities[idx]
+                self.total_allocated_count += 1
+            lo, hi = buf_intervals[idx]
+            for t in range(lo, hi):
+                placed_at[t] += 1
+                if evicted:
+                    has_none_at[t] = True
+                if not done_at[t] and (has_none_at[t] or placed_at[t] == total_at[t]):
+                    done_at[t] = True
+                    not_done -= 1
+
+        for pos in range(stop, n):
+            self.addresses[perm[pos]] = None
 
     def quality(self) -> float:
         """Summed :func:`buffer_quality` of all buffers fully allocated below
@@ -439,16 +582,14 @@ class PermutationBasedLayoutSolverBase(ABC):
         return self.total_allocated_count
 
     def finalize(self) -> None:
-        """Write back addresses of fully-allocated buffers to the buffers.
+        """Write back each buffer's address to the buffer object.
 
-        Buffers that do not fit entirely below ``capacity`` have their
-        ``address`` set to ``None`` and are not committed.
+        ``self.addresses[idx]`` is already the single source of truth: a concrete
+        address for a buffer that fits below ``capacity``, or ``None`` for an
+        evicted one (which is not committed). So the write-back is a direct copy.
         """
         for idx, buf in enumerate(self.buffers):
-            if self.is_fully_allocated(idx):
-                buf.address = self.addresses[idx]
-            else:
-                buf.address = None
+            buf.address = self.addresses[idx]
 
 
 class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
@@ -514,21 +655,14 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     def _build(self) -> None:
         n = len(self.buffers)
         self.addresses = [0] * n
-        self.total_quality = 0.0
-        self.total_allocated_count = 0
-        # reuser idx -> reused (partner) idx for placements that went in-place.
-        self.inplace_reuse: dict[int, int] = {}
-        for pos in range(n):
-            idx = self.permutation[pos]
-            prior = self.permutation[:pos]
-            candidates = [p for p in prior if self.overlaps(idx, p)]
-            addr, partner = self._placement_decision(idx, candidates)
-            self.addresses[idx] = addr
-            if partner is not None:
-                self.inplace_reuse[idx] = partner
-            if self.is_fully_allocated(idx):
-                self.total_quality += self._qualities[idx]
-                self.total_allocated_count += 1
+        # Place every buffer in permutation order (candidates are the earlier,
+        # time-overlapping buffers), with the saturation early-stop. This sets
+        # addresses, inplace_reuse and the running totals.
+        self._sequential_place(
+            lambda pos, idx: [
+                p for p in self.permutation[:pos] if self.overlaps(idx, p)
+            ]
+        )
         # Persistent position index, maintained in O(1) by swap().
         self.position: list[int] = [0] * n
         for p, idx in enumerate(self.permutation):
@@ -673,6 +807,10 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         heap = [(self.position[idx], idx) for idx in seed]
         heapq.heapify(heap)
         queued = set(seed)
+        # Buffers already settled as evicted by the flip-to-None fast path below.
+        # heapq has no cheap delete, so a flipped buffer is skipped (lazily) if it
+        # is later popped from the normal heap.
+        flipped: set[int] = set()
 
         def _dirty(w: Optional[int], pos_z: int) -> None:
             if w is not None and w not in queued and self.position[w] > pos_z:
@@ -682,6 +820,8 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         while heap:
             _, z = heapq.heappop(heap)
             queued.discard(z)
+            if z in flipped:
+                continue
             pos_z = self.position[z]
             old_addr = self.addresses[z]
             old_partner = self.inplace_reuse.get(z)
@@ -689,9 +829,20 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 self.total_quality -= self._qualities[z]
                 self.total_allocated_count -= 1
             self._recompute_address(z)
-            if self.is_fully_allocated(z):
-                self.total_quality += self._qualities[z]
-                self.total_allocated_count += 1
+            if self.addresses[z] is None:
+                # z is evicted and final (position ordering: nothing below it
+                # changes after it is popped, so it cannot un-evict). Everything
+                # resting transitively on z is therefore evicted too -- exactly
+                # z's order-above closure (a buffer is evicted iff an evicted
+                # buffer lies in its candidate set, i.e. is one of its order-below
+                # neighbours). Bulk-flip that closure to None directly instead of
+                # re-deriving each via _recompute_address (which would just
+                # short-circuit to None). z's own quality was already removed
+                # above and is not re-added.
+                self._flip_evicted_closure(z, flipped)
+                continue
+            self.total_quality += self._qualities[z]
+            self.total_allocated_count += 1
             new_partner = self.inplace_reuse.get(z)
             if self.addresses[z] != old_addr:
                 for w in self.above_profile[z].label_set():
@@ -709,6 +860,33 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                     _dirty(self.above_profile[child].label_at(t), pos_z)
                     _dirty(self.above_profile[parent].label_at(t), pos_z)
         return self.total_quality - old_total
+
+    def _flip_evicted_closure(self, z: int, flipped: set[int]) -> None:
+        """Evict every buffer resting (transitively) on the just-evicted ``z``.
+        This method updates ``flipped``.
+
+        These are exactly ``z``'s order-above closure: ``w`` rests on ``z`` iff
+        ``z`` is one of ``w``'s order-below neighbours (``w in above_profile[z]``),
+        and an evicted order-below neighbour forces ``w`` evicted regardless of
+        its other supports. Each is set to ``None`` (clearing any in-place reuse
+        and decrementing the running totals) and marked ``flipped`` so the normal
+        heap skips it when popped. Order-above neighbours always have strictly
+        higher position, so the closure is finite and never revisits ``z``.
+        """
+        stack = [w for w in self.above_profile[z].label_set() if w is not None]
+        while stack:
+            w = stack.pop()
+            if w in flipped:
+                continue
+            flipped.add(w)
+            if self.is_fully_allocated(w):
+                self.total_quality -= self._qualities[w]
+                self.total_allocated_count -= 1
+            self.addresses[w] = None
+            self.inplace_reuse.pop(w, None)
+            for u in self.above_profile[w].label_set():
+                if u is not None and u not in flipped:
+                    stack.append(u)
 
     def _update_profiles_for_swap(self, x: int, y: int, a: int, b: int) -> None:
         """Transpose ``x`` (was lower) and ``y`` (was upper) in the contact
@@ -769,6 +947,17 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         legality test needs, so it yields the same address and partner as
         scanning the full earlier-overlapping set, while touching only ``z``'s
         own contact segments.
+
+        Two distinct meanings of ``None`` meet here and must not be conflated:
+
+        - A profile *label* ``m is None`` means *floor* -- nothing is below ``z``
+          on that segment -- so it contributes no candidate (``continue``).
+        - A label ``m`` that is a real neighbour but whose ``addresses[m] is
+          None`` is an *evicted* neighbour. It is still added to ``cand``;
+          :meth:`_placement_decision` then short-circuits it to an evicted
+          (``None``) placement for ``z``, since ``z`` would rest on it. The tail
+          below clears ``inplace_reuse[z]`` when the result is evicted (partner
+          ``None``), so an evicted buffer never keeps a stale reuse entry.
         """
         cand: set[int] = set()
         prof = self.below_profile[z]
@@ -777,7 +966,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         bufs = self.buffers
         for i, m in enumerate(labels):
             if m is None:
-                continue
+                continue  # floor (no neighbour), not an evicted neighbour
             cand.add(m)
             reused = reuse.get(m)
             if reused is not None:
@@ -873,22 +1062,14 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         contact profiles. It runs inside :meth:`_fast_rotate` *before* the
         profiles are patched for the move, so at this point ``below_profile``
         still describes the pre-move order and cannot be trusted as a candidate
-        source; ``overlaps`` is valid regardless of order.
+        source; ``overlaps`` is valid regardless of order. The saturation
+        early-stop applies here too (this is a forward sweep in permutation
+        order, like ``_build``).
         """
-        perm = self.permutation
         pos = self.position
-        self.inplace_reuse = {}
-        self.total_quality = 0.0
-        self.total_allocated_count = 0
-        for p, idx in enumerate(perm):
-            cand = [w for w in self.overlap_dict[idx] if pos[w] < p]
-            addr, partner = self._placement_decision(idx, cand)
-            self.addresses[idx] = addr
-            if partner is not None:
-                self.inplace_reuse[idx] = partner
-            if self.is_fully_allocated(idx):
-                self.total_quality += self._qualities[idx]
-                self.total_allocated_count += 1
+        self._sequential_place(
+            lambda p, idx: [w for w in self.overlap_dict[idx] if pos[w] < p]
+        )
 
     @staticmethod
     def _iter_common(
@@ -1034,6 +1215,11 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone._sizes = self._sizes
         clone._qualities = self._qualities
         clone._inplace_partners = self._inplace_partners
+        # Lifetime-interval data for the saturation early-stop (static).
+        clone._interval_starts = self._interval_starts
+        clone._num_intervals = self._num_intervals
+        clone._total_at = self._total_at
+        clone._buf_intervals = self._buf_intervals
         # Rotate-policy knobs (cheap scalars; carried so a clone rotates the
         # same way as its source and tests can flip them on a clone).
         clone._rotate_remove_insert_threshold = self._rotate_remove_insert_threshold

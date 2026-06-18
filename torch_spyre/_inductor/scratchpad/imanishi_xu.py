@@ -584,13 +584,22 @@ class ImanishiXuSolverWithBuffers:
         if j == len(perm) - 1:
             j = len(perm) - 2
 
+        def _top_or_inf(p: int) -> float:
+            # Exclusive top (address + size) of buffer ``p``, or +inf when ``p``
+            # is evicted (address is None). An evicted buffer sorts as if it sits
+            # arbitrarily high, so it is treated as "above" any placed buffer and
+            # is never reordered below one; two placed buffers compare by their
+            # real tops, unchanged from before eviction used None.
+            addr = plan.addresses[p]
+            if addr is None:
+                return math.inf
+            return addr + self.buffers[p].size
+
         while i <= j:
             pi = perm[i]
             pi1 = perm[i + 1]
 
-            if (not plan.overlaps(pi, pi1)) and plan.addresses[pi] + self.buffers[
-                pi
-            ].size > plan.addresses[pi1] + self.buffers[pi1].size:
+            if (not plan.overlaps(pi, pi1)) and _top_or_inf(pi) > _top_or_inf(pi1):
                 # Swap buffers pi and pi1. This makes no difference for the quality of the result
                 # *now*, but it makes it easier to rotate to an improved state.
                 plan.swap(i)
@@ -643,7 +652,9 @@ class ImanishiXuSolverWithBuffers:
             # x is not legally allocated, so it can only be made to fit by moving it earlier; the
             # last legally-allocated buffer sits at position k, so only positions 0..k+1 can change
             # the quality. (See the monotonicity argument: x's address is non-decreasing in its
-            # position.)
+            # position. Eviction preserves this: moving x later only adds earlier-positioned
+            # overlapping buffers to what it must stack on, so its top -- and hence whether it is
+            # evicted -- is monotone in position, with an evicted address read as +inf.)
             upper_bound = (
                 max((pos for pos, b in enumerate(allocated) if b), default=0) + 1
             )
