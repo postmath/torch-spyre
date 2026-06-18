@@ -159,7 +159,9 @@ class BaseLayoutSolverTests:
             self.make_buffer("buffer1", 3, [0, 1]),
             self.make_buffer("buffer2", 4, [0, 1]),
         ]
-        self.verify_layout(buffers, {(0, None, None), (None, None, 0)}, alignment=ALIGNMENT)
+        self.verify_layout(
+            buffers, {(0, None, None), (None, None, 0)}, alignment=ALIGNMENT
+        )
 
     def test_alignment_enforced(self):
         # Each buffer is placed at the next alignment boundary.
@@ -840,7 +842,7 @@ class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
 
 class TestImanishiXuLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
     solver_class = ImanishiXuLayoutSolver
-    
+
     def test_largest_buffer_evicted_when_full(self):
         # unlike other solvers, imanishi xu finds the optimal solution
         self.verify_layout(
@@ -852,6 +854,7 @@ class TestImanishiXuLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, Test
             [None, 0, 20],
             size=50,
         )
+
 
 class TestTopologicalSort(TestCase):
     """Tests for the Kahn's-algorithm sort that orders in-place chains.

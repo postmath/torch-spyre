@@ -32,6 +32,7 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
     SelfCalibratingCoolingSchedule,
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
+    ImanishiXuSolverWithBuffers,
     ReheatingSchedule,
     default_initial_temperature,
     peak_memory_load,
@@ -261,6 +262,63 @@ class ImanishiXuTests(TestCase):
             random=rnd.Random(seed),
         )
         return solver.plan_layout(buffers)
+
+    def test_solve_skips_annealing_when_initial_already_complete(self):
+        # The capacity fits all three buffers in any order, so the initial
+        # first_fit layout is already globally optimal. solve()'s up-front check
+        # must return before calibrating or running a single anneal.
+        buffers = [
+            LifetimeBoundBuffer("a", 64, [0, 1]),
+            LifetimeBoundBuffer("b", 64, [0, 1]),
+            LifetimeBoundBuffer("c", 64, [0, 1]),
+        ]
+        cap = 10_000
+        solver = ImanishiXuSolverWithBuffers(
+            buffers,
+            cap,
+            128,
+            initial="first_fit",
+            schedule=_short_schedule(),
+            random=rnd.Random(0),
+        )
+        self.assertTrue(solver._is_optimal())  # precondition: initial is complete
+        solver.solve()
+        # anneal() appends exactly one log per call, so an empty list proves no
+        # anneal ran.
+        self.assertEqual(solver.quality_logs, [])
+        solver.finalize()
+        self.assertTrue(all(b.address is not None for b in buffers))
+        _assert_feasible(buffers, cap)
+
+    def test_anneal_stops_once_all_buffers_allocated(self):
+        # Order [a, b, c] leaves c stacked above capacity (only 2 of 3 fit), but
+        # placing c before b lets it drop to address 0 so all three fit. From
+        # this order every buffer's best reinsertion reaches that complete
+        # layout, so the first annealing step lands it regardless of the RNG --
+        # and the cooling loop must then break immediately rather than run the
+        # schedule out.
+        buffers = [
+            LifetimeBoundBuffer("a", 64, [0, 1]),
+            LifetimeBoundBuffer("b", 64, [1, 4]),
+            LifetimeBoundBuffer("c", 64, [3, 4]),
+        ]
+        cap = 128
+        schedule = ExponentialCoolingSchedule(
+            t_initial=8.0, t_final=1.0, steps_per_epoch=2, epochs=4
+        )  # 8 cooling steps if never interrupted
+        solver = ImanishiXuSolverWithBuffers(
+            buffers,
+            cap,
+            1,
+            initial=[0, 1, 2],
+            schedule=schedule,
+            random=rnd.Random(0),
+        )
+        self.assertEqual(solver.plan.count_allocated(), 2)  # c does not yet fit
+        solver.anneal()
+        self.assertEqual(solver.plan.count_allocated(), 3)  # reached completeness
+        # Broke after the first iteration instead of running all 8 steps.
+        self.assertEqual(len(solver.quality_logs[0]), 1)
 
     def test_finalized_layout_is_feasible(self):
         for seed in range(60):

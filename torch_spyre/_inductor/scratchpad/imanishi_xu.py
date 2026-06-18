@@ -574,7 +574,22 @@ class ImanishiXuSolverWithBuffers:
     def finalize(self) -> None:
         self.plan.finalize()
 
+    def _is_optimal(self) -> bool:
+        """True once every buffer is fully allocated below capacity.
+
+        Quality is then at its upper bound -- each buffer already contributes
+        its full :func:`buffer_quality`, so no rotation or swap can improve it
+        and the search can stop.
+        """
+        return self.plan.count_allocated() == len(self.buffers)
+
     def solve(self) -> None:
+        # If the initial layout already fits every buffer it is globally
+        # optimal, so skip calibration and annealing outright. (Once annealing
+        # is under way the inner loop's own check terminates it; this guard is
+        # only ever reached with the untouched initial plan.)
+        if self._is_optimal():
+            return
         self._calibrate_schedule()
         for _ in range(self.starts):
             self.anneal()
@@ -626,6 +641,11 @@ class ImanishiXuSolverWithBuffers:
             if quality > self.best_quality:
                 self.best_quality = quality
                 self.best_permutation = copy.copy(self.plan.permutation)
+
+            if self._is_optimal():
+                # All buffers fit: quality is maximal, so stop cooling early --
+                # the best layout above is this (globally optimal) one.
+                break
 
             temperature = self.schedule.update(move is not None)
 
