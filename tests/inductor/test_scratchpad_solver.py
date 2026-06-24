@@ -289,7 +289,7 @@ class BaseLayoutSolverTests:
                 self.make_buffer("b", 20, [0, 3]),
                 self.make_buffer("c", 30, [0, 3]),
             ],
-            [0, 10, None],
+            {(0, 10, None), (None, 0, 20)},
             size=50,
         )
 
