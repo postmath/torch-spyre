@@ -482,7 +482,7 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         self.starts = starts
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         solver = ImanishiXuSolverWithBuffers(
             buffers,
