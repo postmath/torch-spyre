@@ -14,8 +14,8 @@
 
 """Plot the layout for a fixed ordering of four buffers (no annealing).
 
-Lifetimes are half-open intervals: a buffer with start_time=s and end_time=e
-is live at ticks s, s+1, ..., e-1.
+Each buffer's ``uses`` list is the ticks at which it is accessed; here
+``[first, last]``, so it is live over the half-open range ``[first, last + 1)``.
 
 The identity ordering [B0, B1, B2, B3] stacks buffers by arrival and produces
 a peak height of 22.  Run::
@@ -36,10 +36,10 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
 from torch_spyre._inductor.scratchpad.utils import plot_buffers
 
 buffers = [
-    LifetimeBoundBuffer("B0", 8, 0, 2),
-    LifetimeBoundBuffer("B1", 4, 1, 5),
-    LifetimeBoundBuffer("B2", 2, 2, 6),
-    LifetimeBoundBuffer("B3", 8, 3, 6),
+    LifetimeBoundBuffer("B0", 8, [0, 1]),
+    LifetimeBoundBuffer("B1", 4, [1, 4]),
+    LifetimeBoundBuffer("B2", 2, [2, 5]),
+    LifetimeBoundBuffer("B3", 8, [3, 5]),
 ]
 
 solver = ImanishiXuSolverWithBuffers(

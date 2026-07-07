@@ -42,7 +42,7 @@ from torch_spyre._inductor.scratchpad.imanishi_xu import (
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
-from torch_spyre._inductor.scratchpad.utils import plot_buffers
+from torch_spyre._inductor.scratchpad.utils import plot_buffers, quality_plot
 
 
 def _random_buffer(
@@ -58,8 +58,9 @@ def _random_buffer(
     t_end = t_start + duration + 1
     size = random.randrange(size_range)
     size = max(1, math.isqrt(size * size_range))
-    # end_time is exclusive: live at ticks [t_start, t_end] inclusive.
-    return LifetimeBoundBuffer(name, size, t_start, t_end + 1)
+    # Live at ticks [t_start, t_end] inclusive; uses records the first and last.
+    uses = [t_start] if t_end == t_start else [t_start, t_end]
+    return LifetimeBoundBuffer(name, size, uses)
 
 
 random = rnd.Random(0)
@@ -94,6 +95,8 @@ solver.solve()
 solver.finalize()
 print(f"ImanishiXu quality: {solver.best_quality}/{total_size}")
 
-solver.quality_plot().savefig("random_buffers_quality.png", dpi=300)
+quality_plot(solver.quality_logs, solver.temperature_logs[0]).savefig(
+    "random_buffers_quality.png", dpi=300
+)
 plot_buffers(buffers, capacity).savefig("random_buffers_layout.png", dpi=300)
 print("Saved random_buffers_quality.png, random_buffers_layout.png")
