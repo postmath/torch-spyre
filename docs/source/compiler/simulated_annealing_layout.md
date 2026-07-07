@@ -59,25 +59,33 @@ maintained O(1)) at each, and accepts a move by the Metropolis criterion.
 
 *Achieves:* usable, self-calibrating annealing plus visualisation and examples. *How:* an
 acceptance-*responsive* `CoolingSchedule` interface — `reset()` returns the first temperature and
-`update(accepted)` the next (or `None` to stop), so a schedule can react to the run. Several
-implementations exist: `ExponentialCoolingSchedule` (fixed geometric cool-down),
-`CoolingScheduleFromPaper` (kept for comparison), `ReheatingSchedule` (finds the productive
-temperature from the acceptance rate, then warm-restarts a band around it), and
-`IterableCoolingSchedule`.
+`update(accepted, move_scale)` the next (or `None` to stop), so a schedule can react to the run. The
+annealer reports, after each step, both whether the step accepted a move and the *move scale* (mean
+`|Δquality|` over the reinsertion positions it probed, ignoring no-op positions). Implementations:
+`ExponentialCoolingSchedule` (fixed geometric cool-down), `CoolingScheduleFromPaper` (kept for
+comparison), and `SelfCalibratingReheatingSchedule` (the default, below).
 
-The **default is `AutoExponentialCoolingSchedule`** — geometric cooling whose **endpoints are
-calibrated to the instance** rather than hard-coded. The solver runs a short warm-up (random
-reinsertions on a throwaway copy), measures the typical `|Δquality|` of a move, and sets the start
-temperature to accept a mean-magnitude *worsening* move with probability ~0.8 and the end
-temperature with ~0.01, then cools geometrically. This transfers across problems of very different
-byte scales instead of relying on tuned constants (which would silently degenerate into a random
-walk or a greedy search on a differently scaled instance) — the choice favoured by other self-calibrating
-SA libraries, and the robust default while we lack representative example models. It is documented
-as a *reasonable, non-definitive* default to revisit (e.g. with an acceptance-targeting adaptive
-schedule) once we can benchmark on real workloads. Knobs: separate `warmup_steps` and `total_steps`;
-the warm-up defaults to a fraction of the budget; the budget is adaptive (`clamp(30·n, 500, 5000)`),
-so the n=100 example uses 3000 steps and nothing exceeds 5000. The compile path uses a seeded RNG,
-so layout planning is deterministic.
+The **default is `SelfCalibratingReheatingSchedule`** — it needs no tuning beyond the step budget.
+It sizes its temperatures to the instance **online** from the streamed move scale, locates the
+productive temperature, and spends the budget on **reheating cycles** around it. With
+`A = -ln(accept_hi)` and `B = -ln(accept_lo)` (~0.8 and ~0.01), each cycle cools geometrically from
+`center·delta` (accepts a mean-magnitude *worsening* move with probability `accept_hi`) down to
+`center/delta` (probability `accept_lo`), where `delta = sqrt(B/A)` fixes the band width and
+`center = d_hat/sqrt(A·B)` tracks the move scale as an EMA (`d_hat`). `center` is re-derived from
+`d_hat` **every step**, so the band drifts down (or re-expands) with the landscape *within* a cycle,
+not only at its boundaries — the EMA horizon is `cycle_len / horizons_per_cycle` (`H`, default 2), so
+a stale band never persists for a large fraction of a cycle. `cycles = 1` degenerates to a single
+tracked cool. Before the first move scale is known, `center` is seeded from the
+peak-load estimate placed at the band top — a single, best-tracked step before the data snaps it
+onto the right scale. Sizing temperatures from the data (rather than tuned constants that would
+silently degenerate into a random walk or a greedy search on a differently scaled instance) is the
+robust default while we lack representative example models; it is documented as a *reasonable,
+non-definitive* default — two unvalidated bets (reheating beats a single long cool; online learning
+beats a pre-committed warm-up), both bounded by best-seen tracking so they can waste budget but never
+worsen the result — to revisit once we can benchmark on real workloads. Knobs: `total_steps`,
+`cycles` (default 4), and `horizons_per_cycle` (default 2, sets the center-tracking EMA horizon);
+the budget is adaptive (`clamp(30·n, 500, 5000)`), so the n=100 example uses 3000 steps and nothing
+exceeds 5000. The compile path uses a seeded RNG, so layout planning is deterministic.
 
 ### 4. Composition refactor + copy-vs-swap study
 

@@ -44,7 +44,6 @@
 import math
 import copy
 from abc import ABC, abstractmethod
-from collections import deque
 from typing import Literal, Optional, TypeAlias, override
 import random as rnd
 from heapq import heappush, heappop
@@ -89,11 +88,14 @@ class CoolingSchedule(ABC):
     """A *responsive* temperature controller for simulated annealing.
 
     Unlike a blind temperature iterator, after every step the annealer reports
-    whether the step accepted a move, so a schedule may adapt -- e.g. detect a
-    stall and reheat. :meth:`reset` begins a fresh anneal and returns the first
-    temperature; :meth:`update` consumes the latest step's acceptance and
-    returns the next temperature, or ``None`` to stop. ``reset`` must fully
-    reinitialize transient state (so a schedule can be reused across anneals).
+    both whether the step accepted a move and the *move scale* -- the mean
+    ``|Δquality|`` over the reinsertion positions it probed (ignoring no-op
+    positions) -- so a schedule may adapt: detect a stall, reheat, or size its
+    temperatures to the instance's move magnitudes online. :meth:`reset` begins
+    a fresh anneal and returns the first temperature; :meth:`update` consumes the
+    latest step's acceptance and move scale and returns the next temperature, or
+    ``None`` to stop. ``reset`` must fully reinitialize transient state (so a
+    schedule can be reused across anneals).
     """
 
     def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
@@ -106,22 +108,10 @@ class CoolingSchedule(ABC):
         """Reinitialize and return the first temperature (None for no steps)."""
 
     @abstractmethod
-    def update(self, accepted: bool) -> Optional[float]:
-        """Return the next temperature given the last step's acceptance, or None
-        to stop."""
-
-
-class Calibratable(ABC):
-    def warmup_steps_requested(self) -> int:
-        """How many warm-up moves the solver should sample (on a throwaway plan
-        copy) to calibrate this schedule. Default 0 -- no calibration needed."""
-        return 0
-
-    def calibrate(self, abs_quality_deltas: list[float]) -> None:
-        """Calibration hook paired with :meth:`warmup_steps_requested`. The
-        solver runs that many random moves and passes their absolute quality
-        deltas here, so a schedule may size its temperatures to the instance's
-        move scale before :meth:`reset` is first called. Default: no-op."""
+    def update(self, accepted: bool, move_scale: float) -> Optional[float]:
+        """Return the next temperature given the last step's acceptance and move
+        scale (mean ``|Δquality|`` over probed reinsertions, ``0.0`` if none
+        changed quality), or None to stop."""
 
 
 class ExponentialCoolingSchedule(CoolingSchedule):
@@ -152,7 +142,7 @@ class ExponentialCoolingSchedule(CoolingSchedule):
         return self._t
 
     @override
-    def update(self, accepted: bool) -> Optional[float]:
+    def update(self, accepted: bool, move_scale: float) -> Optional[float]:
         self._i += 1
         if self._i >= self.steps_per_epoch * self.epochs:
             return None
@@ -161,36 +151,62 @@ class ExponentialCoolingSchedule(CoolingSchedule):
         return self._t
 
 
-class SelfCalibratingCoolingSchedule(CoolingSchedule, Calibratable):
-    """Geometric cooling whose start/end temperatures are auto-calibrated to the
-    instance from a short warm-up. This is the default schedule.
+class SelfCalibratingReheatingSchedule(CoolingSchedule):
+    """Self-calibrating simulated-annealing schedule with reheating cycles.
 
-    NOTE: this is **not** claimed to be optimal or well-tuned -- it is a
-    reasonable, self-calibrating default for the situation where we do *not* yet
-    have representative example models to tune against. It pairs the universal SA
-    cooling law (a fixed-length geometric cool-down) with temperatures sized from
-    the data, so the same schedule transfers across problems of very different
-    byte scales instead of relying on hand-picked constants (which would silently
-    degenerate into a random walk or a greedy search on a differently-scaled
-    instance). Expect to revisit it -- retune the budget, or move to an
-    acceptance-targeting adaptive schedule -- once we can benchmark on real
-    workloads.
+    This is the default schedule. It needs no tuning beyond the step budget: it
+    sizes its temperatures to the instance online from the move scale the
+    annealer streams back, locates the productive temperature, and spends the
+    budget on reheating cycles around it -- concentrating moves where they are
+    useful but not frozen, rather than cooling monotonically once.
 
-    Calibration: the solver samples ``warmup_steps`` random reinsertions on a
-    throwaway ``plan.copy()`` and passes their ``|Δquality|`` to
-    :meth:`calibrate`. With ``d`` = their mean (over moves that change quality),
-    the start temperature accepts a mean-magnitude *worsening* move with
-    probability ``accept_hi`` and the end temperature with probability
-    ``accept_lo`` -- i.e. ``t0 = d / -ln(accept_hi)`` and
-    ``t_end = d / -ln(accept_lo)`` -- so the run begins exploratory and ends
-    near-greedy. Cooling is then geometric from ``t0`` to ``t_end`` over
-    ``total_steps``.
+    NOTE: like its predecessor this is a *reasonable* self-calibrating default,
+    not a tuned or provably-good one -- we do not yet have representative example
+    models to benchmark against. Two bets are unvalidated for our landscape:
+    that reheating beats a single long cool, and that learning the move scale
+    online beats a pre-committed warm-up. Both are bounded by the solver's
+    best-seen tracking, so they can waste budget but never worsen the result.
+    Expect to revisit ``cycles`` and the acceptance band once we can benchmark.
+
+    Temperature scale (self-calibration). With ``A = -ln(accept_hi)`` and
+    ``B = -ln(accept_lo)``, a band centered on temperature ``center`` accepts a
+    mean-magnitude *worsening* move with probability ``accept_hi`` at its top
+    ``center * delta`` and ``accept_lo`` at its bottom ``center / delta``, where::
+
+        delta  = sqrt(B / A)              # band half-width, scale-independent
+        center = d_hat / sqrt(A * B)      # productive temperature
+
+    ``d_hat`` is an exponential moving average of the streamed move scale (mean
+    ``|Δquality|`` over probed reinsertions), so ``center`` tracks the move scale
+    as the layout improves and the landscape flattens.
+
+    Bootstrap. Before any move scale is known, ``center`` is seeded from the
+    peak-load estimate (:func:`default_initial_temperature`), placed at the band
+    top. That estimate is in bytes rather than quality units, so it is only a
+    rough magnitude -- but it governs a single step before the first real
+    samples snap ``center`` onto the data scale, and best-seen tracking absorbs
+    that step regardless.
+
+    Reheating. The budget is split into ``cycles`` equal cycles (the last
+    absorbing any remainder). Each cools geometrically from ``center * delta``
+    down to ``center / delta``. ``center`` is recomputed from ``d_hat`` *every
+    step*, so the band drifts downward (or re-expands) with the landscape
+    continuously rather than jumping only at cycle boundaries -- which matters
+    most when cycles are long (and for ``cycles = 1``, a single tracked cool,
+    the only case where the boundary-only variant never re-centered at all).
+    The EMA horizon is ``cycle_len / horizons_per_cycle``: with the default
+    ``horizons_per_cycle = 2`` the center lags the move scale by about half a
+    cycle, so a stale band never persists for a large fraction of a cycle.
 
     Budget knobs:
-        total_steps: the annealing budget. ``None`` -> adaptive,
-            ``clamp(steps_per_buffer * n, min_steps, max_steps)``.
-        warmup_steps: number of calibration moves (extra, cheap work).
-            ``None`` -> ``warmup_fraction`` of ``total_steps``.
+        total_steps: the annealing budget (temperatures emitted). ``None`` ->
+            adaptive, ``clamp(steps_per_buffer * n, min_steps, max_steps)``.
+        cycles: number of reheating cycles.
+        horizons_per_cycle: EMA horizons per cycle (``H`` in the design notes);
+            the move-scale EMA horizon is ``cycle_len / horizons_per_cycle``, so
+            larger values track the landscape faster (at the cost of more noise
+            and a stronger pull toward greedy cooling). Guessed default pending
+            benchmarks, like ``cycles``.
         max_steps: hard cap on the adaptive budget (default 5000, keeping the
             n=100 random-buffer example bounded).
     """
@@ -199,8 +215,8 @@ class SelfCalibratingCoolingSchedule(CoolingSchedule, Calibratable):
         self,
         *,
         total_steps: Optional[int] = None,
-        warmup_steps: Optional[int] = None,
-        warmup_fraction: float = 0.1,
+        cycles: int = 4,
+        horizons_per_cycle: float = 2.0,
         steps_per_buffer: int = 30,
         min_steps: int = 500,
         max_steps: int = 5000,
@@ -209,20 +225,30 @@ class SelfCalibratingCoolingSchedule(CoolingSchedule, Calibratable):
     ):
         if not 0.0 < accept_lo < accept_hi < 1.0:
             raise ValueError("need 0 < accept_lo < accept_hi < 1")
-        if not 0.0 < warmup_fraction <= 1.0:
-            raise ValueError("warmup_fraction must be in (0, 1]")
+        if cycles < 1:
+            raise ValueError("cycles must be >= 1")
+        if horizons_per_cycle <= 0.0:
+            raise ValueError("horizons_per_cycle must be > 0")
         self._total_steps = total_steps
-        self._warmup_steps = warmup_steps
-        self.warmup_fraction = warmup_fraction
+        self.cycles = cycles
+        self.horizons_per_cycle = horizons_per_cycle
         self.steps_per_buffer = steps_per_buffer
         self.min_steps = min_steps
         self.max_steps = max_steps
         self.accept_hi = accept_hi
         self.accept_lo = accept_lo
-        # Sized in set_buffers; the geometric cooler is built in calibrate.
+        # The reheat band is fixed by the two acceptance targets alone: a factor
+        # `delta` above/below the center, with `sqrt(A*B)` converting the move
+        # scale into the center temperature. Both are scale-independent.
+        a = -math.log(accept_hi)
+        b = -math.log(accept_lo)
+        self._rt_ab = math.sqrt(a * b)
+        self._delta = math.sqrt(b / a)
+        # Sized in set_buffers (needs the buffer count and the peak load); _cycle_len
+        # == 0 marks "not yet sized" so reset() can refuse to run uncalibrated.
         self.total_steps = total_steps or 0
-        self.warmup_steps = warmup_steps or 0
-        self._geom: Optional[ExponentialCoolingSchedule] = None
+        self._cycle_len = 0
+        self._seed_center = 1.0
 
     @override
     def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
@@ -233,45 +259,73 @@ class SelfCalibratingCoolingSchedule(CoolingSchedule, Calibratable):
             )
         else:
             self.total_steps = max(1, self._total_steps)
-        if self._warmup_steps is None:
-            self.warmup_steps = max(1, round(self.warmup_fraction * self.total_steps))
-        else:
-            self.warmup_steps = self._warmup_steps
-
-    @override
-    def warmup_steps_requested(self) -> int:
-        return self.warmup_steps
-
-    @override
-    def calibrate(self, abs_quality_deltas: list[float]) -> None:
-        nonzero = [d for d in abs_quality_deltas if d > 0]
-        if nonzero:
-            d = sum(nonzero) / len(nonzero)
-            t0 = d / -math.log(self.accept_hi)
-            t_end = d / -math.log(self.accept_lo)
-        else:
-            # No sampled move changed quality (degenerate instance): every
-            # positive temperature behaves the same near-greedily, so pick 1.0
-            # to avoid a zero temperature (the acceptance test divides by it).
-            t0 = t_end = 1.0
-        self._geom = ExponentialCoolingSchedule(
-            t_initial=t0, t_final=t_end, steps_per_epoch=1, epochs=self.total_steps
-        )
+        self._cycle_len = max(1, self.total_steps // self.cycles)
+        # Cool by a factor delta^2 across one cycle (band top to band bottom).
+        self._alpha = self._delta ** (-2.0 / self._cycle_len)
+        # Move-scale EMA horizon of cycle_len / horizons_per_cycle steps, so the
+        # center (recomputed every step) lags the landscape by that fraction of a
+        # cycle. Clamped to a valid EMA rate for short cycles (where the ratio can
+        # reach or exceed 1); there it degrades to "center = latest scale".
+        self._ema_beta = min(1.0, self.horizons_per_cycle / self._cycle_len)
+        # Average this many nonzero samples before snapping center off the seed
+        # (a cheap, low-variance bootstrap; at least one).
+        self._snap_after = min(self._cycle_len // 4, 20) or 1
+        # Seed center so the peak-load estimate lands at the band top.
+        self._seed_center = default_initial_temperature(buffers) / self._delta
 
     @override
     def reset(self) -> Optional[float]:
-        if self._geom is None:
+        if self._cycle_len == 0:
             raise ValueError(
-                "AutoExponentialCoolingSchedule must be calibrated before use; "
-                "run it through ImanishiXuSolverWithBuffers, which samples the "
-                "warm-up moves and calls calibrate()."
+                "SelfCalibratingReheatingSchedule must be given buffers before "
+                "use; run it through ImanishiXuSolverWithBuffers, or call "
+                "set_buffers() first."
             )
-        return self._geom.reset()
+        self._i = 0
+        self._s = 0
+        self._cycle = 0
+        self._center = self._seed_center
+        self._d_hat: Optional[float] = None
+        self._sample_sum = 0.0
+        self._n_samples = 0
+        return self._temperature()
+
+    def _temperature(self) -> float:
+        # Position s within the cycle: s == 0 is the band top (center*delta),
+        # cooling by alpha each step toward the band bottom (center/delta).
+        return self._center * self._delta * self._alpha**self._s
 
     @override
-    def update(self, accepted: bool) -> Optional[float]:
-        assert self._geom is not None
-        return self._geom.update(accepted)
+    def update(self, accepted: bool, move_scale: float) -> Optional[float]:
+        # Track the move scale, ignoring no-op reinsertions (move_scale == 0):
+        # they dominate the sample and would collapse the center into a greedy
+        # search. Before the first snap, average a few samples; after it, EMA.
+        if move_scale > 0.0:
+            if self._d_hat is None:
+                self._sample_sum += move_scale
+                self._n_samples += 1
+                if self._n_samples >= self._snap_after:
+                    self._d_hat = self._sample_sum / self._n_samples
+            else:
+                self._d_hat += self._ema_beta * (move_scale - self._d_hat)
+        # Re-center from the current move scale every step, so the band tracks
+        # the landscape continuously within a cycle rather than only at its
+        # boundaries. Until the first snap ``d_hat`` is None and center stays at
+        # the peak-load seed.
+        if self._d_hat is not None:
+            self._center = self._d_hat / self._rt_ab
+
+        self._i += 1
+        if self._i >= self.total_steps:
+            return None
+        self._s += 1
+        # Cycle boundary: restart the cool at the band top. The last cycle
+        # absorbs the budget remainder. (Center already tracks every step, so the
+        # boundary only restarts the carrier phase.)
+        if self._s >= self._cycle_len and self._cycle < self.cycles - 1:
+            self._cycle += 1
+            self._s = 0
+        return self._temperature()
 
 
 class CoolingScheduleFromPaper(CoolingSchedule):
@@ -301,7 +355,7 @@ class CoolingScheduleFromPaper(CoolingSchedule):
         return math.exp(self.log_tau_s)
 
     @override
-    def update(self, accepted: bool) -> Optional[float]:
+    def update(self, accepted: bool, move_scale: float) -> Optional[float]:
         self._i += 1
         if self._i >= self.n:
             return None
@@ -312,120 +366,6 @@ class CoolingScheduleFromPaper(CoolingSchedule):
         return math.exp(
             (self.log_tau_e - self.log_tau_s) * self._i / self.n + self.log_tau_s
         )
-
-
-class ReheatingSchedule(CoolingSchedule):
-    """Locate the productive ("critical") temperature, then warm-restart around
-    it.
-
-    Phase 1 (cool): start at ``t0`` and multiply by ``alpha`` every step,
-    tracking the acceptance rate over a sliding window of the last ``window``
-    steps. When that rate first drops below ``stall_rate`` (the chain has
-    frozen at the current temperature), record that temperature as ``T1``.
-
-    ``t0`` defaults to the peak-load estimate (:func:`default_initial_temperature`)
-    when run through a solver: leave it ``None`` and the solver fills it in via
-    :meth:`set_buffers`. Pass ``t0`` explicitly to override.
-
-    Phase 2 (reheat): perform ``restarts`` cycles, each cooling by ``alpha``
-    from ``T1 * delta`` down to ``T1 / delta`` -- a fixed band around the
-    critical temperature -- then stop. This concentrates the budget where moves
-    are useful but not frozen, rather than re-cooling from a high temperature.
-
-    The acceptance signal makes phase 1 adaptive; the band cycling is fixed.
-    A cycle is ``2 * ln(delta) / ln(1/alpha)`` steps, so a run is roughly
-    ``len(phase 1) + restarts * cycle_length`` steps.
-    """
-
-    def __init__(
-        self,
-        *,
-        t0: Optional[float] = None,
-        alpha: float,
-        window: int,
-        stall_rate: float,
-        delta: float,
-        restarts: int,
-        min_temp: Optional[float] = None,
-    ):
-        if not 0.0 < alpha < 1.0:
-            raise ValueError("alpha must be in (0, 1)")
-        if delta <= 1.0:
-            raise ValueError("delta must be > 1")
-        if window < 1:
-            raise ValueError("window must be >= 1")
-        if not 0.0 <= stall_rate <= 1.0:
-            raise ValueError("stall_rate must be in [0, 1]")
-        if restarts < 0:
-            raise ValueError("restarts must be >= 0")
-        # t0/min_temp may be None until set_buffers() derives them from the peak
-        # load. An explicit t0 is never overridden.
-        self._explicit_t0 = t0
-        self._explicit_min_temp = min_temp
-        self.t0 = t0
-        self.alpha = alpha
-        self.window = window
-        self.stall_rate = stall_rate
-        self.delta = delta
-        self.restarts = restarts
-
-    @override
-    def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
-        if self._explicit_t0 is None:
-            self.t0 = default_initial_temperature(buffers)
-
-    @override
-    def reset(self) -> Optional[float]:
-        if self.t0 is None:
-            raise ValueError(
-                "ReheatingSchedule needs t0; pass it explicitly or run via a "
-                "solver, which derives it from the buffers via set_buffers()"
-            )
-        # Safety floor: cooling reaches zero acceptance eventually, but guard
-        # against never stalling (e.g. stall_rate == 0).
-        self._min_temp = (
-            self._explicit_min_temp
-            if self._explicit_min_temp is not None
-            else self.t0 * 1e-12
-        )
-        self._phase = "cool"
-        self._t = self.t0
-        self._recent: deque[bool] = deque()
-        self._accepts = 0
-        self._t1: Optional[float] = None
-        self._cycles_done = 0
-        return self._t
-
-    @override
-    def update(self, accepted: bool) -> Optional[float]:
-        if self._phase == "cool":
-            self._recent.append(accepted)
-            self._accepts += int(accepted)
-            if len(self._recent) > self.window:
-                self._accepts -= int(self._recent.popleft())
-            stalled = (
-                len(self._recent) == self.window
-                and self._accepts / self.window < self.stall_rate
-            )
-            if stalled or self._t <= self._min_temp:
-                self._t1 = self._t  # critical temperature
-                if self.restarts <= 0:
-                    return None
-                self._phase = "reheat"
-                self._t = self._t1 * self.delta
-                return self._t
-            self._t *= self.alpha
-            return self._t
-
-        # reheat: cool within the band, cycling `restarts` times.
-        assert self._t1 is not None
-        self._t *= self.alpha
-        if self._t <= self._t1 / self.delta:
-            self._cycles_done += 1
-            if self._cycles_done >= self.restarts:
-                return None
-            self._t = self._t1 * self.delta  # next cycle
-        return self._t
 
 
 class SolverToPermutation:
@@ -473,13 +413,11 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         initial: SolverInitialOption = "first_fit",
         schedule: SolverScheduleOption = "auto",
         random: Optional[rnd.Random] = None,
-        starts: int = 1,
     ):
         super().__init__(size, alignment)
         self.initial = initial
         self.schedule = schedule
         self.random = random
-        self.starts = starts
 
     def plan_layout(
         self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
@@ -491,7 +429,6 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
             initial=self.initial,
             schedule=self.schedule,
             random=self.random,
-            starts=self.starts,
         )
         solver.solve()
         solver.finalize()
@@ -504,8 +441,7 @@ class ImanishiXuSolverWithBuffers:
     The layout is held as a *member* (``self.plan``), not a base class. This lets
     each reinsertion sweep run on a throwaway ``plan.copy()`` while the live plan
     only ever performs the single rotation that is actually accepted (and the
-    cleanup swaps) -- so the live layout is never churned through a full sweep
-       initial: 'list[int] | Literal["first_fit", "best_fit", "greedy"] | MemoryPlanSolver' = "first_fit",
+    cleanup swaps) -- so the live layout is never churned through a full sweep.
     """
 
     def __init__(
@@ -517,7 +453,6 @@ class ImanishiXuSolverWithBuffers:
         initial: SolverInitialOption = "first_fit",
         schedule: SolverScheduleOption = "auto",
         random: Optional[rnd.Random] = None,
-        starts: int = 1,
     ):
         if isinstance(initial, list):
             if sorted(initial) != list(range(len(buffers))):
@@ -541,7 +476,6 @@ class ImanishiXuSolverWithBuffers:
         self.size = size
         self.alignment = alignment
         self.plan = PermutationBasedLayoutSolver(buffers, self.initial, size, alignment)
-        self.starts = starts
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
         self.best_quality = self.plan.quality()
@@ -550,7 +484,7 @@ class ImanishiXuSolverWithBuffers:
         if isinstance(schedule, str):
             self.schedule: CoolingSchedule
             if schedule == "auto":
-                self.schedule = SelfCalibratingCoolingSchedule()
+                self.schedule = SelfCalibratingReheatingSchedule()
             elif schedule == "from_paper":
                 self.schedule = CoolingScheduleFromPaper()
             else:
@@ -585,14 +519,12 @@ class ImanishiXuSolverWithBuffers:
 
     def solve(self) -> None:
         # If the initial layout already fits every buffer it is globally
-        # optimal, so skip calibration and annealing outright. (Once annealing
-        # is under way the inner loop's own check terminates it; this guard is
-        # only ever reached with the untouched initial plan.)
+        # optimal, so skip annealing outright. (Once annealing is under way the
+        # inner loop's own check terminates it; this guard is only ever reached
+        # with the untouched initial plan.)
         if self._is_optimal():
             return
-        self._calibrate_schedule()
-        for _ in range(self.starts):
-            self.anneal()
+        self.anneal()
         # Commit the best permutation seen, so finalize() writes it rather than
         # whatever state annealing happened to end in.
         if self.plan.permutation != self.best_permutation:
@@ -600,38 +532,13 @@ class ImanishiXuSolverWithBuffers:
                 self.buffers, list(self.best_permutation), self.size, self.alignment
             )
 
-    def _calibrate_schedule(self) -> None:
-        """If the schedule asks for a warm-up, sample that many random moves on a
-        throwaway plan copy and hand it their absolute quality deltas, so it can
-        size its temperatures to this instance's move scale. The live plan is
-        untouched (the warm-up walks the copy)."""
-        if not isinstance(self.schedule, Calibratable):
-            return
-        k = self.schedule.warmup_steps_requested()
-        if k <= 0:
-            return
-        n = len(self.buffers)
-        deltas: list[float] = []
-        if n >= 2:  # with <2 buffers there is no non-trivial move to sample
-            probe = self.plan.copy()
-            for _ in range(k):
-                i = self.random.randrange(n)
-                j = self.random.randrange(n)
-                while j == i:
-                    j = self.random.randrange(n)
-                # rotate() returns the quality change; its magnitude is the move
-                # scale we want (a random reinsertion stands in for the real
-                # annealing move for calibration purposes).
-                deltas.append(abs(probe.rotate(i, j)))
-        self.schedule.calibrate(deltas)
-
     def anneal(self) -> None:
         quality_log: list[float] = []
         temperature_log: list[float] = []
 
         temperature = self.schedule.reset()
         while temperature is not None:
-            move = self.annealing_step_rotate(temperature)
+            move, move_scale = self.annealing_step_rotate(temperature)
             if move is not None:
                 self.annealing_step_swap(*move)
 
@@ -647,7 +554,7 @@ class ImanishiXuSolverWithBuffers:
                 # the best layout above is this (globally optimal) one.
                 break
 
-            temperature = self.schedule.update(move is not None)
+            temperature = self.schedule.update(move is not None, move_scale)
 
         self.quality_logs.append(quality_log)
         self.temperature_logs.append(temperature_log)
@@ -698,10 +605,14 @@ class ImanishiXuSolverWithBuffers:
             else:
                 i += 1
 
-    def annealing_step_rotate(self, temperature: float) -> Optional[tuple[int, int]]:
-        """This is the inner loop of Algorithm 4 from the paper. The return value is (i, j) iff we
-        accepted a rotation inserting entry i of the permutation into position j != i; None if we
-        accepted no rotation. We never accept a trivial rotation.
+    def annealing_step_rotate(
+        self, temperature: float
+    ) -> tuple[Optional[tuple[int, int]], float]:
+        """This is the inner loop of Algorithm 4 from the paper. The first return value is (i, j) iff
+        we accepted a rotation inserting entry i of the permutation into position j != i; None if we
+        accepted no rotation. We never accept a trivial rotation. The second return value is the move
+        scale for this step -- the mean |Δquality| over the reinsertion positions probed, ignoring
+        no-op positions -- which the schedule uses to size its temperatures online.
 
         The reinsertion sweep runs on a throwaway copy of the plan; only the accepted rotation (if
         any) is applied to the live plan, so the live layout never has to sweep-and-restore."""
@@ -744,6 +655,14 @@ class ImanishiXuSolverWithBuffers:
             if p != i:
                 qualities[p] = probe.quality()
 
+        # Move scale streamed to the schedule: mean |Δquality| over the probed
+        # reinsertion positions, ignoring no-op positions (which dominate the
+        # set and would otherwise collapse the schedule's temperature). This is
+        # the online analogue of the peak-load seed, in the right quality units.
+        probed = [abs(q - quality_before) for q in qualities if q is not None]
+        nonzero = [d for d in probed if d > 0.0]
+        move_scale = sum(nonzero) / len(nonzero) if nonzero else 0.0
+
         insertion_points = [pos for pos, q in enumerate(qualities) if q is not None]
         insertion_points = sorted(
             insertion_points,
@@ -759,7 +678,7 @@ class ImanishiXuSolverWithBuffers:
             ):
                 # Apply only the accepted rotation to the live plan (others keep their order).
                 plan.rotate(i, j)
-                return (i, j)
+                return (i, j), move_scale
 
         # Nothing accepted: the live plan was never touched.
-        return None
+        return None, move_scale

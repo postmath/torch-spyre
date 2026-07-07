@@ -29,11 +29,10 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     buffer_quality,
 )
 from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    SelfCalibratingCoolingSchedule,
+    SelfCalibratingReheatingSchedule,
     ExponentialCoolingSchedule,
     ImanishiXuLayoutSolver,
     ImanishiXuSolverWithBuffers,
-    ReheatingSchedule,
     default_initial_temperature,
     peak_memory_load,
 )
@@ -70,6 +69,15 @@ def _short_schedule():
     )
 
 
+def _peak600_buffers():
+    """Two buffers live at the same time: peak load 600, so a schedule that has
+    not yet seen a move scale seeds its temperature at 600 / 300 = 2.0."""
+    return [
+        LifetimeBoundBuffer("a", 300, [0, 1]),
+        LifetimeBoundBuffer("b", 300, [0, 1]),
+    ]
+
+
 def _assert_feasible(buffers, capacity):
     """Committed buffers fit below capacity and never address-overlap a
     time-overlapping peer (an in-place pair may share its base address)."""
@@ -103,104 +111,128 @@ class CoolingScheduleTests(TestCase):
         traj = [s.reset()]
         t = traj[0]
         while t is not None:
-            t = s.update(True)  # ignores acceptance
+            t = s.update(True, 0.0)  # ignores acceptance and move scale
             traj.append(t)
         self.assertEqual(traj, [8.0, 8.0, 4.0, 4.0, 2.0, 2.0, 1.0, 1.0, None])
 
     def test_reheating_schedule_trajectory(self):
-        # Cool (halving) until the windowed acceptance rate drops below 0.5,
-        # locating T1, then cycle the band [T1/2, T1*2] twice.
-        s = ReheatingSchedule(
-            t0=100.0, alpha=0.5, window=4, stall_rate=0.5, delta=2.0, restarts=2
+        # accept_hi=e^-1, accept_lo=e^-4 -> A=1, B=4, so delta=2 and sqrt(A*B)=2.
+        # Seed temperature is 2.0 (peak load 600 / 300). The first move_scale=8
+        # snaps center to 8/2=4, giving band top 8 and cooling by alpha=0.5 per
+        # step. Four cycles of length 2 over 8 steps: cool 8->4, reheat to 8, ...
+        s = SelfCalibratingReheatingSchedule(
+            total_steps=8, cycles=4, accept_hi=math.exp(-1), accept_lo=math.exp(-4)
         )
-        scripted = [True, True, True, True, False, False, False]
-        traj = [s.reset()]
-        t = traj[0]
-        i = 0
+        s.set_buffers(_peak600_buffers())
+        temps = [s.reset()]
+        t = temps[0]
         while t is not None:
-            accepted = scripted[i] if i < len(scripted) else False
-            t = s.update(accepted)
-            traj.append(t)
-            i += 1
-        # Stall at T1=1.5625 (rate 0.25 < 0.5); reheat band top/bottom = 3.125 /
-        # 0.78125, two cycles.
-        self.assertEqual(
-            traj,
-            [
-                100.0,
-                50.0,
-                25.0,
-                12.5,
-                6.25,
-                3.125,
-                1.5625,
-                3.125,
-                1.5625,
-                3.125,
-                1.5625,
-                None,
-            ],
-        )
+            t = s.update(True, 8.0)
+            if t is not None:
+                temps.append(t)
+        expected = [2.0, 4.0, 8.0, 4.0, 8.0, 4.0, 8.0, 4.0]
+        self.assertEqual(len(temps), len(expected))
+        for got, want in zip(temps, expected):
+            self.assertAlmostEqual(got, want)
 
-    def test_reheating_no_restarts_stops_at_stall(self):
-        s = ReheatingSchedule(
-            t0=8.0, alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=0
+    def test_reheating_center_snaps_to_move_scale_not_seed(self):
+        # A huge peak-load seed governs only the first step: once real move
+        # scales arrive, center snaps to d / sqrt(A*B), independent of the seed.
+        s = SelfCalibratingReheatingSchedule(
+            total_steps=8, cycles=4, accept_hi=math.exp(-1), accept_lo=math.exp(-4)
         )
+        s.set_buffers([LifetimeBoundBuffer("big", 300_000, [0, 1])])  # seed 1000
+        first = s.reset()
+        self.assertAlmostEqual(first, 1000.0)  # the (huge) peak-load seed
+        # snap_after == 1: the first sample sets center = 8/2 = 4, and at step 1
+        # of a length-2 cycle the temperature equals center.
+        self.assertAlmostEqual(s.update(True, 8.0), 4.0)
+
+    def test_reheating_center_tracks_within_cycle(self):
+        # center is recomputed from d_hat every step (not only at cycle
+        # boundaries), so within one long cycle it follows a change in the move
+        # scale at the EMA rate beta = horizons_per_cycle / cycle_len. Here
+        # total_steps=10, cycles=1 -> cycle_len=10; horizons_per_cycle=5 ->
+        # beta=0.5; snap_after = min(10 // 4, 20) = 2.
+        s = SelfCalibratingReheatingSchedule(
+            total_steps=10,
+            cycles=1,
+            horizons_per_cycle=5,
+            accept_hi=math.exp(-1),  # A=1, B=4 -> sqrt(A*B)=2
+            accept_lo=math.exp(-4),
+        )
+        s.set_buffers(_peak600_buffers())
         s.reset()
-        self.assertIsNotNone(s.update(False))  # window not full yet
-        self.assertIsNone(s.update(False))  # window full, rate 0 < 0.5 -> stop
+        s.update(True, 10.0)  # first sample: not yet snapped, center at seed
+        s.update(True, 10.0)  # second sample -> snap: d_hat=10, center=10/2=5
+        self.assertAlmostEqual(s._center, 5.0)
+        # Move scale drops to 2; d_hat EMA-decays 10 -> 6 -> 4 -> 3 -> 2.5 at
+        # beta=0.5, and center = d_hat / 2 tracks it every step (not frozen for
+        # the rest of the cycle).
+        for want in (3.0, 2.0, 1.5, 1.25):
+            s.update(True, 2.0)
+            self.assertAlmostEqual(s._center, want)
 
-    def test_auto_schedule_adaptive_budget(self):
+    def test_reheating_no_snap_when_no_move_changes_quality(self):
+        # move_scale always 0 (degenerate instance): center never snaps off the
+        # peak-load seed, but the band still reheats and the budget is honored.
+        s = SelfCalibratingReheatingSchedule(
+            total_steps=4, cycles=2, accept_hi=math.exp(-1), accept_lo=math.exp(-4)
+        )
+        s.set_buffers(_peak600_buffers())  # seed 2.0, delta 2, alpha 0.5
+        temps = [s.reset()]
+        t = temps[0]
+        while t is not None:
+            t = s.update(False, 0.0)
+            if t is not None:
+                temps.append(t)
+        expected = [2.0, 1.0, 2.0, 1.0]  # cool 2->1, reheat to 2, repeat
+        self.assertEqual(len(temps), len(expected))
+        for got, want in zip(temps, expected):
+            self.assertAlmostEqual(got, want)
+
+    def test_reheating_adaptive_budget(self):
         def n_buffers(n):
             return [LifetimeBoundBuffer(f"b{i}", 1, [0]) for i in range(n)]
 
         # n=100 (the random-buffer example size): 30*n = 3000, under the 5000 cap.
-        s = SelfCalibratingCoolingSchedule()
+        s = SelfCalibratingReheatingSchedule(cycles=4)
         s.set_buffers(n_buffers(100))
         self.assertEqual(s.total_steps, 3000)
         self.assertLessEqual(s.total_steps, 5000)  # the explicit budget ceiling
-        self.assertEqual(s.warmup_steps, 300)  # round(0.1 * total)
         # Large n is capped; tiny n hits the floor.
-        capped = SelfCalibratingCoolingSchedule()
+        capped = SelfCalibratingReheatingSchedule()
         capped.set_buffers(n_buffers(1000))
         self.assertEqual(capped.total_steps, 5000)
-        floored = SelfCalibratingCoolingSchedule()
+        floored = SelfCalibratingReheatingSchedule()
         floored.set_buffers(n_buffers(5))
         self.assertEqual(floored.total_steps, 500)
-        # Explicit overrides win.
-        ex = SelfCalibratingCoolingSchedule(total_steps=42, warmup_steps=7)
+        # Explicit budget wins.
+        ex = SelfCalibratingReheatingSchedule(total_steps=42)
         ex.set_buffers(n_buffers(100))
-        self.assertEqual((ex.total_steps, ex.warmup_steps), (42, 7))
+        self.assertEqual(ex.total_steps, 42)
 
-    def test_auto_schedule_calibration_endpoints(self):
-        s = SelfCalibratingCoolingSchedule(total_steps=4, accept_hi=0.8, accept_lo=0.01)
-        # mean over nonzero deltas = 20; t0/t_end target accept_hi/accept_lo.
-        s.calibrate([10.0, 20.0, 30.0, 0.0])
-        t0 = 20.0 / -math.log(0.8)
-        temps = []
-        t = s.reset()
-        while t is not None:
-            temps.append(t)
-            t = s.update(True)
-        self.assertEqual(len(temps), 4)  # total_steps temperatures, then stop
-        self.assertAlmostEqual(temps[0], t0)
-        self.assertTrue(all(temps[k] > temps[k + 1] for k in range(len(temps) - 1)))
+    def test_reheating_emits_exactly_total_steps(self):
+        # Cycle boundaries and the remainder-absorbing last cycle must still emit
+        # exactly total_steps temperatures, across a range of budget/cycle mixes.
+        for total_steps, cycles in [(20, 4), (17, 4), (7, 3), (5, 1), (10, 10), (3, 4)]:
+            s = SelfCalibratingReheatingSchedule(total_steps=total_steps, cycles=cycles)
+            s.set_buffers(_peak600_buffers())
+            count = 0
+            t = s.reset()
+            while t is not None:
+                count += 1
+                t = s.update(True, 5.0)
+            self.assertEqual(count, total_steps, (total_steps, cycles))
 
-    def test_auto_schedule_degenerate_deltas(self):
-        # No sampled move changed quality -> a safe (positive) flat temperature.
-        s = SelfCalibratingCoolingSchedule(total_steps=3)
-        s.calibrate([0.0, 0.0])
-        self.assertIsNotNone(s.reset())
-
-    def test_auto_schedule_uncalibrated_reset_errors(self):
-        s = SelfCalibratingCoolingSchedule(total_steps=10)
-        s.set_buffers([LifetimeBoundBuffer("a", 1, [0])])
+    def test_reheating_reset_without_buffers_errors(self):
+        s = SelfCalibratingReheatingSchedule(total_steps=10)
         with self.assertRaises(ValueError):
-            s.reset()  # never calibrated
+            s.reset()  # set_buffers() never called
 
     def test_default_schedule_is_auto_feasible_and_deterministic(self):
-        # The solver's default schedule is the auto-calibrated exponential; with
-        # the default (seeded) RNG, two runs of the same instance must agree.
+        # The solver's default schedule is the self-calibrating reheating one;
+        # with the default (seeded) RNG, two runs of the same instance must agree.
         for seed in range(15):
             rng = rnd.Random(seed)
             n = rng.randint(2, 8)
@@ -223,33 +255,6 @@ class CoolingScheduleTests(TestCase):
         ]
         self.assertEqual(peak_memory_load(buffers), 50)
         self.assertAlmostEqual(default_initial_temperature(buffers), 50 / 300.0)
-
-    def test_reheating_t0_derived_from_buffers(self):
-        buffers = [
-            LifetimeBoundBuffer("a", 10, [0, 1]),
-            LifetimeBoundBuffer("b", 20, [1, 2]),
-            LifetimeBoundBuffer("c", 30, [2, 3]),
-        ]
-        s = ReheatingSchedule(
-            alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
-        )
-        s.set_buffers(buffers)
-        self.assertAlmostEqual(s.t0, 50 / 300.0)
-        self.assertAlmostEqual(s.reset(), 50 / 300.0)
-
-    def test_reheating_explicit_t0_not_overridden(self):
-        s = ReheatingSchedule(
-            t0=99.0, alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
-        )
-        s.set_buffers([LifetimeBoundBuffer("a", 10, [0, 1])])
-        self.assertEqual(s.t0, 99.0)
-
-    def test_reheating_no_t0_errors(self):
-        s = ReheatingSchedule(
-            alpha=0.5, window=2, stall_rate=0.5, delta=2.0, restarts=1
-        )
-        with self.assertRaises(ValueError):
-            s.reset()
 
 
 class ImanishiXuTests(TestCase):
@@ -372,14 +377,9 @@ class ImanishiXuTests(TestCase):
                 copy.deepcopy(buffers), list(initial), cap, 128
             ).quality()
 
-            # t0 omitted: the solver derives it from the peak load.
-            schedule = ReheatingSchedule(
-                alpha=0.85,
-                window=15,
-                stall_rate=0.2,
-                delta=4.0,
-                restarts=3,
-            )
+            # Exercises the full streaming path: online move scale, snap off the
+            # peak-load seed, and reheating cycles.
+            schedule = SelfCalibratingReheatingSchedule(total_steps=200, cycles=3)
             solver = ImanishiXuLayoutSolver(
                 cap, 128, initial=initial, schedule=schedule, random=rnd.Random(seed)
             )

@@ -63,12 +63,14 @@ buffers = [
 
 CAPACITY = 120  # peak concurrent load; requires in-place reuse to fit all 17
 N_RUNS = 100
-N_STARTS = 10
 
 
 def _schedule() -> ExponentialCoolingSchedule:
+    # A single continuous cool. (This used to run 10 reset-to-hot "starts" of
+    # 150 steps each; that facility was removed, so the budget is one 1500-step
+    # cool instead.)
     return ExponentialCoolingSchedule(
-        t_initial=10.0, t_final=1.0, steps_per_epoch=1, epochs=150
+        t_initial=10.0, t_final=1.0, steps_per_epoch=1, epochs=1500
     )
 
 
@@ -85,17 +87,13 @@ for _ in range(N_RUNS):
         initial="first_fit",
         schedule=_schedule(),
         random=rng,
-        starts=N_STARTS,
     )
     solver.solve()
     all_logs.append([q for run in solver.quality_logs for q in run])
     last_solver = solver
 
 elapsed = time.perf_counter() - t0
-print(
-    f"{N_RUNS} runs × {N_STARTS} starts in {elapsed:.2f}s "
-    f"({elapsed / N_RUNS * 1000:.1f}ms/run)"
-)
+print(f"{N_RUNS} runs in {elapsed:.2f}s ({elapsed / N_RUNS * 1000:.1f}ms/run)")
 
 final_qualities = [log[-1] for log in all_logs]
 print(f"Final quality distribution (out of 17): {Counter(final_qualities)}")
