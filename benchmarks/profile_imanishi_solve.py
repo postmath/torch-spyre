@@ -56,7 +56,9 @@ def _random_buffer(name, size_range, time_range, random):
     t_end = t_start + duration + 1
     size = random.randrange(size_range)
     size = max(1, math.isqrt(size * size_range))
-    return LifetimeBoundBuffer(name, size, t_start, t_end + 1)
+    # Live at ticks [t_start, t_end] inclusive; uses records the first and last.
+    uses = [t_start] if t_end == t_start else [t_start, t_end]
+    return LifetimeBoundBuffer(name, size, uses)
 
 
 def build_solver():

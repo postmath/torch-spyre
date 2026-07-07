@@ -44,16 +44,16 @@ def make_buffers(rng, n, span_frac):
     for i in range(n):
         start = rng.randint(0, n)
         length = rng.randint(1, max_len)
-        buffers.append(
-            LifetimeBoundBuffer(f"b{i}", rng.randint(1, 4096), start, start + length)
-        )
+        # Half-open lifetime [start, start + length); uses records first and last.
+        uses = [start] if length == 1 else [start, start + length - 1]
+        buffers.append(LifetimeBoundBuffer(f"b{i}", rng.randint(1, 4096), uses))
     return buffers
 
 
 def overlap_rate(plan):
     perm = plan.permutation
     pairs = len(perm) - 1
-    live = sum(1 for i in range(pairs) if plan._overlaps(perm[i], perm[i + 1]))
+    live = sum(1 for i in range(pairs) if plan.overlaps(perm[i], perm[i + 1]))
     return live / max(1, pairs)
 
 
@@ -62,7 +62,7 @@ def find_positions(plan):
     perm = plan.permutation
     noop = ovlp = None
     for i in range(len(perm) - 1):
-        if plan._overlaps(perm[i], perm[i + 1]):
+        if plan.overlaps(perm[i], perm[i + 1]):
             ovlp = i if ovlp is None else ovlp
         else:
             noop = i if noop is None else noop

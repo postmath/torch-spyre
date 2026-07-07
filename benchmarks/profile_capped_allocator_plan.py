@@ -44,16 +44,23 @@ def make_buffers(rng, n):
         start = rng.randint(0, n)
         end = start + rng.randint(1, 8)
         size = rng.randint(1, 4096)
-        buffers.append(
-            LifetimeBoundBuffer(f"b{i}", size, start, end, in_place_parents=[])
-        )
+        # Half-open lifetime [start, end); uses records the first and last tick.
+        uses = [start] if end == start + 1 else [start, end - 1]
+        buffers.append(LifetimeBoundBuffer(f"b{i}", size, uses, in_place_parents=[]))
     for ci in range(1, n):
         if rng.random() < 0.25:
             pi = rng.randrange(max(0, ci - 12), ci)
             parent = buffers[pi]
             child = buffers[ci]
-            child.start_time = parent.end_time - 1
-            child.end_time = parent.end_time + rng.randint(0, 8)
+            # In-place child: start_time == parent.end_time - 1 (the in-place
+            # invariant parent.end_time == child.start_time + 1), ending a random
+            # bit later. start_time/end_time derive from uses, so set uses.
+            new_start = parent.end_time - 1
+            new_end = parent.end_time + rng.randint(0, 8)
+            if new_end == new_start + 1:
+                child.uses = [new_start]
+            else:
+                child.uses = [new_start, new_end - 1]
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
     return buffers
@@ -72,7 +79,7 @@ def overlapping_i(plan, rng, tries=30):
     perm = plan.permutation
     for _ in range(tries):
         i = rng.randrange(len(perm) - 1)
-        if plan._overlaps(perm[i], perm[i + 1]):
+        if plan.overlaps(perm[i], perm[i + 1]):
             return i
     return rng.randrange(len(perm) - 1)
 
@@ -84,7 +91,7 @@ def avg_swap_random(plan, rng, n_swaps):
     for _ in range(n_swaps):
         i = rng.randrange(len(plan.permutation) - 1)
         x, y = plan.permutation[i], plan.permutation[i + 1]
-        if not plan._overlaps(x, y):
+        if not plan.overlaps(x, y):
             noops += 1
         plan.swap(i)
     return (time.perf_counter() - t0) / n_swaps, noops / n_swaps
