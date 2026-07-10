@@ -1,0 +1,49 @@
+==============================================================================
+MULTI-INSTANCE BURST-SIZE SWEEP (noise characterization)
+n=40  ref_budget=7200  instances=5 (seeds 100..104)  per_magnitude=32  warm_seed=13
+==============================================================================
+  instance 0 (seed 100) ALL unwt/wtd: b=0=53%/61%  1n=82%/90%  2n=84%/92%  3n=89%/95%  5n=93%/98%  8n=94%/99%
+  instance 1 (seed 101) ALL unwt/wtd: b=0=56%/58%  1n=76%/83%  2n=78%/85%  3n=88%/95%  5n=92%/98%  8n=95%/99%
+  instance 2 (seed 102) ALL unwt/wtd: b=0=82%/89%  1n=94%/98%  2n=95%/99%  3n=95%/99%  5n=96%/99%  8n=97%/99%
+  instance 3 (seed 103) ALL unwt/wtd: b=0=68%/81%  1n=86%/95%  2n=87%/95%  3n=88%/96%  5n=90%/97%  8n=90%/97%
+  instance 4 (seed 104) ALL unwt/wtd: b=0=55%/57%  1n=88%/93%  2n=92%/96%  3n=93%/96%  5n=94%/97%  8n=97%/99%
+
+MEAN sign-agreement (unweighted) across 5 instances:
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10        59%        85%        88%        90%        92%        93%
+  0.25        63%        87%        88%        91%        91%        94%
+  0.50        74%        90%        90%        91%        95%        95%
+   ALL        63%        85%        87%        91%        93%        95%
+
+SPREAD across instances (min-max, unweighted):
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10    45%-82%    78%-91%    80%-95%    81%-98%    85%-99%   85%-100%
+  0.25    48%-84%    81%-96%    82%-95%    84%-97%    88%-96%    90%-96%
+  0.50    57%-89%    84%-95%    82%-95%    84%-95%    94%-96%    92%-97%
+   ALL    53%-82%    76%-94%    78%-95%    88%-95%    90%-96%    90%-97%
+
+MEAN STAKES-WEIGHTED sign-agreement across 5 instances:
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10        58%        88%        92%        94%        95%        96%
+  0.25        64%        95%        96%        97%        98%        99%
+  0.50        78%        97%        98%        98%        99%       100%
+   ALL        69%        92%        93%        96%        98%        99%
+
+SPREAD across instances (min-max, stakes-weighted):
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10    38%-90%    80%-96%    86%-97%    87%-99%   89%-100%   88%-100%
+  0.25    47%-92%   90%-100%    91%-99%   93%-100%    96%-99%    98%-99%
+  0.50    49%-98%    92%-99%   95%-100%    96%-99%   99%-100%   99%-100%
+   ALL    57%-89%    83%-98%    85%-99%    95%-99%    97%-99%    97%-99%
+
+MEAN Spearman(refined, Q*) across 5 instances:
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10      +0.16      +0.77      +0.85      +0.88      +0.90      +0.92
+  0.25      +0.27      +0.85      +0.87      +0.91      +0.93      +0.96
+  0.50      +0.52      +0.89      +0.90      +0.92      +0.97      +0.97
+   ALL      +0.29      +0.80      +0.84      +0.91      +0.95      +0.96
+
+  Read: a tight SPREAD (esp. the ALL row) means the estimate is stable.
+  If STAKES-WEIGHTED sits well above unweighted at a given burst, the
+  residual misrankings are low-stakes near-ties -- a wrong Metropolis call
+  there costs little, so a smaller burst is adequate in practice.
