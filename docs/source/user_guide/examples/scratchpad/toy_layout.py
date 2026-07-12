@@ -29,8 +29,10 @@ Writes ``toy_layout.png`` to the current directory.  Requires matplotlib.
 import torch  # noqa: F401
 
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
+from torch_spyre._inductor.scratchpad.cooling_schedules import (
     ExponentialCoolingSchedule,
+)
+from torch_spyre._inductor.scratchpad.imanishi_xu import (
     ImanishiXuSolverWithBuffers,
 )
 from torch_spyre._inductor.scratchpad.utils import plot_buffers

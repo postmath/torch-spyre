@@ -28,13 +28,15 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
     buffer_quality,
 )
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
+from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
     ExponentialCoolingSchedule,
-    ImanishiXuLayoutSolver,
-    ImanishiXuSolverWithBuffers,
     default_initial_temperature,
     peak_memory_load,
+)
+from torch_spyre._inductor.scratchpad.imanishi_xu import (
+    ImanishiXuLayoutSolver,
+    ImanishiXuSolverWithBuffers,
 )
 
 # Heavy randomized anneals over many seeds, larger problems and longer

@@ -31,6 +31,7 @@ import bisect
 import heapq
 import math
 
+from torch_spyre._inductor.scratchpad.contact_profile import Profile
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
@@ -45,145 +46,6 @@ def buffer_quality(buf: LifetimeBoundBuffer) -> float:
     ``(len(buf.uses) + (0 if buf.first_use_is_read else 0.5)) * buf.size``.
     """
     return (len(buf.uses) + (0.0 if buf.first_use_is_read else 0.5)) * buf.size
-
-
-# ===========================================================================
-# Contact-profile data structure
-# ===========================================================================
-
-
-def _coalesce_segments(
-    starts: list[int], labels: list[Optional[int]]
-) -> tuple[list[int], list[Optional[int]]]:
-    """Merge adjacent segments carrying equal labels. ``starts`` has length
-    ``len(labels) + 1``; segment ``i`` covers ``[starts[i], starts[i+1])``."""
-    out_starts = [starts[0]]
-    out_labels: list[Optional[int]] = []
-    for i, label in enumerate(labels):
-        if out_labels and out_labels[-1] == label:
-            out_starts[-1] = starts[i + 1]  # extend the previous segment
-        else:
-            out_labels.append(label)
-            out_starts.append(starts[i + 1])
-    return out_starts, out_labels
-
-
-class Profile:
-    """A step function from a half-open span ``[span_start, span_end)`` to labels
-    (each an ``Optional[int]``; ``None`` means "no neighbour here").
-
-    Stored as parallel lists: ``starts`` of length ``n + 1`` and ``labels`` of
-    length ``n``; segment ``i`` covers ``[starts[i], starts[i + 1])`` carrying
-    ``labels[i]``, with ``starts[-1] == span_end``.
-
-    Canonical form (every mutating operation restores it): ``starts`` strictly
-    increasing, and no two adjacent segments carry equal labels.
-    """
-
-    __slots__ = ("starts", "labels")
-
-    def __init__(self, starts: list[int], labels: list[Optional[int]]):
-        self.starts = starts
-        self.labels = labels
-
-    @classmethod
-    def uniform(cls, span_start: int, span_end: int, label: Optional[int]) -> "Profile":
-        """A single-segment profile over ``[span_start, span_end)``."""
-        assert span_start < span_end
-        return cls([span_start, span_end], [label])
-
-    @classmethod
-    def from_segments(cls, starts: list[int], labels: list[Optional[int]]) -> "Profile":
-        """Build a canonical profile from segments that tile the span (coalescing
-        adjacent equal labels)."""
-        assert len(starts) == len(labels) + 1 and len(labels) >= 1
-        return cls(*_coalesce_segments(starts, labels))
-
-    @property
-    def span_start(self) -> int:
-        return self.starts[0]
-
-    @property
-    def span_end(self) -> int:
-        return self.starts[-1]
-
-    def label_at(self, t: int) -> Optional[int]:
-        """The label of the segment containing column ``t`` (``t`` in span)."""
-        assert self.starts[0] <= t < self.starts[-1]
-        return self.labels[bisect.bisect_right(self.starts, t) - 1]
-
-    def segments(self, a: int, b: int) -> tuple[list[int], list[Optional[int]]]:
-        """The segments clipped to ``[a, b)`` as fresh lists (no aliasing): the
-        first segment's start is clamped to ``a`` and the last end to ``b``.
-        An empty range yields ``([a], [])``."""
-        assert self.starts[0] <= a <= b <= self.starts[-1]
-        if a == b:
-            return [a], []
-        out_starts = [a]
-        out_labels: list[Optional[int]] = []
-        i = bisect.bisect_right(self.starts, a) - 1
-        while self.starts[i] < b:
-            out_labels.append(self.labels[i])
-            out_starts.append(min(self.starts[i + 1], b))
-            i += 1
-        return out_starts, out_labels
-
-    def splice(
-        self, a: int, b: int, seg_starts: list[int], seg_labels: list[Optional[int]]
-    ) -> None:
-        """Replace the function on ``[a, b)`` with the given segments (which must
-        exactly tile ``[a, b)``), coalescing at both seams. No-op if ``a == b``."""
-        assert self.starts[0] <= a <= b <= self.starts[-1]
-        if a == b:
-            return
-        assert seg_starts[0] == a and seg_starts[-1] == b
-        left_s, left_l = self.segments(self.starts[0], a)
-        right_s, right_l = self.segments(b, self.starts[-1])
-        new_s = left_s[:-1] + list(seg_starts[:-1]) + right_s
-        new_l = left_l + list(seg_labels) + right_l
-        self.starts, self.labels = _coalesce_segments(new_s, new_l)
-
-    def relabel(self, a: int, b: int, mapping: dict) -> None:
-        """For every segment within ``[a, b)`` whose label is a key of
-        ``mapping``, replace it with ``mapping[label]`` (splitting straddling
-        segments at the boundaries); coalesce afterwards. No-op if ``a == b``."""
-        if a == b:
-            return
-        seg_s, seg_l = self.segments(a, b)
-        new_l = [mapping[label] if label in mapping else label for label in seg_l]
-        self.splice(a, b, seg_s, new_l)
-
-    def label_set(self) -> set:
-        """The set of labels appearing anywhere in the profile.
-
-        (Named ``label_set`` rather than ``labels`` because ``labels`` is the
-        segment-label list attribute.)"""
-        return set(self.labels)
-
-    def validate(self) -> None:
-        """Raise ``AssertionError`` if the canonical-form invariants are broken."""
-        assert len(self.starts) == len(self.labels) + 1, "length mismatch"
-        assert len(self.labels) >= 1, "profile must have at least one segment"
-        for i in range(len(self.starts) - 1):
-            assert self.starts[i] < self.starts[i + 1], "starts not strictly increasing"
-        for i in range(len(self.labels) - 1):
-            assert self.labels[i] != self.labels[i + 1], "adjacent labels equal"
-
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, Profile)
-            and self.starts == other.starts
-            and self.labels == other.labels
-        )
-
-    __hash__ = None  # type: ignore[assignment]
-
-    def __repr__(self) -> str:
-        segs = ", ".join(
-            f"[{self.starts[i]},{self.starts[i + 1]})={self.labels[i]}"
-            for i in range(len(self.labels))
-        )
-        return f"Profile({segs})"
 
 
 # ===========================================================================
@@ -690,12 +552,6 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         # so callers/tests can override it -- set it to 1 to force the fast path
         # on every rotation.
         self._rotate_remove_insert_threshold = max(2, n // 8)
-        # How the fast path updates the contact profiles after a move:
-        #   "patch"   -- incremental single-move splice (Stage 2; default), or
-        #   "rebuild" -- a full _build_profiles() from scratch (Stage 1).
-        # Both produce byte-identical profiles; "rebuild" is kept for
-        # measurement and as a safety net.
-        self._rotate_profile_mode = "patch"
         self._build_profiles()
 
     def _build_profiles(self) -> None:
@@ -1014,29 +870,23 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
 
         Edits the permutation and ``position`` index, recomputes all addresses
         in the new order (:meth:`_recompute_all_addresses`), then updates the
-        contact profiles -- either by an incremental single-move patch
-        (:meth:`_patch_profiles_for_move`, the default) or, when
-        ``_rotate_profile_mode == "rebuild"``, by a full rebuild. Returns the
-        quality delta.
+        contact profiles by an incremental single-move patch
+        (:meth:`_patch_profiles_for_move`). Returns the quality delta.
         """
         old_total = self.total_quality
         x = self.permutation[i]
-        if self._rotate_profile_mode == "patch":
-            # Capture x's pre-move contact profiles; the patch needs the old
-            # adjacency to stitch x's former neighbours back together. (Cheap
-            # shallow copies of the two step functions.)
-            old_below = Profile(
-                list(self.below_profile[x].starts), list(self.below_profile[x].labels)
-            )
-            old_above = Profile(
-                list(self.above_profile[x].starts), list(self.above_profile[x].labels)
-            )
+        # Capture x's pre-move contact profiles; the patch needs the old
+        # adjacency to stitch x's former neighbours back together. (Cheap
+        # shallow copies of the two step functions.)
+        old_below = Profile(
+            list(self.below_profile[x].starts), list(self.below_profile[x].labels)
+        )
+        old_above = Profile(
+            list(self.above_profile[x].starts), list(self.above_profile[x].labels)
+        )
         self._move_in_permutation(i, j)
         self._recompute_all_addresses()
-        if self._rotate_profile_mode == "rebuild":
-            self._build_profiles()
-        else:
-            self._patch_profiles_for_move(x, old_below, old_above)
+        self._patch_profiles_for_move(x, old_below, old_above)
         return self.total_quality - old_total
 
     def _move_in_permutation(self, i: int, j: int) -> None:
@@ -1161,7 +1011,12 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
     def contact_at(self, c: int, t: int) -> Optional[int] | tuple[int, int]:
         """What occupies the address slot directly below ``c`` at column ``t``,
         derived on demand from the order ``below_profile`` and
-        :attr:`inplace_reuse` (nothing extra is stored). Three outcomes:
+        :attr:`inplace_reuse` (nothing extra is stored).
+
+        Inspection/test-only: the placement hot path does not call this; it
+        inlines the same derivation over a buffer's own below-profile segments
+        in :meth:`_recompute_address`. Kept as a readable, single-column oracle
+        for tests and debugging. Three outcomes:
 
         - ``None`` -- nothing is below ``c`` at ``t`` (``c`` is on the floor).
         - ``int m`` -- a single buffer ``m`` is directly below ``c``; ``c`` rests
@@ -1220,10 +1075,9 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         clone._num_intervals = self._num_intervals
         clone._total_at = self._total_at
         clone._buf_intervals = self._buf_intervals
-        # Rotate-policy knobs (cheap scalars; carried so a clone rotates the
-        # same way as its source and tests can flip them on a clone).
+        # Rotate-policy knob (a cheap scalar; carried so a clone rotates the
+        # same way as its source and tests can flip it on a clone).
         clone._rotate_remove_insert_threshold = self._rotate_remove_insert_threshold
-        clone._rotate_profile_mode = self._rotate_profile_mode
         # Deep-copied dynamic state.
         clone.permutation = list(self.permutation)
         clone.addresses = list(self.addresses)
