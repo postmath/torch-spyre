@@ -34,10 +34,12 @@ import random as rnd
 import torch  # noqa: F401
 
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuSolverWithBuffers,
+from torch_spyre._inductor.scratchpad.cooling_schedules import (
     peak_memory_load,
     ExponentialCoolingSchedule,
+)
+from torch_spyre._inductor.scratchpad.imanishi_xu import (
+    ImanishiXuSolverWithBuffers,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,

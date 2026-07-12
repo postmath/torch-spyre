@@ -38,10 +38,13 @@ import torch  # noqa: F401  (importing torch_spyre without torch sometimes fails
 
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.scratchpad import permutation_layout as PL
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuSolverWithBuffers,
+from torch_spyre._inductor.scratchpad import contact_profile as CP
+from torch_spyre._inductor.scratchpad.cooling_schedules import (
     peak_memory_load,
     ExponentialCoolingSchedule,
+)
+from torch_spyre._inductor.scratchpad.imanishi_xu import (
+    ImanishiXuSolverWithBuffers,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
@@ -126,12 +129,12 @@ def line_level():
         BASE._in_place_pair,
         BASE.is_fully_allocated,
         BASE._align_up,
-        PL.Profile.splice,
-        PL.Profile.segments,
-        PL.Profile.relabel,
-        PL.Profile.label_at,
-        PL.Profile.label_set,
-        PL._coalesce_segments,
+        CP.Profile.splice,
+        CP.Profile.segments,
+        CP.Profile.relabel,
+        CP.Profile.label_at,
+        CP.Profile.label_set,
+        CP._coalesce_segments,
     ]
     lp = LineProfiler()
     for f in funcs:
