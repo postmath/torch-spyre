@@ -83,6 +83,10 @@ class FakeCoreDivisionBuffer:
     core_divisions: list[FakeCoreDivision]
     # {parent_name: [(parent_div_idx, this_div_idx), ...]} -- the slicing gate.
     cd_parent_matches: dict[str, list[tuple[int, int]]]
+    # Solver-written outputs (Plan §7.2 / §7.3 output contract). Left unset on
+    # load; the SA engine writes them during solve. ``address is None`` == spill.
+    chosen_division: Optional[int] = None
+    address: Optional[int] = None
 
     @property
     def residency_allowed(self) -> bool:
