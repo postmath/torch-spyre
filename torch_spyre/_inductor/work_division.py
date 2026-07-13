@@ -1069,6 +1069,33 @@ _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
 
 
+def _matmul_hbm_us(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    shared_weight: bool = False,
+) -> float:
+    """The HBM-traffic component (microseconds) of :func:`_matmul_split_cost`.
+
+    Factored out of the estimator so the joint co-optimization scorer can both
+    (a) subtract it to recover the pure node/compute term and (b) reproduce it
+    exactly in its memory term -- the ``hbm_us`` conservation check
+    (CO_OPTIMIZING_PLAN.md §6.5). Every input operand is broadcast to the cohort
+    of cores splitting the orthogonal dim; past ``_COHORT_LIMIT`` the broadcasts
+    contend for the shared link, so effective bandwidth falls off with cohort
+    size. Each axis is a ``(size, split)`` pair.
+    """
+    (B, _b), (M, m), (N, n), (K, _k) = b_axis, m_axis, n_axis, k_axis
+    weight_batches = 1 if shared_weight else B
+    bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
+    fanout_split = max(m, n) if shared_weight else n
+    cohort_penalty = max(
+        1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
+    )
+    return bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+
+
 def _matmul_split_cost(
     b_axis: tuple[int, int],
     m_axis: tuple[int, int],
@@ -1096,15 +1123,8 @@ def _matmul_split_cost(
     compute_us = (B * M * N * K / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
-    # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
-    # link, so effective bandwidth falls off linearly with cohort size.
-    weight_batches = 1 if shared_weight else B
-    bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
-    fanout_split = max(m, n) if shared_weight else n
-    cohort_penalty = max(
-        1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
-    )
-    hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    # orthogonal dim (see _matmul_hbm_us, shared with the co-optimization scorer).
+    hbm_us = _matmul_hbm_us(b_axis, m_axis, n_axis, k_axis, shared_weight)
 
     # PSUM: a K-split spreads the reduction over k cores, costing (k-1)
     # partial-sum hops. Charge each core's output tile rather than the whole
