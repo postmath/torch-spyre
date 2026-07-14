@@ -33,6 +33,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     ExponentialCoolingSchedule,
     default_initial_temperature,
     peak_memory_load,
+    _SINGLE_MOVE,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
@@ -167,13 +168,13 @@ class CoolingScheduleTests(TestCase):
         s.reset()
         s.update(True, 10.0)  # first sample: not yet snapped, center at seed
         s.update(True, 10.0)  # second sample -> snap: d_hat=10, center=10/2=5
-        self.assertAlmostEqual(s._center, 5.0)
+        self.assertAlmostEqual(s._center[_SINGLE_MOVE], 5.0)
         # Move scale drops to 2; d_hat EMA-decays 10 -> 6 -> 4 -> 3 -> 2.5 at
         # beta=0.5, and center = d_hat / 2 tracks it every step (not frozen for
         # the rest of the cycle).
         for want in (3.0, 2.0, 1.5, 1.25):
             s.update(True, 2.0)
-            self.assertAlmostEqual(s._center, want)
+            self.assertAlmostEqual(s._center[_SINGLE_MOVE], want)
 
     def test_reheating_no_snap_when_no_move_changes_quality(self):
         # move_scale always 0 (degenerate instance): center never snaps off the

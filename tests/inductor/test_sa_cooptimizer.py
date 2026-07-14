@@ -29,7 +29,11 @@ residency pressure (spills / eligibility toggles) is actually exercised.
 """
 
 import copy
+import json
 import math
+import os
+import subprocess
+import sys
 import unittest
 from unittest import TestCase
 
@@ -310,6 +314,135 @@ class RegionRecolorTest(TestCase):
             self.assertEqual(len(accepted), solver.moves_accepted["recolor"], tag)
             self.assertTrue(all(p > 1 for p in proposed), tag)
             self.assertLessEqual(Counter(accepted), Counter(proposed), tag)
+
+
+class ScheduleTest(TestCase):
+    """Plan §5 / §8.3: the reheating schedule + cycle-phase mix beats the crude
+    baseline, records per-move acceptance traces + within-group CVs, and stays
+    deterministic and >= baseline."""
+
+    def test_reheating_beats_crude_overall(self):
+        # Aggregate over the captures at a tight capacity: the reheating schedule
+        # must never do worse than the crude one (same seed, same budget), and do
+        # strictly better on at least one graph.
+        total_reheat = total_crude = 0
+        strictly_better = False
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
+            r.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            c = SaCoOptimizingSolver(cap, 128, seed=0, schedule="crude")
+            c.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            self.assertLessEqual(r.best_score, c.best_score, f"{case}[{gi}]")
+            total_reheat += r.best_score
+            total_crude += c.best_score
+            strictly_better = strictly_better or r.best_score < c.best_score
+        self.assertLess(total_reheat, total_crude)
+        self.assertTrue(strictly_better, "reheating never beat crude on any graph")
+
+    def test_per_move_acceptance_traces_recorded(self):
+        # Every applicable move type is proposed and its accepted count is a valid
+        # subset -- the §8.3 per-move-type acceptance traces.
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            s = SaCoOptimizingSolver(cap, 128, seed=0)
+            s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            for m in ("reorder", "flip", "recolor"):
+                self.assertGreater(s.moves_proposed[m], 0, f"{case} {m}")
+                self.assertLessEqual(
+                    s.moves_accepted[m], s.moves_proposed[m], f"{case} {m}"
+                )
+
+    def test_within_group_cv_available_and_finite(self):
+        # The §5.3 within-group-CV instrumentation is populated and non-negative
+        # (drives the deferred variance-bucketing decision).
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            s = SaCoOptimizingSolver(cap, 128, seed=0)
+            s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            cv = s.move_scale_cv()
+            self.assertEqual(set(cv), {"reorder", "flip", "recolor", "none"})
+            for m, v in cv.items():
+                self.assertGreaterEqual(v, 0.0, f"{case} {m}")
+                self.assertTrue(math.isfinite(v), f"{case} {m}")
+
+    def test_reheating_deterministic(self):
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+
+            def run():
+                s = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
+                out = s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                return (
+                    [b.chosen_division for b in out],
+                    [b.address for b in out],
+                    s.best_score,
+                    s.moves_proposed,
+                    s.moves_accepted,
+                )
+
+            self.assertEqual(run(), run(), f"{case}[{gi}]")
+
+    def test_both_schedules_respect_baseline(self):
+        for case, gi, buffers in _all_cases():
+            for sched in ("reheating", "crude"):
+                cap = max(1, _seed_footprint(buffers) // 2)
+                s = SaCoOptimizingSolver(cap, 128, seed=0, schedule=sched)
+                s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                self.assertLessEqual(s.best_score, s.baseline_score, f"{case} {sched}")
+
+    def test_rejects_bad_schedule(self):
+        with self.assertRaises(ValueError):
+            SaCoOptimizingSolver(1024, 128, schedule="nope")
+
+
+# Snippet run in a subprocess to solve one captured graph and print its result;
+# used by the cross-process determinism test below.
+_SOLVE_SNIPPET = """
+import copy, json, math
+from tests.inductor.fake_cooptimization_substrate import load_captures
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
+g = load_captures()["sdpa"][0]
+cap = max(1, sum(math.ceil(b.size / b.core_divisions[0].output_partition)
+                 for b in g.buffers) // 2)
+s = SaCoOptimizingSolver(cap, 128, seed=0)
+out = s.plan_layout_and_core_divs(copy.deepcopy(g.buffers))
+print("RESULT " + json.dumps({
+    "chosen": [b.chosen_division for b in out],
+    "addr": [b.address for b in out],
+    "best": s.best_score,
+}))
+"""
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _solve_with_hashseed(hs):
+    """Solve the sdpa graph in a subprocess with ``PYTHONHASHSEED=hs``."""
+    env = dict(os.environ, PYTHONHASHSEED=str(hs), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+    proc = subprocess.run(
+        [sys.executable, "-c", _SOLVE_SNIPPET],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=_REPO_ROOT,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT "))
+    return json.loads(line[len("RESULT ") :])
+
+
+class CrossProcessDeterminismTest(TestCase):
+    """The §6.5 CI determinism test done right: solve twice in *separate
+    processes* under different ``PYTHONHASHSEED`` values. In-process determinism
+    tests share one hash seed and so cannot catch set-iteration-order bugs (Plan
+    §7.5) -- this one can (it caught the FirstFit seed nondeterminism)."""
+
+    def test_pythonhashseed_independent(self):
+        base = _solve_with_hashseed(0)
+        for hs in (1, 2):
+            self.assertEqual(_solve_with_hashseed(hs), base, f"PYTHONHASHSEED={hs}")
 
 
 if __name__ == "__main__":

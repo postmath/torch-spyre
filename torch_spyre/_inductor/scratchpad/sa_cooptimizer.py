@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Joint work-division + LX-layout simulated-annealing engine (Plan Phase 3).
+"""Joint work-division + LX-layout simulated-annealing engine (Plan Phases 3-5).
 
 ``SaCoOptimizingSolver`` is the third co-optimization engine (a sibling to the
 substrate's CP-SAT and DFS solvers, Plan §7.3). It *composes* the incremental
@@ -29,11 +29,21 @@ scorer's Metropolis test. Region-recolor (Plan §4.3 / §7.2) picks a non-trivia
 to a coordinated, mutually-compatible menu-index assignment over the reachable
 region -- the region *is* the flood's reach, boundaries emerge for free, and a
 join with no compatible index keeps the tie-break pick and accepts the internal
-seam. This is Tier 0 (plain uniform recolor + instrumentation); the §4.3 Tier
-1/2 escalations and the per-move-type / reheat-gated schedule (Plan §5) come
-later. Best-seen over ``(pi, W)`` from the §8.2 seed (every op at index 0, ``pi``
-from FirstFit) makes every returned state no worse than the baseline regardless
-of how crude the moves/schedule are (§8.1).
+seam. (Region-recolor is Tier 0 -- plain uniform recolor; the §4.3 Tier 1/2
+escalations remain gated on run evidence.)
+
+Schedule / proposal mix (Plan §5). The default ``"reheating"`` schedule is the
+multi-move self-calibrating reheating carrier of :mod:`cooptimization_schedule`:
+one shared reheating clock, an independent acceptance band + move-scale EMA per
+move type (region-recolor coldest), and a cycle-phase proposal mix that weights
+each move by its neighborhood size times a hotness that lets structural moves
+dominate hot phases and layout reorders dominate cold ones (§5.4). Per-move
+acceptance traces and within-group ``|dE|`` CVs are recorded for the §5.3
+bucketing decision. ``schedule="crude"`` selects the Phase-3/4 single geometric
+cool + fixed weights, retained as the A/B baseline the reheating schedule beats.
+Best-seen over ``(pi, W)`` from the §8.2 seed (every op at index 0, ``pi`` from
+FirstFit) makes every returned state no worse than the baseline regardless of how
+crude the moves/schedule are (§8.1).
 
 Objective. The shared scorer (:mod:`cooptimization_scorer`) is authoritative.
 On the (op-metadata-free) fake substrate this reduces to the substrate's own
@@ -56,7 +66,11 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
+from typing import Optional
 
+from torch_spyre._inductor.scratchpad.cooling_schedules import (
+    SelfCalibratingReheatingSchedule,
+)
 from torch_spyre._inductor.scratchpad.cooptimization_substrate import (
     CoOptimizingSolver,
     CoreDivisionBufferProtocol,
@@ -75,6 +89,16 @@ from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
 # substrate's shared drop cause).
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
+# Per-move-type acceptance bands (accept_hi, accept_lo) for the reheating
+# schedule (Plan §5.2): reorders warmest, region-recolor the coldest floor so it
+# freezes earliest. Guessed defaults pending benchmarks -- best-seen bounds any
+# bad choice, and the per-move acceptance traces validate the resulting rates.
+_DEFAULT_MOVE_BANDS = {
+    "reorder": (0.6, 0.02),
+    "flip": (0.3, 0.005),
+    "recolor": (0.1, 0.001),
+}
+
 
 class SaCoOptimizingSolver(CoOptimizingSolver):
     """SA joint core-division + LX-placement engine (see module docstring).
@@ -86,10 +110,17 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         steps_per_buffer: annealing steps scale linearly with the buffer count
             (crude bounded budget; Plan Appendix H tunes this later).
         min_steps: floor on the step budget for tiny graphs.
-        reorder_weight / flip_weight / recolor_weight: relative proposal weights
-            for the three move types (restricted to whichever are applicable each
-            step). Crude fixed mix -- Plan §5.4 makes it neighborhood-weighted and
-            §5.2 gives recolor its own coldest band later.
+        schedule: ``"reheating"`` (Plan §5 -- the multi-move self-calibrating
+            reheating schedule + cycle-phase proposal mix) or ``"crude"`` (the
+            Phase-3/4 single geometric cool + fixed proposal weights, retained as
+            the A/B baseline the reheating schedule must beat).
+        cycles / horizons_per_cycle: reheating-schedule knobs (Plan §5.1).
+        weight_floor: the ``w_floor`` in the cycle-phase proposal mix (Plan §5.4),
+            so no applicable move type is ever fully starved.
+        move_bands: per-move-type ``(accept_hi, accept_lo)`` acceptance bands for
+            the reheating schedule; defaults to :data:`_DEFAULT_MOVE_BANDS`.
+        reorder_weight / flip_weight / recolor_weight: fixed proposal weights for
+            the ``"crude"`` schedule only.
         burst_fraction: layout-burst length as a fraction of the buffer count
             (Plan §4.4; the burst warms ``pi`` to the new footprints before the
             compound move is judged).
@@ -103,19 +134,35 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         seed: int = 0,
         steps_per_buffer: int = 40,
         min_steps: int = 200,
+        schedule: str = "reheating",
+        cycles: int = 4,
+        horizons_per_cycle: float = 2.0,
+        weight_floor: float = 0.05,
+        move_bands: Optional[dict[str, tuple[float, float]]] = None,
         reorder_weight: float = 0.5,
         flip_weight: float = 0.3,
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
     ) -> None:
         super().__init__(size, alignment)
+        if schedule not in ("reheating", "crude"):
+            raise ValueError("schedule must be 'reheating' or 'crude'")
         self._seed = seed
         self._steps_per_buffer = steps_per_buffer
         self._min_steps = min_steps
+        self._schedule = schedule
+        self._cycles = cycles
+        self._horizons_per_cycle = horizons_per_cycle
+        self._weight_floor = weight_floor
+        self._move_bands = move_bands or _DEFAULT_MOVE_BANDS
         self._reorder_weight = reorder_weight
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
+        # Best-seen over the anneal (set in _anneal, read in _step); declared here
+        # so their type is known across methods.
+        self._best_score: int
+        self._best_snap: tuple[PermutationBasedLayoutSolver, list[int]]
 
     # -- public interface ----------------------------------------------------
 
@@ -145,6 +192,13 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         self.recolor_accepted_partitions: list[int] = []
         self._last_recolor_region_size = 0
         self._last_recolor_anchor_partition = 0
+        # Within-group score-delta stats per move type (online n / sum / sum-of-
+        # squares over nonzero |dE|), for the §5.3 within-group-CV instrumentation
+        # that gates whether a move type needs size-bucketed sub-groups. Read via
+        # :meth:`move_scale_cv`.
+        self._ms_n = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
+        self._ms_sum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
+        self._ms_sqsum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
         n = len(buffers)
         if n == 0:
             return list(buffers)
@@ -414,25 +468,36 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
     def _restore(self, snap) -> None:
         self.packer, self.chosen = snap[0], snap[1]
 
-    def _calibrate_temperature(self, flippable: list[int]) -> float:
-        """A crude initial temperature: the *median* absolute score delta of a
-        sample of random moves from the seed. The median (not mean) is robust to
-        region-recolor's large deltas, so ``T0`` tracks the frequent small moves --
-        which is what we want under a single schedule: recolor's big delta then
-        rides near-greedy (accepted mainly when improving), a fair stand-in for its
-        eventual coldest band (Plan §5.2). Falls back to 1.0 when nothing moved.
-        Restores state afterwards; consumes RNG deterministically."""
-        n = len(self._bufs)
+    def _calibrate_temperature(self) -> float:
+        """A crude scale estimate: the *median* absolute score delta over a sample
+        of random (fixed-weight) moves from the current state. Serves as the crude
+        schedule's ``T0`` and the reheating schedule's pre-snap seed center. The
+        median (not mean) is robust to region-recolor's large deltas. Falls back to
+        1.0 when nothing moved. Restores state; consumes RNG deterministically."""
         base = self._score()
         deltas: list[int] = []
-        for _ in range(min(64, 4 * n + 8)):
+        for _ in range(min(64, 4 * len(self._bufs) + 8)):
             snap = self._snapshot()
-            self._propose(flippable)
+            self._execute_move(self._choose_move_crude())
             d = abs(self._score() - base)
             if d > 0:
                 deltas.append(d)
             self._restore(snap)
         return float(statistics.median(deltas)) if deltas else 1.0
+
+    # -- move selection & execution -----------------------------------------
+
+    def _applicable_moves(self) -> list[str]:
+        """Move types available this step, in fixed (deterministic) order: reorder
+        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor."""
+        moves = []
+        if len(self._bufs) >= 2:
+            moves.append("reorder")
+        if self._flippable_ops:
+            moves.append("flip")
+        if self._anchor_candidates:
+            moves.append("recolor")
+        return moves
 
     def _weighted_choice(self, choices: list[tuple[str, float]]) -> str:
         """Deterministic weighted pick over ``choices`` (in fixed order)."""
@@ -445,83 +510,171 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
                 return name
         return choices[-1][0]
 
-    def _propose(self, flippable: list[int]) -> str:
-        """Apply one random move in place and return its type. Chooses among the
-        applicable moves (reorder needs >=2 buffers; flip needs a multi-entry menu;
-        recolor needs a non-trivial anchor) by fixed weight. Structural moves
-        (flip / recolor) carry their own layout burst."""
-        n = len(self._bufs)
-        choices: list[tuple[str, float]] = []
-        if n >= 2:
-            choices.append(("reorder", self._reorder_weight))
-        if flippable:
-            choices.append(("flip", self._flip_weight))
-        if self._anchor_candidates:
-            choices.append(("recolor", self._recolor_weight))
-        if not choices:
+    def _choose_move_crude(self) -> str:
+        """Fixed-weight move choice (the crude schedule and the calibrator)."""
+        applicable = self._applicable_moves()
+        if not applicable:
             return "none"
-        name = self._weighted_choice(choices)
+        w = {
+            "reorder": self._reorder_weight,
+            "flip": self._flip_weight,
+            "recolor": self._recolor_weight,
+        }
+        return self._weighted_choice([(m, w[m]) for m in applicable])
+
+    @staticmethod
+    def _hotness(name: str, phi: float) -> float:
+        """Structural moves are hot early (cycle phase near 0), layout reorders
+        late (near 1) -- Plan §5.4."""
+        return phi if name == "reorder" else 1.0 - phi
+
+    def _choose_move_reheating(self, phi: float) -> str:
+        """Cycle-phase proposal mix (Plan §5.4): weight each applicable move by its
+        neighborhood size times ``max(w_floor, hotness(m, phi))``, so structural
+        moves dominate hot phases and layout reorders dominate cold ones."""
+        applicable = self._applicable_moves()
+        if not applicable:
+            return "none"
+        choices = [
+            (m, self._neighborhoods[m] * max(self._weight_floor, self._hotness(m, phi)))
+            for m in applicable
+        ]
+        return self._weighted_choice(choices)
+
+    def _execute_move(self, name: str) -> None:
+        """Apply move ``name`` in place; structural moves carry their own burst."""
+        n = len(self._bufs)
         if name == "reorder":
             self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
         elif name == "flip":
-            idx = self._rng.choice(flippable)
+            idx = self._rng.choice(self._flippable_ops)
             menu = len(self._bufs[idx].core_divisions)
             offset = self._rng.randrange(1, menu)  # a different index, wrap-around
             self._atomic_flip(idx, (self.chosen[idx] + offset) % menu)
             self._burst()
-        else:  # recolor
+        elif name == "recolor":
             self._recolor()
-        return name
+        # "none": no applicable move; no-op.
+
+    # -- instrumentation -----------------------------------------------------
+
+    def _record_move_scale(self, name: str, scale: float) -> None:
+        """Fold a nonzero ``|dE|`` into ``name``'s within-group stats (Plan §5.3)."""
+        if scale > 0.0:
+            self._ms_n[name] += 1
+            self._ms_sum[name] += scale
+            self._ms_sqsum[name] += scale * scale
+
+    def move_scale_cv(self) -> dict[str, float]:
+        """Coefficient of variation (std / mean) of ``|dE|`` within each move type
+        -- the §5.3 signal for whether a type should be split into size buckets.
+        ``0.0`` for a type with < 2 samples or a zero mean."""
+        out: dict[str, float] = {}
+        for m, n in self._ms_n.items():
+            if n < 2:
+                out[m] = 0.0
+                continue
+            mean = self._ms_sum[m] / n
+            var = max(0.0, self._ms_sqsum[m] / n - mean * mean)
+            out[m] = (math.sqrt(var) / mean) if mean > 0.0 else 0.0
+        return out
+
+    def _record_recolor(self, name: str, accepted: bool) -> None:
+        if name != "recolor":
+            return
+        self.recolor_region_sizes.append(self._last_recolor_region_size)
+        self.recolor_anchor_partitions.append(self._last_recolor_anchor_partition)
+        if accepted:
+            self.recolor_accepted_partitions.append(self._last_recolor_anchor_partition)
+
+    # -- annealing loop ------------------------------------------------------
+
+    def _step(self, name: str, temperature: float, cur: int) -> tuple[int, bool, float]:
+        """Execute one judged move: propose ``name``, apply the Metropolis test
+        against ``temperature``, and update best-seen + instrumentation. Returns
+        ``(new_cur, accepted, |dE|)``."""
+        snap = self._snapshot()
+        self._execute_move(name)
+        self.moves_proposed[name] += 1
+        new = self._score()
+        delta = new - cur
+        scale = float(abs(delta))
+        # `or` short-circuits, so the RNG is drawn only when delta > 0.
+        accepted = delta <= 0 or self._rng.random() < math.exp(-delta / temperature)
+        self._record_move_scale(name, scale)
+        if accepted:
+            self.moves_accepted[name] += 1
+            cur = new
+            if cur < self._best_score:
+                self._best_score = cur
+                self._best_snap = self._snapshot()
+                if name == "recolor":
+                    self.recolor_improved += 1
+        else:
+            self._restore(snap)
+        self._record_recolor(name, accepted)
+        return cur, accepted, scale
 
     def _anneal(self) -> None:
         n = len(self._bufs)
         steps = max(self._min_steps, self._steps_per_buffer * n)
-        flippable = self._flippable()
-
-        t0 = self._calibrate_temperature(flippable)
-        t_end = max(t0 / 1000.0, 1e-9)
+        self._flippable_ops = self._flippable()
+        # Static proposal-mix neighborhoods (Plan §5.4): reorder ~ n reinsertion
+        # points; flip ~ the available local labels; recolor ~ the anchor tilings
+        # (n_regions x n_colors, with the anchor's non-trivial menu size as
+        # n_colors, §7.2).
+        self._neighborhoods = {
+            "reorder": n,
+            "flip": sum(
+                len(self._bufs[i].core_divisions) - 1 for i in self._flippable_ops
+            ),
+            "recolor": sum(
+                len(self._nontrivial_menu[a]) for a in self._anchor_candidates
+            ),
+        }
 
         cur = self._score()
-        # Baseline = the seed state's score; best-seen never rises above it, which
-        # is the >=-baseline guarantee (Plan §8.1). Both are recorded for tests /
-        # cross-engine comparison.
+        # Baseline = the seed state's score; best-seen never rises above it, the
+        # >=-baseline guarantee (Plan §8.1).
         self.baseline_score = cur
-        best_score = cur
-        best_snap = self._snapshot()
+        self._best_score = cur
+        self._best_snap = self._snapshot()
 
+        if self._applicable_moves():
+            if self._schedule == "crude":
+                self._anneal_crude(steps, cur)
+            else:
+                self._anneal_reheating(steps, cur)
+
+        self.best_score = self._best_score
+        self._restore(self._best_snap)
+
+    def _anneal_crude(self, steps: int, cur: int) -> None:
+        """Phase-3/4 baseline: one geometric cool + fixed proposal weights. Kept as
+        the A/B the reheating schedule must beat."""
+        t0 = self._calibrate_temperature()
+        t_end = max(t0 / 1000.0, 1e-9)
         for step in range(steps):
             frac = step / (steps - 1) if steps > 1 else 1.0
             temperature = t0 * (t_end / t0) ** frac
-            snap = self._snapshot()
-            name = self._propose(flippable)
-            self.moves_proposed[name] += 1
-            new = self._score()
-            delta = new - cur
-            # `or` short-circuits, so the RNG is drawn only when delta > 0 --
-            # keeping the trajectory identical to the inline form.
-            accepted = delta <= 0 or self._rng.random() < math.exp(-delta / temperature)
-            if accepted:
-                cur = new
-                self.moves_accepted[name] += 1
-                if cur < best_score:
-                    best_score = cur
-                    best_snap = self._snapshot()
-                    if name == "recolor":
-                        self.recolor_improved += 1
-            else:
-                self._restore(snap)
-            if name == "recolor":
-                self.recolor_region_sizes.append(self._last_recolor_region_size)
-                self.recolor_anchor_partitions.append(
-                    self._last_recolor_anchor_partition
-                )
-                if accepted:
-                    self.recolor_accepted_partitions.append(
-                        self._last_recolor_anchor_partition
-                    )
+            cur, _, _ = self._step(self._choose_move_crude(), temperature, cur)
 
-        self.best_score = best_score
-        self._restore(best_snap)
+    def _anneal_reheating(self, steps: int, cur: int) -> None:
+        """Plan §5: the multi-move self-calibrating reheating schedule with the
+        cycle-phase proposal mix. The schedule self-calibrates each move type's
+        band from its streamed ``|dE|``, seeded (pre-snap) from a crude median."""
+        schedule = SelfCalibratingReheatingSchedule(
+            bands=self._move_bands,
+            total_steps=steps,
+            cycles=self._cycles,
+            horizons_per_cycle=self._horizons_per_cycle,
+            seed_center=self._calibrate_temperature(),
+        )
+        schedule.reset()
+        while not schedule.finished:
+            name = self._choose_move_reheating(schedule.cycle_phase())
+            cur, accepted, scale = self._step(name, schedule.temperature(name), cur)
+            schedule.update(accepted, scale, name)
 
     # -- write-back ----------------------------------------------------------
 
