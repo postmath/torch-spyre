@@ -152,7 +152,11 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         placed_by_name = {b.name: b for b in placed}
         for i, gap in enumerate(gaps):
             new_parents = list(gap.in_place_parents)
-            for parent_name in parent_names:
+            # Sort the set iteration: ``plan_layout`` reuses ``in_place_parents[0]``,
+            # so a hash-ordered append here would pick a different in-place parent
+            # (hence a different address) run-to-run under PYTHONHASHSEED. Sorting
+            # keeps the placement deterministic (Plan §7.5).
+            for parent_name in sorted(parent_names):
                 parent = placed_by_name.get(parent_name)
                 if parent is None or parent.address is None:
                     continue
