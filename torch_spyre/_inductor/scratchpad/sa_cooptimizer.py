@@ -22,12 +22,18 @@ single annealing loop over the joint state ``(pi, W)``:
 * ``pi`` -- the layout permutation, held in the packer.
 * ``W`` -- the work division, one ``chosen_division`` menu index per buffer.
 
-This is the minimal end-to-end slice: **reorder + atomic-division-flip only**,
-the compound flip+burst move, a crude single cooling schedule, best-seen over
-``(pi, W)``, and the §8.2 seed (every op at index 0, ``pi`` from FirstFit).
-Region-recolor (Phase 4) and the per-move-type schedule (Phase 5) come later; the
-seed-from-baseline + keep-best design means this already returns a solution no
-worse than the baseline regardless of how crude the moves/schedule are (§8.1).
+The move set is **reorder, atomic division flip, and region-recolor**, each
+structural move run as a compound move+burst and judged as a unit by the shared
+scorer's Metropolis test. Region-recolor (Plan §4.3 / §7.2) picks a non-trivial
+(split) anchor tiling and floods the ``cd_parent_matches`` relation bidirectionally
+to a coordinated, mutually-compatible menu-index assignment over the reachable
+region -- the region *is* the flood's reach, boundaries emerge for free, and a
+join with no compatible index keeps the tie-break pick and accepts the internal
+seam. This is Tier 0 (plain uniform recolor + instrumentation); the §4.3 Tier
+1/2 escalations and the per-move-type / reheat-gated schedule (Plan §5) come
+later. Best-seen over ``(pi, W)`` from the §8.2 seed (every op at index 0, ``pi``
+from FirstFit) makes every returned state no worse than the baseline regardless
+of how crude the moves/schedule are (§8.1).
 
 Objective. The shared scorer (:mod:`cooptimization_scorer`) is authoritative.
 On the (op-metadata-free) fake substrate this reduces to the substrate's own
@@ -45,8 +51,10 @@ integer fixed-point score make a run bit-for-bit reproducible.
 
 from __future__ import annotations
 
+import heapq
 import math
 import random as rnd
+import statistics
 from collections.abc import Sequence
 
 from torch_spyre._inductor.scratchpad.cooptimization_substrate import (
@@ -78,9 +86,10 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         steps_per_buffer: annealing steps scale linearly with the buffer count
             (crude bounded budget; Plan Appendix H tunes this later).
         min_steps: floor on the step budget for tiny graphs.
-        flip_probability: fraction of proposals that are atomic division flips
-            (the rest are layout reorders). Crude fixed mix (Plan §5.4 makes it
-            neighborhood-weighted later).
+        reorder_weight / flip_weight / recolor_weight: relative proposal weights
+            for the three move types (restricted to whichever are applicable each
+            step). Crude fixed mix -- Plan §5.4 makes it neighborhood-weighted and
+            §5.2 gives recolor its own coldest band later.
         burst_fraction: layout-burst length as a fraction of the buffer count
             (Plan §4.4; the burst warms ``pi`` to the new footprints before the
             compound move is judged).
@@ -94,14 +103,18 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         seed: int = 0,
         steps_per_buffer: int = 40,
         min_steps: int = 200,
-        flip_probability: float = 0.5,
+        reorder_weight: float = 0.5,
+        flip_weight: float = 0.3,
+        recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
     ) -> None:
         super().__init__(size, alignment)
         self._seed = seed
         self._steps_per_buffer = steps_per_buffer
         self._min_steps = min_steps
-        self._flip_probability = flip_probability
+        self._reorder_weight = reorder_weight
+        self._flip_weight = flip_weight
+        self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
 
     # -- public interface ----------------------------------------------------
@@ -115,6 +128,23 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
         same buffers (the one-shot interface satisfied by an internal solve)."""
         self.spill_reasons = {}
+        # Tier-0 move instrumentation (Plan §4.3 / §8.3): per-type proposal and
+        # accept counts, recolor improvement count, the flooded region sizes, and
+        # the anchor-tiling ``output_partition`` of every proposed recolor and of
+        # the accepted subset. The last two answer the open "should the anchor
+        # tiling be weighted by output_partition?" question empirically -- if
+        # aggressive (high-partition) anchors are proposed but rarely accepted
+        # once the real node term is on (Phase 6), that is the measurement that
+        # justifies escalating to a §4.3 Tier-1 biased proposal. Populated only by
+        # the main annealing loop (not the calibration probes).
+        self.moves_proposed = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
+        self.moves_accepted = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
+        self.recolor_improved = 0
+        self.recolor_region_sizes: list[int] = []
+        self.recolor_anchor_partitions: list[int] = []
+        self.recolor_accepted_partitions: list[int] = []
+        self._last_recolor_region_size = 0
+        self._last_recolor_anchor_partition = 0
         n = len(buffers)
         if n == 0:
             return list(buffers)
@@ -165,6 +195,25 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
                 )
                 self._children[p_idx].append((c_idx, pairs))
         self._num_children = [len(self._children[i]) for i in range(n)]
+
+        # Region-recolor support (Plan §7.2). ``_edge_pairs[(p, c)]`` is the
+        # compatible ``(p_div, c_div)`` set on the edge p->c; ``_children_idx``
+        # lists each op's children by index (deterministic flood order).
+        self._children_idx = [sorted(c for c, _ in self._children[i]) for i in range(n)]
+        self._edge_pairs: dict[tuple[int, int], frozenset] = {
+            (i, c): pairs for i in range(n) for c, pairs in self._children[i]
+        }
+        # Non-trivial (split) menu indices per op -- the only legal recolor
+        # anchors, so recolor stays a coordinated *splitting* move and leaves
+        # undividing to atomic flips (Plan §7.2). Anchor candidates are the ops
+        # that have at least one.
+        self._nontrivial_menu = [
+            sorted(
+                j for j, cd in enumerate(b.core_divisions) if cd.output_partition > 1
+            )
+            for b in bufs
+        ]
+        self._anchor_candidates = [i for i in range(n) if self._nontrivial_menu[i]]
 
     # -- division-dependent derivations --------------------------------------
 
@@ -282,6 +331,67 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         for x in sorted({idx} | self._parents_idx[idx]):
             self.packer.set_eligible(x, self._eligible(x))
 
+    def _flood_region(self, anchor: int, tiling: int) -> dict[int, int]:
+        """Flood the ``cd_parent_matches`` relation from ``(anchor, tiling)`` to a
+        menu-index assignment over the reachable region (Plan §7.2).
+
+        Bidirectional: from an assigned op ``u`` (index ``iu``), a child ``c`` joins
+        at the smallest ``ic`` with ``(iu, ic)`` compatible, and a parent ``p`` at
+        the smallest ``ip`` with ``(ip, iu)`` compatible. The reachable set *is* the
+        region; boundaries emerge for free (no compatible index across an edge).
+        First-assignment-wins with a min-index frontier and sorted candidates makes
+        this deterministic and independent of ``cd_parent_matches`` list order
+        (Plan §7.5); a join reached with no compatible index simply is not
+        extended -- its edge becomes an accepted internal seam, never a failure.
+        """
+        assignment = {anchor: tiling}
+        heap = [anchor]
+        while heap:
+            u = heapq.heappop(heap)
+            iu = assignment[u]
+            for c in self._children_idx[u]:  # down: u -> c
+                if c in assignment:
+                    continue
+                cands = sorted(ic for ip, ic in self._edge_pairs[(u, c)] if ip == iu)
+                if cands:
+                    assignment[c] = cands[0]
+                    heapq.heappush(heap, c)
+            for p in sorted(self._parents_idx[u]):  # up: p -> u
+                if p in assignment:
+                    continue
+                cands = sorted(ip for ip, ic in self._edge_pairs[(p, u)] if ic == iu)
+                if cands:
+                    assignment[p] = cands[0]
+                    heapq.heappush(heap, p)
+        return assignment
+
+    def _apply_recolor(self, assignment: dict[int, int]) -> None:
+        """Commit a flooded region coloring: set every region op's division, resize
+        its footprint, and refresh eligibility for the region plus the parents of
+        region ops (the same ripple as a flip, unioned over the region)."""
+        for op, div in assignment.items():
+            self.chosen[op] = div
+        affected = set(assignment)
+        for op in sorted(assignment):
+            self.packer.resize(op, self._per_core_size(op, self.chosen[op]))
+            affected |= self._parents_idx[op]
+        for x in sorted(affected):
+            self.packer.set_eligible(x, self._eligible(x))
+
+    def _recolor(self) -> None:
+        """One region-recolor move: a size-proportional anchor (uniform op, so a
+        region is hit ∝ its op-count), a random non-trivial anchor tiling, flood,
+        then recolor + burst."""
+        anchor = self._rng.choice(self._anchor_candidates)
+        tiling = self._rng.choice(self._nontrivial_menu[anchor])
+        assignment = self._flood_region(anchor, tiling)
+        self._last_recolor_region_size = len(assignment)
+        self._last_recolor_anchor_partition = (
+            self._bufs[anchor].core_divisions[tiling].output_partition
+        )
+        self._apply_recolor(assignment)
+        self._burst()
+
     def _burst(self) -> None:
         """A short cold layout burst: greedily accept O(1) adjacent swaps that do
         not lower the packer's layout quality, letting ``pi`` adapt to the new
@@ -304,15 +414,17 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
     def _restore(self, snap) -> None:
         self.packer, self.chosen = snap[0], snap[1]
 
-    def _calibrate_temperature(self) -> float:
-        """A crude initial temperature: the mean absolute score delta of a sample
-        of random moves from the seed (so a typical move accepts with moderate
-        probability). Falls back to 1.0 when no sampled move changes the score.
-        Restores the state afterwards; consumes RNG deterministically."""
+    def _calibrate_temperature(self, flippable: list[int]) -> float:
+        """A crude initial temperature: the *median* absolute score delta of a
+        sample of random moves from the seed. The median (not mean) is robust to
+        region-recolor's large deltas, so ``T0`` tracks the frequent small moves --
+        which is what we want under a single schedule: recolor's big delta then
+        rides near-greedy (accepted mainly when improving), a fair stand-in for its
+        eventual coldest band (Plan §5.2). Falls back to 1.0 when nothing moved.
+        Restores state afterwards; consumes RNG deterministically."""
         n = len(self._bufs)
         base = self._score()
         deltas: list[int] = []
-        flippable = self._flippable()
         for _ in range(min(64, 4 * n + 8)):
             snap = self._snapshot()
             self._propose(flippable)
@@ -320,31 +432,53 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
             if d > 0:
                 deltas.append(d)
             self._restore(snap)
-        return (sum(deltas) / len(deltas)) if deltas else 1.0
+        return float(statistics.median(deltas)) if deltas else 1.0
 
-    def _propose(self, flippable: list[int]) -> None:
-        """Apply one random move in place: an atomic flip + burst, or a layout
-        reorder (rotate). Falls back to the always-available move when the other
-        is not applicable (no flippable op / a single buffer)."""
+    def _weighted_choice(self, choices: list[tuple[str, float]]) -> str:
+        """Deterministic weighted pick over ``choices`` (in fixed order)."""
+        total = sum(w for _, w in choices)
+        r = self._rng.random() * total
+        acc = 0.0
+        for name, weight in choices:
+            acc += weight
+            if r < acc:
+                return name
+        return choices[-1][0]
+
+    def _propose(self, flippable: list[int]) -> str:
+        """Apply one random move in place and return its type. Chooses among the
+        applicable moves (reorder needs >=2 buffers; flip needs a multi-entry menu;
+        recolor needs a non-trivial anchor) by fixed weight. Structural moves
+        (flip / recolor) carry their own layout burst."""
         n = len(self._bufs)
-        do_flip = flippable and self._rng.random() < self._flip_probability
-        if not do_flip and n < 2:
-            do_flip = bool(flippable)  # nothing to reorder; try a flip instead
-        if do_flip:
+        choices: list[tuple[str, float]] = []
+        if n >= 2:
+            choices.append(("reorder", self._reorder_weight))
+        if flippable:
+            choices.append(("flip", self._flip_weight))
+        if self._anchor_candidates:
+            choices.append(("recolor", self._recolor_weight))
+        if not choices:
+            return "none"
+        name = self._weighted_choice(choices)
+        if name == "reorder":
+            self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
+        elif name == "flip":
             idx = self._rng.choice(flippable)
             menu = len(self._bufs[idx].core_divisions)
             offset = self._rng.randrange(1, menu)  # a different index, wrap-around
             self._atomic_flip(idx, (self.chosen[idx] + offset) % menu)
             self._burst()
-        elif n >= 2:
-            self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
+        else:  # recolor
+            self._recolor()
+        return name
 
     def _anneal(self) -> None:
         n = len(self._bufs)
         steps = max(self._min_steps, self._steps_per_buffer * n)
         flippable = self._flippable()
 
-        t0 = self._calibrate_temperature()
+        t0 = self._calibrate_temperature(flippable)
         t_end = max(t0 / 1000.0, 1e-9)
 
         cur = self._score()
@@ -359,16 +493,32 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
             frac = step / (steps - 1) if steps > 1 else 1.0
             temperature = t0 * (t_end / t0) ** frac
             snap = self._snapshot()
-            self._propose(flippable)
+            name = self._propose(flippable)
+            self.moves_proposed[name] += 1
             new = self._score()
             delta = new - cur
-            if delta <= 0 or self._rng.random() < math.exp(-delta / temperature):
+            # `or` short-circuits, so the RNG is drawn only when delta > 0 --
+            # keeping the trajectory identical to the inline form.
+            accepted = delta <= 0 or self._rng.random() < math.exp(-delta / temperature)
+            if accepted:
                 cur = new
+                self.moves_accepted[name] += 1
                 if cur < best_score:
                     best_score = cur
                     best_snap = self._snapshot()
+                    if name == "recolor":
+                        self.recolor_improved += 1
             else:
                 self._restore(snap)
+            if name == "recolor":
+                self.recolor_region_sizes.append(self._last_recolor_region_size)
+                self.recolor_anchor_partitions.append(
+                    self._last_recolor_anchor_partition
+                )
+                if accepted:
+                    self.recolor_accepted_partitions.append(
+                        self._last_recolor_anchor_partition
+                    )
 
         self.best_score = best_score
         self._restore(best_snap)
