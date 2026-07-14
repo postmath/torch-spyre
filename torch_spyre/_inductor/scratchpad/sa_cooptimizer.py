@@ -154,7 +154,10 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         self._cycles = cycles
         self._horizons_per_cycle = horizons_per_cycle
         self._weight_floor = weight_floor
-        self._move_bands = move_bands or _DEFAULT_MOVE_BANDS
+        # Merge (not replace) so a partial override keeps the defaults for the
+        # move types it omits -- otherwise _choose_move_reheating can select a
+        # move type whose band is missing and crash in the reheating schedule.
+        self._move_bands = {**_DEFAULT_MOVE_BANDS, **(move_bands or {})}
         self._reorder_weight = reorder_weight
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
@@ -361,7 +364,7 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
             if self.packer.addresses[i] is not None:
                 traffic += b.boundary_cost
             else:
-                traffic += self._num_children[i] * b.size + b.spill_write_cost
+                traffic += self._spill_cost(b, self._num_children[i])
         memory_fixed = scorer.to_fixed_us(traffic / scorer.hbm_bytes_per_us())
         node_fixed = 0  # no op-kind metadata in the fake substrate (Phase 6)
         return memory_fixed + node_fixed
