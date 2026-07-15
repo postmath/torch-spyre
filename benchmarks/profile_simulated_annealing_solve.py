@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Profile a full ImanishiXu solve on the random_buffers example workload.
+"""Profile a full simulated-annealing solve on the random_buffers example workload.
 
 Reproduces examples/scratchpad/random_buffers.py exactly (seed 0, N=100,
 first-fit init, 30x100 exponential schedule) and profiles ``solver.solve()``:
@@ -23,7 +23,7 @@ first-fit init, 30x100 exponential schedule) and profiles ``solver.solve()``:
 
 Run from the repository root::
 
-    python benchmarks/profile_imanishi_solve.py
+    python benchmarks/profile_simulated_annealing_solve.py
 """
 
 import cProfile
@@ -43,8 +43,8 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     peak_memory_load,
     ExponentialCoolingSchedule,
 )
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuSolverWithBuffers,
+from torch_spyre._inductor.scratchpad.simulated_annealing import (
+    SimulatedAnnealingSolverWithBuffers,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
@@ -72,7 +72,7 @@ def build_solver():
     capacity = peak_memory_load(buffers) // 2
     ff = copy.deepcopy(buffers)
     FirstFitLayoutSolver(capacity).plan_layout(ff)  # example parity (no rng use)
-    return ImanishiXuSolverWithBuffers(
+    return SimulatedAnnealingSolverWithBuffers(
         buffers,
         capacity,
         alignment=1,
@@ -111,11 +111,11 @@ def line_level():
     solver = build_solver()
     PBLS = PL.PermutationBasedLayoutSolver
     BASE = PL.PermutationBasedLayoutSolverBase
-    IX = ImanishiXuSolverWithBuffers
+    SA = SimulatedAnnealingSolverWithBuffers
     funcs = [
-        IX.anneal,
-        IX.annealing_step_rotate,
-        IX.annealing_step_swap,
+        SA.anneal,
+        SA.annealing_step_rotate,
+        SA.annealing_step_swap,
         PBLS.swap,
         PBLS._recompute_address,
         PBLS.contact_at,

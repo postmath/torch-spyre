@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end tests for the Imanishi/Xu simulated-annealing layout solver."""
+"""End-to-end tests for the simulated-annealing layout solver."""
 
 import copy
 import math
@@ -34,9 +34,9 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     default_initial_temperature,
     peak_memory_load,
 )
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuLayoutSolver,
-    ImanishiXuSolverWithBuffers,
+from torch_spyre._inductor.scratchpad.simulated_annealing import (
+    SimulatedAnnealingLayoutSolver,
+    SimulatedAnnealingSolverWithBuffers,
 )
 
 # Heavy randomized anneals over many seeds, larger problems and longer
@@ -241,8 +241,8 @@ class CoolingScheduleTests(TestCase):
             buffers = _random_buffers(rng, n)
             cap = max(b.size for b in buffers) * rng.randint(2, 4)
             b1, b2 = copy.deepcopy(buffers), copy.deepcopy(buffers)
-            ImanishiXuLayoutSolver(cap, 128).plan_layout(b1)  # default schedule
-            ImanishiXuLayoutSolver(cap, 128).plan_layout(b2)
+            SimulatedAnnealingLayoutSolver(cap, 128).plan_layout(b1)  # default schedule
+            SimulatedAnnealingLayoutSolver(cap, 128).plan_layout(b2)
             self.assertEqual(
                 [b.address for b in b1], [b.address for b in b2], f"seed={seed}"
             )
@@ -259,9 +259,9 @@ class CoolingScheduleTests(TestCase):
         self.assertAlmostEqual(default_initial_temperature(buffers), 50 / 300.0)
 
 
-class ImanishiXuTests(TestCase):
+class SimulatedAnnealingTests(TestCase):
     def _run(self, buffers, capacity, *, initial, seed, alignment=128):
-        solver = ImanishiXuLayoutSolver(
+        solver = SimulatedAnnealingLayoutSolver(
             capacity,
             alignment,
             initial=initial,
@@ -280,7 +280,7 @@ class ImanishiXuTests(TestCase):
             LifetimeBoundBuffer("c", 64, [0, 1]),
         ]
         cap = 10_000
-        solver = ImanishiXuSolverWithBuffers(
+        solver = SimulatedAnnealingSolverWithBuffers(
             buffers,
             cap,
             128,
@@ -313,7 +313,7 @@ class ImanishiXuTests(TestCase):
         schedule = ExponentialCoolingSchedule(
             t_initial=8.0, t_final=1.0, steps_per_epoch=2, epochs=4
         )  # 8 cooling steps if never interrupted
-        solver = ImanishiXuSolverWithBuffers(
+        solver = SimulatedAnnealingSolverWithBuffers(
             buffers,
             cap,
             1,
@@ -339,7 +339,7 @@ class ImanishiXuTests(TestCase):
             LifetimeBoundBuffer("b", 90, [0, 1]),  # [0, 2), stacks on a -> evicted
             LifetimeBoundBuffer("c", 10, [5, 6]),  # [5, 7), disjoint
         ]
-        solver = ImanishiXuSolverWithBuffers(
+        solver = SimulatedAnnealingSolverWithBuffers(
             buffers,
             100,
             1,
@@ -407,7 +407,7 @@ class ImanishiXuTests(TestCase):
             # Exercises the full streaming path: online move scale, snap off the
             # peak-load seed, and reheating cycles.
             schedule = SelfCalibratingReheatingSchedule(total_steps=200, cycles=3)
-            solver = ImanishiXuLayoutSolver(
+            solver = SimulatedAnnealingLayoutSolver(
                 cap, 128, initial=initial, schedule=schedule, random=rnd.Random(seed)
             )
             solver.plan_layout(buffers)
@@ -419,8 +419,8 @@ class ImanishiXuTests(TestCase):
 @unittest.skipUnless(
     _STRESS, "set TORCH_SPYRE_STRESS_SCRATCHPAD=1 to run scratchpad stress tests"
 )
-class ImanishiXuStressTests(TestCase):
-    """Heavy version of ImanishiXuTests: many seeds, larger problems and a
+class SimulatedAnnealingStressTests(TestCase):
+    """Heavy version of SimulatedAnnealingTests: many seeds, larger problems and a
     longer cooling schedule. Not run by default."""
 
     def test_many_anneals_feasible_and_not_worse(self):
@@ -438,7 +438,7 @@ class ImanishiXuStressTests(TestCase):
             schedule = ExponentialCoolingSchedule(
                 t_initial=200.0, t_final=0.5, steps_per_epoch=8, epochs=6
             )
-            solver = ImanishiXuLayoutSolver(
+            solver = SimulatedAnnealingLayoutSolver(
                 cap,
                 128,
                 initial=initial,

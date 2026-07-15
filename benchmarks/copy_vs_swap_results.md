@@ -1,6 +1,6 @@
 # copy() vs swap() vs full sweep
 
-Cost comparison for the operations the Imanishi/Xu reinsertion sweep is built
+Cost comparison for the operations the simulated-annealing reinsertion sweep is built
 from, to decide whether that sweep should keep a second copy of the plan (to
 avoid re-traversing) -- worth it only if a copy is cheaper than the swaps it
 would save.

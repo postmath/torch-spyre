@@ -21,9 +21,9 @@ which contains the following files.
   built on.
 - **`cooling_schedules.py`** — the `CoolingSchedule` family: `ExponentialCoolingSchedule` and the
   default, auto-calibrated `SelfCalibratingReheatingSchedule`.
-- **`imanishi_xu.py`** — `ImanishiXuSolverWithBuffers`, a simulated-annealing search over allocation
+- **`simulated_annealing.py`** — `SimulatedAnnealingSolverWithBuffers`, a simulated-annealing search over allocation
   orders (following a paper by Imanishi & Xu) that drives the permutation solver by composition. It
-  is wired in as the opt-in `layout_solver = "imanishi_xu"` config option; the default stays
+  is wired in as the opt-in `layout_solver = "simulated_annealing"` config option; the default stays
   `greedy`.
 - **`benchmarks/`** and **`examples/scratchpad/`** — profiling scripts, result docs, and runnable
   examples.
@@ -82,7 +82,7 @@ is an instance attribute callers can override (set it to 1 to force the fast pat
 
 ### The annealing search
 
-`ImanishiXuSolverWithBuffers` is the search that optimises the layout, following the
+`SimulatedAnnealingSolverWithBuffers` is the search that optimises the layout, following the
 simulated-annealing algorithm of Imanishi & Xu. Each step picks a buffer and probes every reinsertion
 position by bubbling it across a throwaway `copy()` of the plan, recording `quality()` at each, and
 accepts a move by the Metropolis criterion.

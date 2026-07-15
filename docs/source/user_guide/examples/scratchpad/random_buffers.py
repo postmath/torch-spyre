@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare first-fit vs ImanishiXu quality on a set of random buffers.
+"""Compare first-fit vs simulated-annealing quality on a set of random buffers.
 
 Capacity is set to the theoretical peak load (i.e. the minimum possible).
-The ImanishiXu annealing improves on the first-fit ordering by reducing
+The simulated-annealing search improves on the first-fit ordering by reducing
 fragmentation so that more buffers fit within the fixed capacity.
 
 Run::
@@ -38,8 +38,8 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     peak_memory_load,
     ExponentialCoolingSchedule,
 )
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuSolverWithBuffers,
+from torch_spyre._inductor.scratchpad.simulated_annealing import (
+    SimulatedAnnealingSolverWithBuffers,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
@@ -82,8 +82,8 @@ FirstFitLayoutSolver(capacity).plan_layout(ff_buffers)
 ff_quality = sum(b.size for b in ff_buffers if b.address is not None)
 print(f"First-fit quality: {ff_quality}/{total_size}")
 
-# ImanishiXu annealing, seeded from the first-fit ordering.
-solver = ImanishiXuSolverWithBuffers(
+# Simulated annealing, seeded from the first-fit ordering.
+solver = SimulatedAnnealingSolverWithBuffers(
     buffers,
     capacity,
     alignment=1,
@@ -95,7 +95,7 @@ solver = ImanishiXuSolverWithBuffers(
 )
 solver.solve()
 solver.finalize()
-print(f"ImanishiXu quality: {solver.best_quality}/{total_size}")
+print(f"Simulated-annealing quality: {solver.best_quality}/{total_size}")
 
 quality_plot(solver.quality_logs, solver.temperature_logs[0]).savefig(
     "random_buffers_quality.png", dpi=300

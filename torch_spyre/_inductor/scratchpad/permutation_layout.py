@@ -20,7 +20,7 @@ places buffers in that order and maintains addresses incrementally under
 ``swap``/``rotate`` via the order-based contact profiles, while
 :class:`ReferencePermutationBasedLayoutSolver` is a from-scratch oracle used
 for differential testing. The :class:`Profile` step function is the contact
-data structure both build on. Search policies (e.g. the Imanishi/Xu annealer)
+data structure both build on. Search policies (e.g. the simulated-annealing search)
 drive this substrate by composition; it knows nothing about how the
 permutation is chosen.
 """
