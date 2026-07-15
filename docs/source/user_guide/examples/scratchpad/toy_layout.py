@@ -32,8 +32,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     ExponentialCoolingSchedule,
 )
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuSolverWithBuffers,
+from torch_spyre._inductor.scratchpad.simulated_annealing import (
+    SimulatedAnnealingSolverWithBuffers,
 )
 from torch_spyre._inductor.scratchpad.utils import plot_buffers
 
@@ -44,7 +44,7 @@ buffers = [
     LifetimeBoundBuffer("B3", 8, [3, 5]),
 ]
 
-solver = ImanishiXuSolverWithBuffers(
+solver = SimulatedAnnealingSolverWithBuffers(
     buffers,
     size=14,
     alignment=1,

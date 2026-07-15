@@ -15,7 +15,7 @@
 """Compare the cost of PermutationBasedLayoutSolver.copy() against swap() and a
 full single-element sweep, across buffer counts and overlap densities.
 
-This decides whether the Imanishi/Xu reinsertion sweep should add a second copy
+This decides whether the simulated-annealing reinsertion sweep should add a second copy
 (to avoid re-traversing) -- worth it only if a copy is cheaper than the swaps it
 saves. Reports, per (n, density): the adjacent-pair overlap rate, build time,
 copy time, no-op/overlapping swap time, full-sweep time, and "swaps/copy" -- how

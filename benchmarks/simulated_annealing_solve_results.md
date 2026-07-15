@@ -1,4 +1,4 @@
-# Profiling a full ImanishiXu solve
+# Profiling a full simulated-annealing solve
 
 Where time goes in one full anneal on the `random_buffers` example workload
 (seed 0, N=100, first-fit init, 30x100 exponential schedule = 3000 steps), and
@@ -7,7 +7,7 @@ how two placement optimizations moved it.
 Reproduce with:
 
 ```bash
-python benchmarks/profile_imanishi_solve.py
+python benchmarks/profile_simulated_annealing_solve.py
 ```
 
 (The line-by-line pass needs `line_profiler`: `uv pip install line_profiler`.)

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Cooling schedules for the Imanishi/Xu simulated-annealing layout solver.
+"""Cooling schedules for the simulated-annealing layout solver.
 
 A :class:`CoolingSchedule` is a responsive temperature controller: the annealer
 streams back each step's acceptance and move scale, so a schedule may adapt
@@ -245,7 +245,7 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         if self._cycle_len == 0:
             raise ValueError(
                 "SelfCalibratingReheatingSchedule must be given buffers before "
-                "use; run it through ImanishiXuSolverWithBuffers, or call "
+                "use; run it through SimulatedAnnealingSolverWithBuffers, or call "
                 "set_buffers() first."
             )
         self._i = 0

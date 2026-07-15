@@ -42,8 +42,8 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     _assert_in_place_relationships,
     _topological_sort,
 )
-from torch_spyre._inductor.scratchpad.imanishi_xu import (
-    ImanishiXuLayoutSolver,
+from torch_spyre._inductor.scratchpad.simulated_annealing import (
+    SimulatedAnnealingLayoutSolver,
 )
 
 LARGE_SIZE = 512
@@ -840,11 +840,13 @@ class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
     solver_class = GreedyLayoutSolver
 
 
-class TestImanishiXuLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
-    solver_class = ImanishiXuLayoutSolver
+class TestSimulatedAnnealingLayoutSolver(
+    ScoreOrderingTests, BaseLayoutSolverTests, TestCase
+):
+    solver_class = SimulatedAnnealingLayoutSolver
 
     def test_largest_buffer_evicted_when_full(self):
-        # unlike other solvers, imanishi xu finds the optimal solution
+        # unlike other solvers, simulated annealing finds the optimal solution
         self.verify_layout(
             [
                 LifetimeBoundBuffer("a", 10, [0, 3]),

@@ -97,7 +97,7 @@ SolverInitialOption: TypeAlias = (
 SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto"]
 
 
-class ImanishiXuLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class SimulatedAnnealingLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
     """We can only do the full initialization when we know the list of buffers, so this class is
     just a shim to create the actual solver."""
 
@@ -119,7 +119,7 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         _buffers = list(buffers)
-        solver = ImanishiXuSolverWithBuffers(
+        solver = SimulatedAnnealingSolverWithBuffers(
             _buffers,
             self.limit,
             self.alignment,
@@ -132,7 +132,7 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         return _buffers
 
 
-class ImanishiXuSolverWithBuffers:
+class SimulatedAnnealingSolverWithBuffers:
     """Drives simulated annealing over a :class:`PermutationBasedLayoutSolver`.
 
     The layout is held as a *member* (``self.plan``), not a base class. This lets
