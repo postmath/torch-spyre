@@ -360,7 +360,7 @@ class ParameterizedScratchpadUsage(
         return mlp, args, {"atol": 0.1, "rtol": 0.1}
 
     parameter_axes = {
-        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat"),
+        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat", "imanishi_xu"),
         "sencores": (1, 32),
         "co_optimization": (False, True)
         if ts_inductor_config.co_optimizing_lx_planning
