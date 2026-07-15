@@ -44,7 +44,7 @@
 import math
 import copy
 from abc import ABC, abstractmethod
-from typing import Literal, Optional, TypeAlias, override
+from typing import Literal, Optional, Sequence, TypeAlias, override
 import random as rnd
 from heapq import heappush, heappop
 
@@ -401,7 +401,7 @@ SolverInitialOption: TypeAlias = (
 SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto", "from_paper"]
 
 
-class ImanishiXuLayoutSolver(MemoryPlanSolver):
+class ImanishiXuLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
     """We can only do the full initialization when we know the list of buffers, so this class is
     just a shim to create the actual solver."""
 
@@ -420,10 +420,11 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         self.random = random
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
+        _buffers = list(buffers)
         solver = ImanishiXuSolverWithBuffers(
-            buffers,
+            _buffers,
             self.limit,
             self.alignment,
             initial=self.initial,
@@ -432,7 +433,7 @@ class ImanishiXuLayoutSolver(MemoryPlanSolver):
         )
         solver.solve()
         solver.finalize()
-        return buffers
+        return _buffers
 
 
 class ImanishiXuSolverWithBuffers:
