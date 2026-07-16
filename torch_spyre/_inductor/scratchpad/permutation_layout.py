@@ -162,13 +162,14 @@ class PermutationBasedLayoutSolverBase(ABC):
     # --- shared helpers -----------------------------------------------------
 
     def rotate(self, i: int, j: int) -> float:
-        """Modify the permutation by taking ``self.permutation[i]`` out of the permutation and
-        reinserting it at position ``j``. Returns the change in :meth:`quality` caused by the
-        rotation (new minus old)."""
-        # A product of swaps, even over the full distance, beats a permutation-edit + _build():
-        # most of the swaps are O(1) no-ops, so the chain is far cheaper than an O(n^2) rebuild in
-        # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
-        # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
+        """Modify the permutation by taking ``self.permutation[i]`` out of the
+        permutation and reinserting it at position ``j``. Returns the change in
+        :meth:`quality` caused by the rotation (new minus old)."""
+        # A product of swaps, even over the full distance, beats a permutation-edit +
+        # _build(): most of the swaps are O(1) no-ops, so the chain is far cheaper
+        # than an O(n^2) rebuild in the realistic (sparse-overlap) regime. (A rebuild
+        # only wins for dense overlap, where it is a symptom of swap propagation
+        # degenerating -- a thing to fix, not to route around. See
         # benchmarks/copy_vs_swap_results.md.)
         delta = 0.0
         if i < j:
@@ -313,7 +314,11 @@ class PermutationBasedLayoutSolverBase(ABC):
                 partner_addr = addr[partner]
                 assert partner_addr is not None  # the partner is allocated
                 others_top = max(
-                    (addr[q] + sizes[q] for q in candidates if q != partner),  # type: ignore
+                    (
+                        addr[q] + sizes[q]  # type: ignore
+                        for q in candidates
+                        if q != partner
+                    ),
                     default=0,
                 )
                 if others_top <= partner_addr:

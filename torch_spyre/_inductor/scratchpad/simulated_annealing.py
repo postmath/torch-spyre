@@ -15,30 +15,34 @@
 
 # Implement the algorithm from this paper:
 #
-# Imanishi, Akifumi, and Zijian Xu. "A heuristic for periodic memory allocation with little
-# fragmentation to train neural networks." In Proceedings of the 2024 ACM SIGPLAN International
-# Symposium on Memory Management, pp. 82-94. 2024.
+# Imanishi, Akifumi, and Zijian Xu. "A heuristic for periodic memory allocation
+# with little fragmentation to train neural networks." In Proceedings of the 2024
+# ACM SIGPLAN International Symposium on Memory Management, pp. 82-94. 2024.
 #
-# The paper describes a few algorithms that work together to come up with a good allocation scheme.
-# The problem setting differs slightly from ours in that they have a fixed set of buffers that are
-# all to be allocated, and they want to do it in as little space as possible. By contrast, in our
-# case, we have a fixed amount of space and we want to allocate those buffers that will give the
-# best performance -- which we can probably approximate by saying, we want to minimize the volume of
-# HBM transfers.
+# The paper describes a few algorithms that work together to come up with a good
+# allocation scheme. The problem setting differs slightly from ours in that they
+# have a fixed set of buffers that are all to be allocated, and they want to do it
+# in as little space as possible. By contrast, in our case, we have a fixed amount
+# of space and we want to allocate those buffers that will give the best
+# performance -- which we can probably approximate by saying, we want to minimize
+# the volume of HBM transfers.
 #
-# Algorithm 4 is the simulated annealing algorithm that comes up with the permutation. It takes as
-# inputs an annealing schedule, a list of buffers, and an initial permutation. One iteration
-# randomly selects a buffer, and then cleverly compares all possible positions where the buffer
-# could be reinserted. In effect, it cheaply considers (n-1) neighbours every iteration.
+# Algorithm 4 is the simulated annealing algorithm that comes up with the
+# permutation. It takes as inputs an annealing schedule, a list of buffers, and an
+# initial permutation. One iteration randomly selects a buffer, and then cleverly
+# compares all possible positions where the buffer could be reinserted. In effect,
+# it cheaply considers (n-1) neighbours every iteration.
 #
-# In order to adjust this algorithm to our setting, we hold a PermutationBasedLayoutSolver from
-# plan_solver as a member. It lets us use a permutation of buffers as a source of a layout plan, and
-# modify the permutation and see the modification in the layout plan by repeated swapping. Each
-# reinsertion sweep runs on a throwaway plan.copy(), so the live plan only performs the rotation
-# that is actually accepted rather than sweeping and restoring. We also adjust our random sampling:
-# a buffer that is currently allocated legally gets to consider being inserted into all other
-# positions, whereas a buffer that is not currently allocated legally only gets to consider being
-# reinserted in positions of (nearly) legally allocated buffers, so that we don't spend too much
+# In order to adjust this algorithm to our setting, we hold a
+# PermutationBasedLayoutSolver from plan_solver as a member. It lets us use a
+# permutation of buffers as a source of a layout plan, and modify the permutation
+# and see the modification in the layout plan by repeated swapping. Each
+# reinsertion sweep runs on a throwaway plan.copy(), so the live plan only performs
+# the rotation that is actually accepted rather than sweeping and restoring. We
+# also adjust our random sampling: a buffer that is currently allocated legally
+# gets to consider being inserted into all other positions, whereas a buffer that
+# is not currently allocated legally only gets to consider being reinserted in
+# positions of (nearly) legally allocated buffers, so that we don't spend too much
 # time on swaps that have no effect.
 
 import math
@@ -69,15 +73,15 @@ class SolverToPermutation:
         self.solver = solver
 
     def permutation(self, buffers: list[LifetimeBoundBuffer]) -> list[int]:
-        """Lay out the given buffers, then sort them by their addresses. Any non-allocated buffers
-        come after all allocated buffers. Return this ordering as a list of indices; the first index
-        is i such that buffers[i] is one of the buffers allocated at address 0, etc. This yields a
-        permutation that gives the given layout, or an equivalent one, or occasionally even a better
-        one."""
+        """Lay out the given buffers, then sort them by their addresses. Any
+        non-allocated buffers come after all allocated buffers. Return this ordering
+        as a list of indices; the first index is i such that buffers[i] is one of the
+        buffers allocated at address 0, etc. This yields a permutation that gives the
+        given layout, or an equivalent one, or occasionally even a better one."""
         allocated_buffers = self.solver.plan_layout(copy.deepcopy(buffers))
-        # Typically, allocated_buffers is just the argument to plan_layout, which has been modified
-        # in-place. But we can't assume that. Moreover, we need to protect the passed in buffers
-        # from being modified by the given solver.
+        # Typically, allocated_buffers is just the argument to plan_layout, which has
+        # been modified in-place. But we can't assume that. Moreover, we need to
+        # protect the passed in buffers from being modified by the given solver.
 
         max_address = max(
             (b.address for b in allocated_buffers if b.address is not None), default=0
@@ -98,8 +102,8 @@ SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto"]
 
 
 class SimulatedAnnealingLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
-    """We can only do the full initialization when we know the list of buffers, so this class is
-    just a shim to create the actual solver."""
+    """We can only do the full initialization when we know the list of buffers, so
+    this class is just a shim to create the actual solver."""
 
     def __init__(
         self,
@@ -266,11 +270,12 @@ class SimulatedAnnealingSolverWithBuffers:
 
         if i > j:
             i, j = j, i
-        # Now i < j, and perm[:i] and perm[j+1:] are "clean"; that is, there is no k such that
-        # perm[k] and perm[k+1] are buffers that *do not overlap* in time, and have perm[k] have a
-        # higher end point in memory than perm[k+1]. Because perm[i] up to and including perm[j]
-        # changed, we need to examine i-1 <= k <= j -- except if that would take us outside the
-        # bounds of perm, of course.
+        # Now i < j, and perm[:i] and perm[j+1:] are "clean"; that is, there is no k
+        # such that perm[k] and perm[k+1] are buffers that *do not overlap* in time,
+        # and have perm[k] have a higher end point in memory than perm[k+1]. Because
+        # perm[i] up to and including perm[j] changed, we need to examine
+        # i-1 <= k <= j -- except if that would take us outside the bounds of perm,
+        # of course.
         i -= 1
 
         # Ensure that both i and j+1 are valid indices.
@@ -295,8 +300,9 @@ class SimulatedAnnealingSolverWithBuffers:
             pi1 = perm[i + 1]
 
             if (not plan.overlaps(pi, pi1)) and _top_or_inf(pi) > _top_or_inf(pi1):
-                # Swap buffers pi and pi1. This makes no difference for the quality of the result
-                # *now*, but it makes it easier to rotate to an improved state.
+                # Swap buffers pi and pi1. This makes no difference for the quality
+                # of the result *now*, but it makes it easier to rotate to an
+                # improved state.
                 plan.swap(i)
 
                 # Adjust the bounds of what we need to examine.
@@ -312,31 +318,34 @@ class SimulatedAnnealingSolverWithBuffers:
     def annealing_step_rotate(
         self, temperature: float
     ) -> tuple[Optional[tuple[int, int]], float]:
-        """This is the inner loop of Algorithm 4 from the paper. The first return value is (i, j) iff
-        we accepted a rotation inserting entry i of the permutation into position j != i; None if we
-        accepted no rotation. We never accept a trivial rotation. The second return value is the move
-        scale for this step -- the mean |Δquality| over the reinsertion positions probed, ignoring
+        """This is the inner loop of Algorithm 4 from the paper. The first return
+        value is (i, j) iff we accepted a rotation inserting entry i of the
+        permutation into position j != i; None if we accepted no rotation. We never
+        accept a trivial rotation. The second return value is the move scale for this
+        step -- the mean |Δquality| over the reinsertion positions probed, ignoring
         no-op positions -- which the schedule uses to size its temperatures online.
 
-        The reinsertion sweep runs on a throwaway copy of the plan; only the accepted rotation (if
-        any) is applied to the live plan, so the live layout never has to sweep-and-restore."""
+        The reinsertion sweep runs on a throwaway copy of the plan; only the accepted
+        rotation (if any) is applied to the live plan, so the live layout never has
+        to sweep-and-restore."""
         plan = self.plan
         n = len(self.buffers)
         allocated = [plan.is_fully_allocated(plan.permutation[i]) for i in range(n)]
         n_allocated = sum(1 if b else 0 for b in allocated)
-        # Choose each allocated buffer with weight n and each non-allocated buffer with weight
-        # n_allocated + 1.
+        # Choose each allocated buffer with weight n and each non-allocated buffer
+        # with weight n_allocated + 1.
         i = self.random.choices(
             range(n), weights=[n if b else n_allocated + 1 for b in allocated]
         )[0]
 
-        # qualities[j] is the quality if we rotate i to position j in the permutation, or None if we
-        # don't consider rotating i to position j.
+        # qualities[j] is the quality if we rotate i to position j in the
+        # permutation, or None if we don't consider rotating i to position j.
         qualities: list[Optional[float]] = [None] * n
         quality_before = plan.quality()
 
-        # Probe all reinsertion positions on a copy: rotate i to position 0, then bubble it forward
-        # one step at a time, recording the quality at each position it visits.
+        # Probe all reinsertion positions on a copy: rotate i to position 0, then
+        # bubble it forward one step at a time, recording the quality at each
+        # position it visits.
         probe = plan.copy()
         if i != 0:
             probe.rotate(i, 0)
@@ -344,12 +353,14 @@ class SimulatedAnnealingSolverWithBuffers:
         if allocated[i]:
             upper_bound = n - 1
         else:
-            # x is not legally allocated, so it can only be made to fit by moving it earlier; the
-            # last legally-allocated buffer sits at position k, so only positions 0..k+1 can change
-            # the quality. (See the monotonicity argument: x's address is non-decreasing in its
-            # position. Eviction preserves this: moving x later only adds earlier-positioned
-            # overlapping buffers to what it must stack on, so its top -- and hence whether it is
-            # evicted -- is monotone in position, with an evicted address read as +inf.)
+            # x is not legally allocated, so it can only be made to fit by moving it
+            # earlier; the last legally-allocated buffer sits at position k, so only
+            # positions 0..k+1 can change the quality. (See the monotonicity
+            # argument: x's address is non-decreasing in its position. Eviction
+            # preserves this: moving x later only adds earlier-positioned overlapping
+            # buffers to what it must stack on, so its top -- and hence whether it is
+            # evicted -- is monotone in position, with an evicted address read as
+            # +inf.)
             upper_bound = (
                 max((pos for pos, b in enumerate(allocated) if b), default=0) + 1
             )
@@ -382,7 +393,8 @@ class SimulatedAnnealingSolverWithBuffers:
             if qj > quality_before or self.random.random() < math.exp(
                 (qj - quality_before) / temperature
             ):
-                # Apply only the accepted rotation to the live plan (others keep their order).
+                # Apply only the accepted rotation to the live plan (others keep
+                # their order).
                 plan.rotate(i, j)
                 return (i, j), move_scale
 

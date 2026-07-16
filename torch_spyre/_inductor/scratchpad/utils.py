@@ -95,10 +95,10 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     at which that buffer is accessed (read or written).  Graph inputs are seeded with
     an empty list; unused inputs remain empty.
 
-    Note: previously, unused graph inputs did not appear in the returned dict at all.
-    Now they appear with an empty list.  Callers that skip buffers with ``len(uses) <= 1``
-    (e.g. ``_build_bound_buffers``) will still skip unused inputs correctly, since
-    ``len([]) == 0 <= 1``."""
+    Note: previously, unused graph inputs did not appear in the returned dict at
+    all.  Now they appear with an empty list.  Callers that skip buffers with
+    ``len(uses) <= 1`` (e.g. ``_build_bound_buffers``) will still skip unused inputs
+    correctly, since ``len([]) == 0 <= 1``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
@@ -593,8 +593,8 @@ def quality_plot(
 
     Each run is drawn as a thin blue line; their smoothed average is drawn
     in red.  When temperature data is available (typically recorded by
-    a method from an annealing schedule), the first run's temperature schedule is overlaid on a
-    log-scale right axis in green.
+    a method from an annealing schedule), the first run's temperature schedule is
+    overlaid on a log-scale right axis in green.
     """
     import matplotlib.pyplot as plt
     import numpy as np

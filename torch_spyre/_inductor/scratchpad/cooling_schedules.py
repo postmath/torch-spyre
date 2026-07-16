@@ -23,7 +23,9 @@ plus the peak-load helpers used to seed an initial temperature.
 
 import math
 from abc import ABC, abstractmethod
-from typing import Optional, override
+from typing import Optional
+
+from typing_extensions import override
 from heapq import heappush, heappop
 
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
@@ -88,8 +90,9 @@ class ExponentialCoolingSchedule(CoolingSchedule):
     def __init__(
         self, *, t_initial: float, t_final: float, steps_per_epoch: int, epochs: int
     ):
-        """A schedule that starts at temperature `t_initial` and ends at `t_final`, cooling down by
-        a constant factor every `steps_per_epoch` steps. There are `epochs` such epochs.
+        """A schedule that starts at temperature `t_initial` and ends at `t_final`,
+        cooling down by a constant factor every `steps_per_epoch` steps. There are
+        `epochs` such epochs.
 
         If `epochs == 1`, then the temperature stays at `t_initial`."""
         self.t_initial = t_initial
