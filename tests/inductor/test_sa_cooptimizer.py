@@ -44,6 +44,7 @@ from tests.inductor.fake_cooptimization_substrate import (
     FakeCoreDivisionBuffer,
     load_captures,
 )
+from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
 
 
 def _seed_footprint(buffers):
@@ -62,14 +63,34 @@ def _capacities(buffers):
 
 
 def _all_cases():
+    """The captured real corpus (softmax/mlp/swiglu/sdpa). Empirical, schedule-
+    quality assertions that are calibrated on real cost structure iterate this."""
     for case, graphs in load_captures().items():
         for gi, g in enumerate(graphs):
             yield case, gi, g.buffers
 
 
+def _synthetic_cases():
+    """Hand-built structural fixtures (long/short chains, wide join, multi-region,
+    K-split, pins, big-n). They carry no ground-truth ``solved`` reference, so they
+    exercise only the *shape-invariant* guarantees below -- never schedule-quality
+    claims. See ``synthetic_cooptimization_graphs``."""
+    for case, graphs in synthetic_graphs().items():
+        for gi, g in enumerate(graphs):
+            yield case, gi, g.buffers
+
+
+def _all_cases_incl_synthetic():
+    """Real captures + synthetic fixtures: the fan-out for shape-invariant tests
+    (output contract, >= baseline, determinism, region flood, recolor coverage)
+    that must hold for *any* valid graph, not just the calibrated corpus."""
+    yield from _all_cases()
+    yield from _synthetic_cases()
+
+
 class OutputContractTest(TestCase):
     def test_every_buffer_gets_division_and_address(self):
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             for cap in _capacities(buffers):
                 bufs = copy.deepcopy(buffers)
                 solver = SaCoOptimizingSolver(cap, 128, seed=0)
@@ -95,7 +116,7 @@ class BaselineGuaranteeTest(TestCase):
     """The returned state never scores worse than the seed (lower is better)."""
 
     def test_never_worse_than_baseline(self):
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             for cap in _capacities(buffers):
                 bufs = copy.deepcopy(buffers)
                 solver = SaCoOptimizingSolver(cap, 128, seed=0)
@@ -119,7 +140,7 @@ class DeterminismTest(TestCase):
         )
 
     def test_same_seed_bit_identical(self):
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             for cap in _capacities(buffers):
                 a = self._run(buffers, cap, seed=0)
                 b = self._run(buffers, cap, seed=0)
@@ -128,7 +149,7 @@ class DeterminismTest(TestCase):
     def test_different_seeds_still_valid(self):
         # A different seed may explore differently, but each run must still be a
         # valid, >=-baseline solution (guards against seed-dependent breakage).
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             cap = _seed_footprint(buffers)
             for seed in (1, 7):
                 bufs = copy.deepcopy(buffers)
@@ -253,7 +274,7 @@ class RegionRecolorTest(TestCase):
 
     def test_recolor_exercised_and_finds_multi_op_regions(self):
         max_region_overall = 0
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
             solver = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
             solver.plan_layout_and_core_divs(copy.deepcopy(buffers))
@@ -278,7 +299,7 @@ class RegionRecolorTest(TestCase):
         self.assertGreater(total_improved, 0, "recolor never improved on any graph")
 
     def test_recolor_instrumentation_deterministic(self):
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
 
             def run():
@@ -303,7 +324,7 @@ class RegionRecolorTest(TestCase):
         # sub-multiset of the proposed one, one per accepted recolor.
         from collections import Counter
 
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
             solver = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
             solver.plan_layout_and_core_divs(copy.deepcopy(buffers))
@@ -343,7 +364,7 @@ class ScheduleTest(TestCase):
     def test_per_move_acceptance_traces_recorded(self):
         # Every applicable move type is proposed and its accepted count is a valid
         # subset -- the §8.3 per-move-type acceptance traces.
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
             s = SaCoOptimizingSolver(cap, 128, seed=0)
             s.plan_layout_and_core_divs(copy.deepcopy(buffers))
@@ -356,7 +377,7 @@ class ScheduleTest(TestCase):
     def test_within_group_cv_available_and_finite(self):
         # The §5.3 within-group-CV instrumentation is populated and non-negative
         # (drives the deferred variance-bucketing decision).
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
             s = SaCoOptimizingSolver(cap, 128, seed=0)
             s.plan_layout_and_core_divs(copy.deepcopy(buffers))
@@ -367,7 +388,7 @@ class ScheduleTest(TestCase):
                 self.assertTrue(math.isfinite(v), f"{case} {m}")
 
     def test_reheating_deterministic(self):
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
 
             def run():
@@ -384,7 +405,7 @@ class ScheduleTest(TestCase):
             self.assertEqual(run(), run(), f"{case}[{gi}]")
 
     def test_both_schedules_respect_baseline(self):
-        for case, gi, buffers in _all_cases():
+        for case, gi, buffers in _all_cases_incl_synthetic():
             for sched in ("reheating", "crude"):
                 cap = max(1, _seed_footprint(buffers) // 2)
                 s = SaCoOptimizingSolver(cap, 128, seed=0, schedule=sched)
@@ -396,32 +417,35 @@ class ScheduleTest(TestCase):
             SaCoOptimizingSolver(1024, 128, schedule="nope")
 
 
-# Snippet run in a subprocess to solve one captured graph and print its result;
-# used by the cross-process determinism test below.
+# Snippet run in a subprocess to solve one graph (captured *or* synthetic, chosen
+# by CASE) and print its result; used by the cross-process determinism test below.
 _SOLVE_SNIPPET = """
 import copy, json, math
 from tests.inductor.fake_cooptimization_substrate import load_captures
+from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
-g = load_captures()["sdpa"][0]
+case = {case!r}
+src = load_captures() if case in load_captures() else synthetic_graphs()
+g = src[case][0]
 cap = max(1, sum(math.ceil(b.size / b.core_divisions[0].output_partition)
                  for b in g.buffers) // 2)
 s = SaCoOptimizingSolver(cap, 128, seed=0)
 out = s.plan_layout_and_core_divs(copy.deepcopy(g.buffers))
-print("RESULT " + json.dumps({
+print("RESULT " + json.dumps({{
     "chosen": [b.chosen_division for b in out],
     "addr": [b.address for b in out],
     "best": s.best_score,
-}))
+}}))
 """
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-def _solve_with_hashseed(hs):
-    """Solve the sdpa graph in a subprocess with ``PYTHONHASHSEED=hs``."""
+def _solve_with_hashseed(hs, case="sdpa"):
+    """Solve ``case`` in a subprocess with ``PYTHONHASHSEED=hs``."""
     env = dict(os.environ, PYTHONHASHSEED=str(hs), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
     proc = subprocess.run(
-        [sys.executable, "-c", _SOLVE_SNIPPET],
+        [sys.executable, "-c", _SOLVE_SNIPPET.format(case=case)],
         capture_output=True,
         text=True,
         env=env,
@@ -439,10 +463,16 @@ class CrossProcessDeterminismTest(TestCase):
     tests share one hash seed and so cannot catch set-iteration-order bugs (Plan
     §7.5) -- this one can (it caught the FirstFit seed nondeterminism)."""
 
+    # ``sdpa`` is the richest captured graph (pins + reductions); ``big_chain`` is
+    # the largest synthetic one (many regions / n~48), so between them they stress
+    # the most set-ordered decisions (flood order, candidate lists, best-seen ties).
     def test_pythonhashseed_independent(self):
-        base = _solve_with_hashseed(0)
-        for hs in (1, 2):
-            self.assertEqual(_solve_with_hashseed(hs), base, f"PYTHONHASHSEED={hs}")
+        for case in ("sdpa", "big_chain"):
+            base = _solve_with_hashseed(0, case)
+            for hs in (1, 2):
+                self.assertEqual(
+                    _solve_with_hashseed(hs, case), base, f"{case} PYTHONHASHSEED={hs}"
+                )
 
 
 if __name__ == "__main__":
