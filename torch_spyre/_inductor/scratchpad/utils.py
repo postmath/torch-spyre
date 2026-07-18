@@ -45,7 +45,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "amax",
         "maximum",
         "sum",
-        # "clone",
+        "clone",
         "exp",
         "sub",
         "mul",
@@ -68,12 +68,12 @@ def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
 
-    Gated by the dedicated ``lx_boundary_clones`` flag (or, legacy, by listing
-    "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE). It intentionally does NOT consult
-    ``allow_all_ops_in_lx_planning``: that flag widens intermediate-output
-    eligibility and is set broadly (e.g. the LX-planning op suite), so coupling
-    it here would silently turn on the not-yet-correct boundary clone path."""
-    return config.lx_boundary_clones or "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+    Gated by listing "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE. It intentionally
+    does NOT consult ``allow_all_ops_in_lx_planning``: that flag widens
+    intermediate-output eligibility and is set broadly (e.g. the LX-planning
+    op suite), so coupling it here would silently turn on the boundary clone
+    path in contexts that don't intend to exercise it."""
+    return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
 
 
 class GraphView:
@@ -126,7 +126,6 @@ def mem_usage_by_buf(
     num_cores_per_op = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
-    buf_names = {op.name for op in graph.operations}
     for op in graph.operations:
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
@@ -142,7 +141,7 @@ def mem_usage_by_buf(
                 # below carries validity, so no arithmetic on num_cores here.
                 "size_per_core": -1,
                 "core_div_mismatch": num_cores < 0,
-                "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+                "op_inputs": [dep.name for dep in rw.reads],
             }
             continue
         dev_layout = layout.device_layout
@@ -153,7 +152,7 @@ def mem_usage_by_buf(
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
             "core_div_mismatch": num_cores < 0,
-            "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+            "op_inputs": [dep.name for dep in rw.reads],
         }
 
     return mem_usage
