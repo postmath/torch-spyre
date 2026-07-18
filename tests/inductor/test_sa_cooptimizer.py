@@ -80,12 +80,37 @@ def _synthetic_cases():
             yield case, gi, g.buffers
 
 
+# Large (25-100 buffer) real captures for manual experiments, kept OUT of CI:
+# they are slow (~2s/solve at n~79) and exist to surface schedule-scaling findings
+# (e.g. reheating regresses vs crude on the largest flash graphs -- see the
+# Phase-5 finding note). Opt in with ``SA_COOPT_LARGE_CAPTURES=1``.
+_LARGE_CAPTURES_ENV = "SA_COOPT_LARGE_CAPTURES"
+_LARGE_CAPTURES_PATH = os.path.join(
+    os.path.dirname(__file__), "cooptimization_captures_large.json"
+)
+
+
+def _large_captures_enabled() -> bool:
+    return os.environ.get(_LARGE_CAPTURES_ENV) == "1"
+
+
+def _large_cases():
+    """The env-gated large experimental graphs (empty unless opted in)."""
+    if not _large_captures_enabled():
+        return
+    for case, graphs in load_captures(_LARGE_CAPTURES_PATH).items():
+        for gi, g in enumerate(graphs):
+            yield case, gi, g.buffers
+
+
 def _all_cases_incl_synthetic():
-    """Real captures + synthetic fixtures: the fan-out for shape-invariant tests
-    (output contract, >= baseline, determinism, region flood, recolor coverage)
-    that must hold for *any* valid graph, not just the calibrated corpus."""
+    """Real captures + synthetic fixtures (+ large experimental captures when
+    ``SA_COOPT_LARGE_CAPTURES=1``): the fan-out for shape-invariant tests (output
+    contract, >= baseline, determinism, region flood, recolor coverage) that must
+    hold for *any* valid graph, not just the calibrated corpus."""
     yield from _all_cases()
     yield from _synthetic_cases()
+    yield from _large_cases()
 
 
 class OutputContractTest(TestCase):
@@ -478,6 +503,55 @@ class CrossProcessDeterminismTest(TestCase):
                 self.assertEqual(
                     _solve_with_hashseed(hs, case), base, f"{case} PYTHONHASHSEED={hs}"
                 )
+
+
+@unittest.skipUnless(
+    _large_captures_enabled(),
+    f"large-capture experiments; set {_LARGE_CAPTURES_ENV}=1 to run",
+)
+class LargeCaptureExperimentTest(TestCase):
+    """Opt-in (non-CI) experiments over the large 25-100 buffer captures. These
+    exist to *surface findings*, not to gate CI -- so they assert only the
+    shape-invariant guarantees (determinism, >= baseline) and otherwise *report*
+    rather than fail. Run with ``SA_COOPT_LARGE_CAPTURES=1``."""
+
+    def test_large_graphs_valid_and_deterministic(self):
+        # The engine must stay correct on big n: contract + determinism + baseline.
+        for case, gi, buffers in _large_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+
+            def run():
+                s = SaCoOptimizingSolver(cap, 128, seed=0)
+                out = s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                return (
+                    [b.chosen_division for b in out],
+                    [b.address for b in out],
+                    s.best_score,
+                )
+
+            a, b = run(), run()
+            self.assertEqual(a, b, f"{case}[{gi}] nondeterministic")
+            s = SaCoOptimizingSolver(cap, 128, seed=0)
+            s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            self.assertLessEqual(s.best_score, s.baseline_score, f"{case}[{gi}]")
+
+    def test_report_reheating_vs_crude_by_size(self):
+        # The flash_big-style finding, reproducible across small + large: reheating
+        # ties/wins on small-to-mid graphs but regresses on the largest flash
+        # graphs. Reports the per-graph deltas; asserts nothing about quality.
+        print("\n  case               n   reheat        crude         delta")
+        for case, gi, buffers in list(_all_cases()) + list(_large_cases()):
+            cap = max(1, _seed_footprint(buffers) // 2)
+            r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
+            r.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            c = SaCoOptimizingSolver(cap, 128, seed=0, schedule="crude")
+            c.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            d = r.best_score - c.best_score
+            tag = "better" if d < 0 else ("worse" if d > 0 else "tie")
+            print(
+                f"  {case:16} {len(buffers):3d}  {r.best_score:12d}  "
+                f"{c.best_score:12d}  {d:+d} {tag}"
+            )
 
 
 if __name__ == "__main__":
