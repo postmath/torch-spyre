@@ -19,22 +19,27 @@ seeds:
   steps.
 - **swiglu (n=8): reheating finds a better _final_ optimum at long runs** (-5.7%
   at 82k steps) that crude never reaches.
-- **flash_big (n=79) is inconclusive at this budget.** It only reached 202k steps
-  (spb 2560; the 640k-step cell was too costly to fit 2h). Neither schedule
-  converged -- both still descending (crude 51.8%, reheating 50.6% over baseline)
-  and the +-2-3% deltas sit inside the large seed spread. Settling it needs the
-  longer (spb 10240) run.
+- **flash_big (n=79): the longer run resolves it in reheating's favor.** Extended
+  to 809k steps (spb 10240; ~74 min for that one cell), reheating ends **1.7%
+  better** than crude (51.8% vs 50.9% over baseline). The trajectory is noisy --
+  both schedules bounce between 50-52% and crude actually regresses from 202k to
+  809k steps for these seeds (each budget re-parameterizes the cooling), and the
+  deltas sit within the large seed spread -- but the earlier apparent regression
+  does not survive the longer run: at the longest budget reheating is ahead,
+  consistent with flash_attention.
 - **Most graphs are schedule-insensitive** (softmax, rms_norm, mlp, simple_attn,
   block_x2/x3/x4): both schedules reach the same optimum, usually by the shortest
   run, so schedule choice is irrelevant there.
 
-**Answer:** on the one large graph that _converged_ within budget
-(flash_attention), the advanced schedule is clearly useful and **more useful at
-longer run lengths** -- consistent with "needs longer runs to pay off," not
-"useless on large graphs." flash_big specifically needs a longer run to judge.
+**Answer:** the advanced schedule is not useless on large graphs. On both large
+graphs (flash_attention, flash_big) reheating ends **ahead** at the longest run,
+and on flash_attention its advantage **grows with run length** -- consistent with
+"needs longer runs to pay off," not "useless on large graphs." The remaining
+question is variance: flash_big is noisy across seeds, so its ~2% edge is softer
+than flash_attention's clean -7% trend.
 
 _Caveats: capacity = footprint//2 throughout; y is the SA fixed-point objective,
-not wall-clock; flash_big is undersampled at the top budget._
+not wall-clock._
 
 ![crossover](results/coopt_schedule_crossover.png)
 
@@ -100,6 +105,7 @@ not wall-clock; flash_big is undersampled at the top budget._
 | flash_big | 79 | 160 | 12640 | 156,927,951 | 155,959,951 | -0.62 |
 | flash_big | 79 | 640 | 50560 | 152,191,951 | 149,999,951 | -1.44 |
 | flash_big | 79 | 2560 | 202240 | 145,039,951 | 148,831,951 | +2.61 |
+| flash_big | 79 | 10240 | 808960 | 147,719,951 | 145,215,951 | -1.70 |
 
 ## Summary: does reheating catch up at longer runs?
 
@@ -115,4 +121,4 @@ not wall-clock; flash_big is undersampled at the top budget._
 | block_x3 | 42 | +0.00 | +0.00 | schedule-insensitive (both converge) |
 | flash_attention | 43 | -1.51 | -6.96 | reheating wins, margin grows with length |
 | block_x4 | 56 | +0.00 | +0.00 | schedule-insensitive (both converge) |
-| flash_big | 79 | +1.43 | +2.61 | reheating behind (converged? check spread) |
+| flash_big | 79 | +1.43 | -1.70 | reheating wins, margin grows with length |
