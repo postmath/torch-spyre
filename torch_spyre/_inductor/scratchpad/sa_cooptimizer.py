@@ -143,10 +143,20 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         flip_weight: float = 0.3,
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
+        nested: bool = False,
+        inner_curve: str = "convex",
+        inner_annealed: bool = False,
+        inner_len_base: float = 0.25,
+        inner_len_max: float = 3.0,
+        early_abandon: bool = True,
+        polish_frac: float = 0.2,
+        abandon_k: float = 30.0,
     ) -> None:
         super().__init__(size, alignment)
         if schedule not in ("reheating", "crude"):
             raise ValueError("schedule must be 'reheating' or 'crude'")
+        if inner_curve not in ("constant", "linear", "convex", "adaptive"):
+            raise ValueError("inner_curve must be constant|linear|convex|adaptive")
         self._seed = seed
         self._steps_per_buffer = steps_per_buffer
         self._min_steps = min_steps
@@ -162,6 +172,17 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
+        # Nested two-timescale mode (experimental): the outer loop anneals over
+        # structure (flip/recolor) and each proposal runs an inner layout loop
+        # whose length grows over the run; see :meth:`_anneal_nested`.
+        self._nested = nested
+        self._inner_curve = inner_curve
+        self._inner_annealed = inner_annealed
+        self._inner_len_base = inner_len_base
+        self._inner_len_max = inner_len_max
+        self._early_abandon = early_abandon
+        self._polish_frac = polish_frac
+        self._abandon_k = abandon_k
         # Best-seen over the anneal (set in _anneal, read in _step); declared here
         # so their type is known across methods.
         self._best_score: int
@@ -644,7 +665,9 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         self._best_snap = self._snapshot()
 
         if self._applicable_moves():
-            if self._schedule == "crude":
+            if self._nested:
+                self._anneal_nested(steps, cur)
+            elif self._schedule == "crude":
                 self._anneal_crude(steps, cur)
             else:
                 self._anneal_reheating(steps, cur)
@@ -678,6 +701,171 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
             name = self._choose_move_reheating(schedule.cycle_phase())
             cur, accepted, scale = self._step(name, schedule.temperature(name), cur)
             schedule.update(accepted, scale, name)
+
+    # -- nested two-timescale loop (experimental) ----------------------------
+
+    def _choose_structural_move(self) -> str:
+        """Outer-loop move: flip or recolor by weight (no standalone reorder --
+        layout lives in the inner loop). ``none`` if no structural move exists."""
+        moves = []
+        if self._flippable_ops:
+            moves.append("flip")
+        if self._anchor_candidates:
+            moves.append("recolor")
+        if not moves:
+            return "none"
+        w = {"flip": self._flip_weight, "recolor": self._recolor_weight}
+        return self._weighted_choice([(m, w[m]) for m in moves])
+
+    def _apply_structural(self, name: str) -> None:
+        """Apply a structural move's division change + ripple, WITHOUT the burst
+        (the inner layout loop replaces it)."""
+        if name == "flip":
+            idx = self._rng.choice(self._flippable_ops)
+            menu = len(self._bufs[idx].core_divisions)
+            offset = self._rng.randrange(1, menu)
+            self._atomic_flip(idx, (self.chosen[idx] + offset) % menu)
+        elif name == "recolor":
+            anchor = self._rng.choice(self._anchor_candidates)
+            tiling = self._rng.choice(self._nontrivial_menu[anchor])
+            assignment = self._flood_region(anchor, tiling)
+            self._last_recolor_region_size = len(assignment)
+            self._last_recolor_anchor_partition = (
+                self._bufs[anchor].core_divisions[tiling].output_partition
+            )
+            self._apply_recolor(assignment)
+
+    def _inner_len(self, progress: float, acc: int, prop: int, n: int) -> int:
+        """Inner-loop length (in swap steps) for the current outer progress. Grows
+        from ``inner_len_base * n`` to ``inner_len_max * n`` along ``inner_curve``:
+        constant/linear/convex in outer progress, or adaptive in the structural
+        *reject* rate (invest more in layout as structure stops moving)."""
+        base, mx = self._inner_len_base, self._inner_len_max
+        if self._inner_curve == "constant":
+            f = base
+        elif self._inner_curve == "linear":
+            f = base + (mx - base) * progress
+        elif self._inner_curve == "convex":
+            f = base + (mx - base) * progress * progress
+        else:  # adaptive
+            reject = 1.0 - (acc / prop) if prop > 0 else 0.0
+            f = base + (mx - base) * reject
+        return max(1, int(f * n))
+
+    def _calibrate_inner_qtemp(self) -> float:
+        """Median |quality delta| over a sample of layout reinsertions -- the
+        annealed inner loop's (constant) temperature, in packer-quality units.
+        Restores state; consumes RNG deterministically."""
+        n = len(self._bufs)
+        if n < 2:
+            return 1.0
+        deltas = []
+        for _ in range(min(64, 4 * n + 8)):
+            i = self._rng.randrange(n)
+            j = self._rng.randrange(n)
+            dq = self.packer.rotate(i, j)
+            self.packer.rotate(j, i)  # revert (pop-i-insert-j inverse)
+            if dq != 0.0:
+                deltas.append(abs(dq))
+        return float(statistics.median(deltas)) if deltas else 1.0
+
+    def _inner_layout_loop(self, steps: int, qtemp: float) -> int:
+        """Warm-started inner layout anneal: ``steps`` single-buffer reinsertions
+        (``rotate`` -- an arbitrary-position move, far faster-mixing than adjacent
+        swaps) on the current packer. Greedy-cold (keep only non-worsening) or
+        annealed (Metropolis on the quality delta at ``qtemp``, tracking + restoring
+        the best-quality layout). Returns the number of steps taken."""
+        n = len(self._bufs)
+        steps = int(steps)
+        if n < 2 or steps < 1:
+            return 0
+        best_q = self.packer.total_quality
+        best_packer: Optional[PermutationBasedLayoutSolver] = None
+        for _ in range(steps):
+            i = self._rng.randrange(n)
+            j = self._rng.randrange(n)
+            dq = self.packer.rotate(i, j)  # quality delta (higher is better)
+            if self._inner_annealed:
+                keep = dq >= 0 or (
+                    qtemp > 0 and self._rng.random() < math.exp(dq / qtemp)
+                )
+                if not keep:
+                    self.packer.rotate(j, i)  # revert
+                elif self.packer.total_quality > best_q:
+                    best_q = self.packer.total_quality
+                    best_packer = self.packer.copy()
+            elif dq < 0:
+                self.packer.rotate(j, i)  # greedy revert
+        if best_packer is not None:
+            self.packer = best_packer
+        return steps
+
+    def _anneal_nested(self, budget: int, cur: int) -> None:
+        """Outer SA over structure; each proposal runs an inner layout loop, is
+        judged on the full score (end + early-abandon), and a final pure-layout
+        polish refines the best structure. Layout warm-starts across structural
+        moves (pi persists, Plan §2.2)."""
+        n = len(self._bufs)
+        qtemp = self._calibrate_inner_qtemp()
+        polish = int(self._polish_frac * budget)
+        outer_budget = max(0, budget - polish)
+
+        # No structural move available -> spend the whole budget polishing layout.
+        if self._choose_structural_move() == "none":
+            self._inner_layout_loop(budget, qtemp)
+            best = self._score()
+            if best < self._best_score:
+                self._best_score = best
+                self._best_snap = self._snapshot()
+            return
+
+        t0 = self._calibrate_temperature()
+        t_end = max(t0 / 1000.0, 1e-9)
+        spent = prop = acc = 0
+        while spent < outer_budget:
+            name = self._choose_structural_move()
+            if name == "none":
+                break
+            progress = spent / outer_budget if outer_budget else 1.0
+            temperature = t0 * (t_end / t0) ** progress
+            snap = self._snapshot()
+            self._apply_structural(name)
+            target = self._inner_len(progress, acc, prop, n)
+            # End + early-abandon: run a burn-in, peek the score, and skip the
+            # inner tail if the move is hopelessly worse at this temperature.
+            burn = max(1, target // 4) if self._early_abandon else target
+            used = self._inner_layout_loop(burn, qtemp)
+            if self._early_abandon and target > burn:
+                if self._score() - cur <= self._abandon_k * temperature:
+                    used += self._inner_layout_loop(target - burn, qtemp)
+            new = self._score()
+            delta = new - cur
+            self.moves_proposed[name] += 1
+            self._record_move_scale(name, float(abs(delta)))
+            prop += 1
+            accepted = delta <= 0 or self._rng.random() < math.exp(-delta / temperature)
+            if accepted:
+                self.moves_accepted[name] += 1
+                acc += 1
+                cur = new
+                if cur < self._best_score:
+                    self._best_score = cur
+                    self._best_snap = self._snapshot()
+                    if name == "recolor":
+                        self.recolor_improved += 1
+            else:
+                self._restore(snap)
+            self._record_recolor(name, accepted)
+            spent += 1 + used
+
+        # Final polish: a long pure-layout anneal on the best structure found.
+        if polish > 0:
+            self._restore(self._best_snap)
+            self._inner_layout_loop(polish, qtemp)
+            polished = self._score()
+            if polished < self._best_score:
+                self._best_score = polished
+                self._best_snap = self._snapshot()
 
     # -- write-back ----------------------------------------------------------
 
