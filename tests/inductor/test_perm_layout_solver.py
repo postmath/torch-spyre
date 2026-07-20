@@ -106,10 +106,11 @@ def _check_contact_faithful(test, plan, tag=""):
     pos = plan.position
 
     def top(w):
-        # Exclusive top of a placed buffer; +inf for an evicted (None) one.
+        # Exclusive top of a placed buffer; +inf for an evicted (None) one. Uses
+        # the plan-local size so a resize is reflected.
         if plan.addresses[w] is None:
             return float("inf")
-        return plan.addresses[w] + plan.buffers[w].size
+        return plan.addresses[w] + plan._sizes[w]
 
     def alive(w):
         return plan.buffers[w].start_time <= t < plan.buffers[w].end_time
@@ -117,13 +118,19 @@ def _check_contact_faithful(test, plan, tag=""):
     for c in range(n):
         bc = plan.buffers[c]
         if plan.addresses[c] is None:
-            # c is evicted: it has no concrete geometry to validate. (Its
-            # order-based contact relation is still checked via _check_consistency
-            # and the placed buffers below.)
+            # c is evicted (or ineligible / in HBM): no concrete geometry to
+            # validate. (Its order-based contact relation is still checked via
+            # _check_consistency and the placed buffers below.)
             continue
         for t in range(bc.start_time, bc.end_time):
             contact = plan.contact_at(c, t)
-            cand = [w for w in plan.overlap_dict[c] if pos[w] < pos[c] and alive(w)]
+            # Only eligible earlier buffers are in the stack (an ineligible one is
+            # transparent), matching the candidate set placement actually uses.
+            cand = [
+                w
+                for w in plan.overlap_dict[c]
+                if pos[w] < pos[c] and alive(w) and plan._eligible[w]
+            ]
             if not cand:
                 test.assertIsNone(contact, f"{tag} c={c} t={t}")
                 continue
@@ -183,6 +190,36 @@ def _buf(name, size, start, end, in_place_parents=None):
         size=size,
         uses=[start, end - 1],
         in_place_parents=in_place_parents or [],
+    )
+
+
+def _rebuilt_with_state(plan, capacity, alignment):
+    """A fresh ``PermutationBasedLayoutSolver`` reproducing ``plan``'s current
+    permutation, *sizes*, and *eligibility* -- the from-scratch oracle for the
+    resize / set_eligible differential checks.
+
+    ``resize`` mutates the plan-local ``_sizes`` (never the shared buffer
+    objects), so the rebuild is fed fresh buffers carrying those sizes; the live
+    eligibility is passed through the constructor. This is the analogue of the
+    ``rebuilt = PermutationBasedLayoutSolver(buffers, fast.permutation, ...)``
+    oracle the swap/rotate tests use, extended to the co-opt state.
+    """
+    fresh = [
+        LifetimeBoundBuffer(
+            name=b.name,
+            size=plan._sizes[i],
+            uses=list(b.uses),
+            first_use_is_read=b.first_use_is_read,
+            in_place_parents=list(b.in_place_parents),
+        )
+        for i, b in enumerate(plan.buffers)
+    ]
+    return PermutationBasedLayoutSolver(
+        fresh,
+        list(plan.permutation),
+        capacity,
+        alignment,
+        eligible=list(plan._eligible),
     )
 
 
@@ -1031,6 +1068,222 @@ class FastRotateTests(TestCase):
             self.assertEqual(fast.below_profile, chain.below_profile, tag)
             self.assertEqual(fast.above_profile, chain.above_profile, tag)
             self.assertEqual(fast.inplace_reuse, chain.inplace_reuse, tag)
+
+
+class EligibilityConstructionTests(TestCase):
+    """Constructing a plan with some buffers ineligible up front."""
+
+    def plan(self, buffers, permutation, eligible, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(
+            buffers, permutation, capacity, alignment, eligible=eligible
+        )
+
+    def test_default_all_eligible(self):
+        buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
+        plan = PermutationBasedLayoutSolver(buffers, [0, 1], 10_000, 1)
+        self.assertEqual(plan._eligible, [True, True])
+
+    def test_bad_eligible_length_rejected(self):
+        buffers = [_buf("a", 64, 0, 2)]
+        with self.assertRaises(AssertionError):
+            self.plan(buffers, [0], eligible=[True, False])
+
+    def test_ineligible_buffer_is_transparent(self):
+        # b ineligible: routed to HBM (no address, no quality), and c stacks
+        # directly on a as if b were absent -- not on b.
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
+        plan = self.plan(buffers, [0, 1, 2], eligible=[True, False, True])
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertEqual(_addr(plan, "c"), 64)  # rests on a, not on b
+        self.assertEqual(plan.quality(), 2.5 * (64 + 40))
+        self.assertEqual(plan.count_allocated(), 2)
+        self.assertEqual(_below_named(plan, "c"), [(0, 3, "a")])
+        # b's own profile is a trivial "nothing here" step function.
+        self.assertEqual(_below_named(plan, "b"), [(0, 3, None)])
+        self.assertEqual(_above_named(plan, "b"), [(0, 3, None)])
+        _check_consistency(self, plan)
+        _check_contact_faithful(self, plan)
+
+    def test_matches_reference_with_initial_eligibility(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
+        elig = [True, False, True]
+        fast = self.plan(buffers, [0, 1, 2], eligible=elig)
+        ref = ReferencePermutationBasedLayoutSolver(
+            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
+        )
+        self.assertEqual(fast.addresses, ref.addresses)
+        self.assertEqual(fast.quality(), ref.quality())
+
+
+class ResizeTests(TestCase):
+    """resize(idx, new_size): change a footprint in place and re-place."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def test_resize_shifts_stacked_neighbour(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3)]
+        plan = self.plan(buffers, [0, 1])
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 64])
+        delta = plan.resize(0, 100)  # a grows -> b moves up
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 100])
+        # a's quality rises (2.5 * (100 - 64)); b's is unchanged.
+        self.assertEqual(delta, 2.5 * (100 - 64))
+        self.assertEqual(plan.quality(), 2.5 * (100 + 50))
+        # The shared buffer object is NOT mutated.
+        self.assertEqual(buffers[0].size, 64)
+
+    def test_resize_over_capacity_evicts_and_uneviction(self):
+        buffers = [_buf("a", 40, 0, 2), _buf("b", 40, 0, 2)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 40])
+        plan.resize(0, 80)  # a@0..80, b@80..120 > 100 -> b evicted
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertEqual(plan.count_allocated(), 1)
+        plan.resize(0, 40)  # shrink back -> b re-fits
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 40])
+        self.assertEqual(plan.count_allocated(), 2)
+
+    def test_resize_ineligible_is_bookkeeping_only(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3)]
+        plan = PermutationBasedLayoutSolver(
+            buffers, [0, 1], 10_000, 1, eligible=[True, False]
+        )
+        before = list(plan.addresses)
+        delta = plan.resize(1, 5000)  # b is in HBM: nothing observable changes
+        self.assertEqual(delta, 0.0)
+        self.assertEqual(plan.addresses, before)
+        self.assertEqual(plan._sizes[1], 5000)  # but the size is recorded
+
+    def test_resize_crosses_inplace_fit_boundary(self):
+        # child reuses parent while it fits; growing it past the parent forces a
+        # stack, and shrinking it back restores the reuse.
+        parent = _buf("p", 128, 0, 5)
+        child = _buf("c", 64, 4, 10, in_place_parents=["p"])
+        plan = self.plan([parent, child], [0, 1])
+        self.assertEqual(_addr(plan, "c"), 0)  # reuses p
+        plan.resize(1, 200)  # c no longer fits in p
+        self.assertEqual(_addr(plan, "c"), 128)  # stacks on p
+        plan.resize(1, 64)
+        self.assertEqual(_addr(plan, "c"), 0)  # reuse restored
+
+
+class SetEligibleTests(TestCase):
+    """set_eligible(idx, flag): toggle a buffer in/out of LX."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def test_toggle_out_then_in_restores(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
+        plan = self.plan(buffers, [0, 1, 2])
+        self.assertEqual([_addr(plan, n) for n in "abc"], [0, 64, 114])
+        d_out = plan.set_eligible(1, False)  # b -> HBM
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertEqual(_addr(plan, "c"), 64)  # c drops onto a
+        self.assertEqual(d_out, -2.5 * 50)
+        d_in = plan.set_eligible(1, True)  # b -> LX at its slot
+        self.assertEqual([_addr(plan, n) for n in "abc"], [0, 64, 114])
+        self.assertEqual(d_in, 2.5 * 50)
+        # Profiles match a fresh build after the round trip.
+        rebuilt = _rebuilt_with_state(plan, 10_000, 1)
+        self.assertEqual(plan.below_profile, rebuilt.below_profile)
+        self.assertEqual(plan.above_profile, rebuilt.above_profile)
+        _check_consistency(self, plan)
+        _check_contact_faithful(self, plan)
+
+    def test_toggle_unchanged_flag_is_noop(self):
+        buffers = [_buf("a", 64, 0, 2)]
+        plan = self.plan(buffers, [0])
+        before = list(plan.addresses)
+        self.assertEqual(plan.set_eligible(0, True), 0.0)  # already eligible
+        self.assertEqual(plan.addresses, before)
+
+    def test_toggle_out_uneviction(self):
+        # a@0(60); b rests on a -> 120 > 100 evicted. Making a ineligible frees
+        # the floor so b re-fits at 0.
+        buffers = [_buf("a", 60, 0, 3), _buf("b", 60, 0, 3)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        plan.set_eligible(0, False)
+        self.assertIsNone(_addr(plan, "a"))
+        self.assertEqual(_addr(plan, "b"), 0)  # un-evicted
+        self.assertEqual(plan.count_allocated(), 1)
+
+
+class ResizeEligibilityDifferentialTests(TestCase):
+    """Randomized differential coverage for resize + set_eligible interleaved
+    with swap / rotate, against both the from-scratch reference (O(n^2) scan) and
+    a fresh rebuild carrying the same size/eligibility state."""
+
+    def _assert_matches(self, fast, ref, cap, align, delta, before, tag):
+        # Live reference (independent O(n^2) scan of the current state).
+        self.assertEqual(fast.addresses, ref.addresses, tag)
+        self.assertEqual(fast.quality(), ref.quality(), tag)
+        self.assertEqual(fast.count_allocated(), ref.count_allocated(), tag)
+        self.assertEqual(delta, fast.quality() - before, tag)
+        # Fresh rebuild reproducing the current sizes + eligibility: profiles and
+        # in-place reuse (both size/eligibility dependent) must match exactly.
+        rebuilt = _rebuilt_with_state(fast, cap, align)
+        self.assertEqual(fast.addresses, rebuilt.addresses, tag)
+        self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
+        self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
+        self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+        _check_consistency(self, fast, tag)
+        _check_contact_faithful(self, fast, tag)
+
+    def _apply(self, op, plan, rng, n):
+        """Apply a random instance of ``op`` to ``plan``; return its delta."""
+        if op == "swap":
+            return plan.swap(rng.randrange(n - 1))
+        if op == "rotate":
+            return plan.rotate(rng.randrange(n), rng.randrange(n))
+        if op == "resize":
+            idx = rng.randrange(n)
+            # A mix of shrink, grow-in-bounds, and grow-past-capacity (evicts).
+            new = rng.choice([1, rng.randint(1, 300), rng.randint(300, 1200)])
+            return plan.resize(idx, new)
+        # toggle-eligibility
+        idx = rng.randrange(n)
+        return plan.set_eligible(idx, not plan._eligible[idx])
+
+    def _sync_reference(self, ref, fast):
+        """Rebuild ``ref`` to reproduce ``fast``'s post-move state, giving an
+        independent O(n^2) oracle regardless of how the move was chosen."""
+        ref.permutation = list(fast.permutation)
+        ref._sizes = list(fast._sizes)
+        ref._qualities = list(fast._qualities)
+        ref._eligible = list(fast._eligible)
+        ref._build()
+
+    def test_random_mixed_sequences_match_oracles(self):
+        seeds = 4000 if _STRESS else 800
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            fast._rotate_remove_insert_threshold = 1  # exercise the fast path
+            ref = ReferencePermutationBasedLayoutSolver(buffers, perm, cap, align)
+
+            ops = ["swap", "rotate", "resize", "toggle"]
+            for step in range(rng.randint(1, 3 * n + 3)):
+                op = rng.choice(ops)
+                if op == "swap" and n < 2:
+                    op = "resize"  # no adjacent pair to swap
+                before = fast.quality()
+                d_fast = self._apply(op, fast, rng, n)
+                self._sync_reference(ref, fast)
+                tag = f"seed={seed} step={step} op={op} elig={fast._eligible}"
+                self._assert_matches(fast, ref, cap, align, d_fast, before, tag)
 
 
 class CopyTests(TestCase):
