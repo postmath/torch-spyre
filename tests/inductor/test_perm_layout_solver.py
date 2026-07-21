@@ -29,6 +29,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
     ReferencePermutationBasedLayoutSolver,
 )
+from torch_spyre._C import NativePermutationLayoutSolver
 
 ALIGNMENT = 128
 
@@ -1348,6 +1349,108 @@ class ResizeEligibilityDifferentialTests(TestCase):
                 self._sync_reference(ref, fast)
                 tag = f"seed={seed} step={step} op={op} elig={fast._eligible}"
                 self._assert_matches(fast, ref, cap, align, d_fast, before, tag)
+
+
+class NativeSolverDifferentialTests(TestCase):
+    """Differential coverage for the C++ ``NativePermutationLayoutSolver``
+    accelerator against the canonical Python ``PermutationBasedLayoutSolver``.
+
+    The C++ class is an opt-in accelerator; the Python packer stays canonical
+    and is the correctness oracle. This drives the SAME random interleaved
+    swap / rotate / resize / set_eligible sequences (the ``_apply`` mix from
+    :class:`ResizeEligibilityDifferentialTests`) through both and asserts
+    observable equality -- bit-for-bit identical ``addresses`` (None ==
+    evicted / HBM), ``quality()`` and ``count_allocated()`` -- after every op,
+    plus that the per-op quality delta each returns agrees.
+    """
+
+    def _apply_both(self, op, py_plan, cpp_plan, rng, n):
+        """Apply one random instance of ``op`` identically to both plans.
+
+        Returns ``(delta_py, delta_cpp)``. Every random parameter is drawn once
+        and reused, so the two plans receive byte-identical operations.
+        """
+        if op == "swap":
+            i = rng.randrange(n - 1)
+            return py_plan.swap(i), cpp_plan.swap(i)
+        if op == "rotate":
+            i, j = rng.randrange(n), rng.randrange(n)
+            return py_plan.rotate(i, j), cpp_plan.rotate(i, j)
+        if op == "resize":
+            idx = rng.randrange(n)
+            new = rng.choice([1, rng.randint(1, 300), rng.randint(300, 1200)])
+            return py_plan.resize(idx, new), cpp_plan.resize(idx, new)
+        # toggle-eligibility: the Python plan is the source of truth for the
+        # current flag; flip the same (idx, flag) on both.
+        idx = rng.randrange(n)
+        flag = not py_plan._eligible[idx]
+        return py_plan.set_eligible(idx, flag), cpp_plan.set_eligible(idx, flag)
+
+    def _assert_equal(self, py_plan, cpp_plan, tag):
+        self.assertEqual(list(cpp_plan.addresses), list(py_plan.addresses), tag)
+        self.assertEqual(cpp_plan.quality(), py_plan.quality(), tag)
+        self.assertEqual(cpp_plan.count_allocated(), py_plan.count_allocated(), tag)
+
+    def test_random_mixed_sequences_match_python(self):
+        seeds = 4000 if _STRESS else 800
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            py_plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            py_plan._rotate_remove_insert_threshold = 1  # exercise the fast path
+            cpp_plan = NativePermutationLayoutSolver(buffers, perm, cap, align)
+
+            self._assert_equal(py_plan, cpp_plan, f"seed={seed} init")
+
+            ops = ["swap", "rotate", "resize", "toggle"]
+            for step in range(rng.randint(1, 3 * n + 3)):
+                op = rng.choice(ops)
+                if op == "swap" and n < 2:
+                    op = "resize"  # no adjacent pair to swap
+                d_py, d_cpp = self._apply_both(op, py_plan, cpp_plan, rng, n)
+                tag = f"seed={seed} step={step} op={op}"
+                self.assertEqual(d_cpp, d_py, tag)
+                self._assert_equal(py_plan, cpp_plan, tag)
+
+    def test_copy_is_independent_and_matches_python(self):
+        # copy() yields an independent snapshot: mutating the clone leaves the
+        # source observably unchanged, and the mutated clone still matches a
+        # Python plan driven through the same swaps.
+        for seed in range(400):
+            rng = random.Random(seed)
+            n = rng.randint(2, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            cpp_plan = NativePermutationLayoutSolver(buffers, perm, cap, align)
+            src_addr = list(cpp_plan.addresses)
+            src_q = cpp_plan.quality()
+
+            clone = cpp_plan.copy()
+            py_plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            swaps = [rng.randrange(n - 1) for _ in range(rng.randint(1, 2 * n))]
+            for i in swaps:
+                clone.swap(i)
+                py_plan.swap(i)
+
+            # Source untouched by clone mutations.
+            self.assertEqual(list(cpp_plan.addresses), src_addr, f"seed={seed}")
+            self.assertEqual(cpp_plan.quality(), src_q, f"seed={seed}")
+            # Mutated clone matches the Python plan run through the same swaps.
+            self.assertEqual(
+                list(clone.addresses), list(py_plan.addresses), f"seed={seed}"
+            )
+            self.assertEqual(clone.quality(), py_plan.quality(), f"seed={seed}")
+            self.assertEqual(
+                clone.count_allocated(), py_plan.count_allocated(), f"seed={seed}"
+            )
 
 
 class CopyTests(TestCase):
