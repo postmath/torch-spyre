@@ -1504,6 +1504,139 @@ class StressTests(TestCase):
             self._assert_matches_rebuild(clone, cap, align, f"seed={seed} (clone)")
 
 
+try:
+    from torch_spyre._C import NativePermutationLayoutSolver
+
+    _HAVE_NATIVE = True
+except ImportError:  # pragma: no cover - native extension not built
+    NativePermutationLayoutSolver = None  # type: ignore[assignment,misc]
+    _HAVE_NATIVE = False
+
+
+@unittest.skipUnless(
+    _HAVE_NATIVE, "torch_spyre._C.NativePermutationLayoutSolver not available"
+)
+class NativeDifferentialTests(TestCase):
+    """Differential test of the C++ ``NativePermutationLayoutSolver`` against the
+    canonical Python ``PermutationBasedLayoutSolver`` (the oracle).
+
+    The SAME random interleaved swap/rotate/resize/set_eligible sequence is
+    driven through both plans; after every op we assert bit-for-bit identical
+    observable state: ``addresses`` (list; ``None`` == evicted/HBM), ``quality()``
+    / ``count_allocated()``, the per-op returned delta, the contact relation
+    (both below and above profiles, segment for segment), and ``inplace_reuse``.
+    """
+
+    def _below_pairs(self, plan, idx):
+        p = plan.below_profile[idx]
+        return list(p.starts), list(p.labels)
+
+    def _above_pairs(self, plan, idx):
+        p = plan.above_profile[idx]
+        return list(p.starts), list(p.labels)
+
+    def _assert_observably_equal(self, py_plan, native, tag):
+        n = len(py_plan.buffers)
+        self.assertEqual(list(native.addresses), py_plan.addresses, tag)
+        self.assertEqual(native.quality(), py_plan.quality(), tag)
+        self.assertEqual(native.count_allocated(), py_plan.count_allocated(), tag)
+        # Contact relation: below/above profiles must match segment for segment.
+        for idx in range(n):
+            self.assertEqual(
+                native.below_profile(idx),
+                self._below_pairs(py_plan, idx),
+                f"{tag} below idx={idx}",
+            )
+            self.assertEqual(
+                native.above_profile(idx),
+                self._above_pairs(py_plan, idx),
+                f"{tag} above idx={idx}",
+            )
+        self.assertEqual(native.inplace_reuse(), py_plan.inplace_reuse, tag)
+
+    def _draw_op(self, rng, n):
+        """Draw a random op and its arguments once, so the identical move can be
+        applied to both plans."""
+        ops = ["swap", "rotate", "resize", "toggle"]
+        op = rng.choice(ops)
+        if op == "swap" and n < 2:
+            op = "resize"
+        if op == "swap":
+            return ("swap", rng.randrange(n - 1))
+        if op == "rotate":
+            return ("rotate", rng.randrange(n), rng.randrange(n))
+        if op == "resize":
+            idx = rng.randrange(n)
+            new = rng.choice([1, rng.randint(1, 300), rng.randint(300, 1200)])
+            return ("resize", idx, new)
+        # toggle-eligibility: flip idx relative to the Python plan's current flag.
+        idx = rng.randrange(n)
+        return ("toggle", idx)
+
+    def _apply_to(self, plan, move):
+        kind = move[0]
+        if kind == "swap":
+            return plan.swap(move[1])
+        if kind == "rotate":
+            return plan.rotate(move[1], move[2])
+        if kind == "resize":
+            return plan.resize(move[1], move[2])
+        # toggle: read the current flag off the Python plan is not available for
+        # the native plan, so both flip against the passed target.
+        return plan.set_eligible(move[1], move[2])
+
+    def test_random_mixed_sequences_match_python_oracle(self):
+        seeds = 4000 if _STRESS else 800
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+
+            py_plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            py_plan._rotate_remove_insert_threshold = 1  # exercise the fast path
+            native = NativePermutationLayoutSolver(buffers, perm, cap, align)
+            native._rotate_remove_insert_threshold = 1
+
+            self._assert_observably_equal(py_plan, native, f"seed={seed} init")
+
+            for step in range(rng.randint(1, 3 * n + 3)):
+                move = self._draw_op(rng, n)
+                if move[0] == "toggle":
+                    # Resolve the concrete target flag from the Python oracle and
+                    # feed the same flag to both plans.
+                    target = not py_plan._eligible[move[1]]
+                    move = ("toggle", move[1], target)
+                py_before = py_plan.quality()
+                nat_before = native.quality()
+                d_py = self._apply_to(py_plan, move)
+                d_nat = self._apply_to(native, move)
+                tag = f"seed={seed} step={step} move={move}"
+                self.assertEqual(d_nat, d_py, f"{tag} delta")
+                self.assertEqual(d_py, py_plan.quality() - py_before, f"{tag} py-delta")
+                self.assertEqual(
+                    d_nat, native.quality() - nat_before, f"{tag} nat-delta"
+                )
+                self._assert_observably_equal(py_plan, native, tag)
+
+    def test_copy_is_independent(self):
+        rng = random.Random(12345)
+        n = 7
+        buffers = _random_buffers(rng, n)
+        perm = list(range(n))
+        rng.shuffle(perm)
+        native = NativePermutationLayoutSolver(buffers, perm, 400, 64)
+        clone = native.copy()
+        before = list(native.addresses)
+        for _ in range(20):
+            clone.swap(rng.randrange(n - 1))
+        # Mutating the clone leaves the original untouched.
+        self.assertEqual(list(native.addresses), before)
+
+
 class ProfileTests(TestCase):
     """Unit tests for the Profile step-function, in isolation."""
 

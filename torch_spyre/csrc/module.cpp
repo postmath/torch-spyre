@@ -43,6 +43,7 @@
 #include "logging.h"
 #include "logging_bindings.h"
 #include "logging_config.h"
+#include "permutation_layout_native.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
@@ -203,6 +204,10 @@ PYBIND11_MODULE(_C, m) {
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
+
+  // Register the native (C++) permutation-based layout solver: an opt-in
+  // accelerator mirroring the canonical Python PermutationBasedLayoutSolver.
+  torch_spyre::scratchpad::register_native_permutation_layout(m);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
