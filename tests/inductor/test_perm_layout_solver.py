@@ -1654,3 +1654,42 @@ class ProfileTests(TestCase):
         p.splice(3, 7, [3, 7], [2])
         self.assertEqual(p, Profile([0, 3, 7, 10], [None, 2, None]))
         p.validate()
+
+
+class NativeGuardTests(TestCase):
+    """The C++ accelerator validates out-of-range / degenerate arguments and
+    raises (like ``swap()`` already did, and like the Python packer's fail-fast
+    asserts) instead of corrupting the heap or crashing. Regression coverage for
+    the memory-safety review's ASan-confirmed findings (bad ``idx``/``i``/``j``
+    into resize/rotate/set_eligible, empty ``uses``, zero alignment)."""
+
+    def _plan(self, n=3):
+        bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
+        return NativePermutationLayoutSolver(bufs, list(range(n)), 10_000, 128)
+
+    def test_resize_index_out_of_range_raises(self):
+        p = self._plan()
+        for bad in (-1, 3, 999):
+            with self.assertRaises(ValueError):
+                p.resize(bad, 100)
+
+    def test_rotate_index_out_of_range_raises(self):
+        p = self._plan()
+        for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1)):
+            with self.assertRaises(ValueError):
+                p.rotate(i, j)
+
+    def test_set_eligible_index_out_of_range_raises(self):
+        p = self._plan()
+        for bad in (-1, 3, 999):
+            with self.assertRaises(ValueError):
+                p.set_eligible(bad, False)
+
+    def test_empty_uses_raises(self):
+        bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])
+        with self.assertRaises(ValueError):
+            NativePermutationLayoutSolver([bad], [0], 10_000, 128)
+
+    def test_zero_alignment_raises(self):
+        with self.assertRaises(ValueError):
+            NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)

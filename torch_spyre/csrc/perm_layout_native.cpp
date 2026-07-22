@@ -92,6 +92,9 @@ class NativePermutationLayoutSolver {
     st->n = n;
     st->capacity = capacity;
     st->alignment = alignment;
+    if (alignment <= 0) {
+      throw std::invalid_argument("alignment must be positive");
+    }
 
     // Validate the permutation is a permutation of range(n).
     {
@@ -117,6 +120,9 @@ class NativePermutationLayoutSolver {
       names[i] = b.attr("name").cast<std::string>();
       sizes_[i] = b.attr("size").cast<int64_t>();
       std::vector<int64_t> uses = b.attr("uses").cast<std::vector<int64_t>>();
+      if (uses.empty()) {
+        throw std::invalid_argument("buffer uses must be non-empty");
+      }
       bool first_read = b.attr("first_use_is_read").cast<bool>();
       parent_names[i] =
           b.attr("in_place_parents").cast<std::vector<std::string>>();
@@ -207,6 +213,10 @@ class NativePermutationLayoutSolver {
 
   double rotate(int i, int j) {
     if (i == j) return 0.0;
+    const int n = st_->n;
+    if (i < 0 || i >= n || j < 0 || j >= n) {
+      throw std::invalid_argument("rotate index out of range");
+    }
     if (!eligible_[permutation_[i]]) {
       // Moving a transparent (HBM) buffer changes no eligible buffer's relative
       // order, so no address moves; just relocate its slot.
@@ -220,6 +230,9 @@ class NativePermutationLayoutSolver {
   }
 
   double resize(int idx, int64_t new_size) {
+    if (idx < 0 || idx >= st_->n) {
+      throw std::invalid_argument("resize index out of range");
+    }
     const double old_total = total_quality_;
     sizes_[idx] = new_size;
     // An ineligible buffer is in HBM: its size affects nothing observable, but
@@ -230,6 +243,9 @@ class NativePermutationLayoutSolver {
   }
 
   double set_eligible(int idx, bool flag) {
+    if (idx < 0 || idx >= st_->n) {
+      throw std::invalid_argument("set_eligible index out of range");
+    }
     if (static_cast<bool>(eligible_[idx]) == flag) return 0.0;
     const double old_total = total_quality_;
     eligible_[idx] = flag ? 1 : 0;
@@ -459,8 +475,8 @@ class NativePermutationLayoutSolver {
 
   // Scratch reused across RecomputeAll / PlaceDecision calls.
   std::vector<int> cand_;
-  std::vector<int> cand_mark_;
-  int cand_gen_ = 0;
+  std::vector<uint64_t> cand_mark_;
+  uint64_t cand_gen_ = 0;
   std::vector<int> placed_at_;
   std::vector<char> has_none_at_;
   std::vector<char> done_at_;
