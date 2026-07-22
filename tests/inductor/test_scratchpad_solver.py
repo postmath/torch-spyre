@@ -371,7 +371,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 _DETERMINISM_SNIPPET_TEMPLATE = """
 import json
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import {solver_class}
+from {solver_module} import {solver_class}
 def b(n, s, st, en, ipp=None):
     return LifetimeBoundBuffer(name=n, size=s, uses=[st, en - 1], in_place_parents=ipp or [])
 # c has two in-place parents at distinct addresses, both in-place candidates for
@@ -382,13 +382,15 @@ print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
 """
 
 
-def _run_determinism_snippet(hashseed, solver_class_name):
+def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
     env = dict(
         os.environ,
         PYTHONHASHSEED=str(hashseed),
         TORCH_DEVICE_BACKEND_AUTOLOAD="0",
     )
-    snippet = _DETERMINISM_SNIPPET_TEMPLATE.format(solver_class=solver_class_name)
+    snippet = _DETERMINISM_SNIPPET_TEMPLATE.format(
+        solver_class=solver_class_name, solver_module=solver_module
+    )
     p = subprocess.run(
         [sys.executable, "-c", snippet],
         capture_output=True,
@@ -465,10 +467,11 @@ class ScoreOrderingTests:
     def test_inplace_parent_choice_is_hashseed_independent(self):
         """Placement must not depend on PYTHONHASHSEED (set-iteration order)."""
         solver_class_name = self.solver_class.__name__
-        base = _run_determinism_snippet(0, solver_class_name)
+        solver_module = self.solver_class.__module__
+        base = _run_determinism_snippet(0, solver_class_name, solver_module)
         for hashseed in range(1, 10):
             self.assertEqual(
-                _run_determinism_snippet(hashseed, solver_class_name),
+                _run_determinism_snippet(hashseed, solver_class_name, solver_module),
                 base,
                 f"PYTHONHASHSEED={hashseed}",
             )
