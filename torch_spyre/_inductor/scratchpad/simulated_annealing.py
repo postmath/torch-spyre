@@ -64,7 +64,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.permutation_layout import (
-    PermutationBasedLayoutSolver,
+    make_permutation_packer,
 )
 
 
@@ -162,9 +162,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
             convertor = SolverToPermutation(initial)
             self.initial = convertor.permutation(self.buffers)
 
-        self.plan = PermutationBasedLayoutSolver(
-            self.buffers, self.initial, size, alignment
-        )
+        self.plan = make_permutation_packer(self.buffers, self.initial, size, alignment)
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
         self.best_quality = self.plan.quality()
@@ -223,7 +221,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         # Commit the best permutation seen, so finalize() writes it rather than
         # whatever state annealing happened to end in.
         if self.plan.permutation != self.best_permutation:
-            self.plan = PermutationBasedLayoutSolver(
+            self.plan = make_permutation_packer(
                 self.buffers, list(self.best_permutation), self.size, self.alignment
             )
 
