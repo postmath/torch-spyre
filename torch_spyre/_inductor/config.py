@@ -103,4 +103,11 @@ layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
 
+# Use the C++ (native) permutation-layout packer accelerator when it is built
+# into the ``_C`` extension. The native and Python packers are behaviourally
+# identical (verified bit-for-bit); the native one is faster. Set False (or
+# ``TORCH_SPYRE_NATIVE_PACKER=0``, which backs this default) to force the
+# pure-Python packer; it is also used automatically if the extension lacks it.
+native_layout_packer: bool = os.environ.get("TORCH_SPYRE_NATIVE_PACKER", "1") != "0"
+
 install_config_module(sys.modules[__name__])

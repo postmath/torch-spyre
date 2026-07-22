@@ -30,7 +30,6 @@ from abc import ABC, abstractmethod
 import bisect
 import heapq
 import math
-import os
 import warnings
 
 from torch_spyre._inductor.scratchpad.contact_profile import Profile
@@ -1573,17 +1572,22 @@ def make_permutation_packer(
     alignment: int = 128,
     eligible: Optional[list[bool]] = None,
 ):
-    """Construct a permutation packer, choosing the C++ accelerator when opted in.
+    """Construct a permutation packer, using the C++ accelerator by default.
 
     Returns a :class:`_NativePackerAdapter` (over the C++
-    ``NativePermutationLayoutSolver``) iff the environment variable
-    ``TORCH_SPYRE_NATIVE_PACKER == "1"`` *and* the native class is importable;
-    otherwise the canonical Python :class:`PermutationBasedLayoutSolver`. If the
-    flag is set but the native class is unavailable, a one-time warning is emitted
-    and the Python packer is used. With the flag unset (the default) the Python
-    packer is always returned, so existing behaviour is byte-for-byte unchanged.
+    ``NativePermutationLayoutSolver``) when ``config.native_layout_packer`` is
+    true (the default -- back it off with that config knob, or its
+    ``TORCH_SPYRE_NATIVE_PACKER=0`` env default) and the native class is
+    importable. When the knob is false, or the native class is unavailable, the
+    canonical Python :class:`PermutationBasedLayoutSolver` is used instead. The
+    two packers are behaviourally identical (verified bit-for-bit by the
+    differential and the SA-equivalence tests); the C++ one is the faster default.
+    If the native class is unavailable a one-time warning is emitted before
+    falling back to Python.
     """
-    if os.environ.get("TORCH_SPYRE_NATIVE_PACKER") == "1":
+    from torch_spyre._inductor import config
+
+    if config.native_layout_packer:
         native_cls = _native_solver_class()
         if native_cls is not None:
             return _NativePackerAdapter(
@@ -1593,9 +1597,10 @@ def make_permutation_packer(
         if not _native_packer_warned:
             _native_packer_warned = True
             warnings.warn(
-                "TORCH_SPYRE_NATIVE_PACKER=1 was set but "
                 "torch_spyre._C.NativePermutationLayoutSolver is unavailable; "
-                "falling back to the Python permutation packer.",
+                "using the Python permutation packer. Set "
+                "config.native_layout_packer = False to select the Python packer "
+                "explicitly and silence this warning.",
                 RuntimeWarning,
                 stacklevel=2,
             )
