@@ -59,12 +59,15 @@ namespace scratchpad {
 
 namespace {
 
+// Default placement alignment: one Spyre stick (128 bytes).
+constexpr int64_t kDefaultAlignment = 128;
+
 // Immutable-during-planning data derived from the buffers, the capacity and the
 // alignment. Shared by reference between a solver and its ``copy()`` clones.
 struct StaticData {
   int n = 0;
   int64_t capacity = 0;
-  int64_t alignment = 128;
+  int64_t alignment = kDefaultAlignment;
   std::vector<int64_t> start;  // start_time == uses.front()
   std::vector<int64_t> end;    // end_time == uses.back() + 1
   std::vector<double> weight;  // len(uses) + (first_use_is_read ? 0.0 : 0.5)
@@ -166,7 +169,7 @@ class NativePermutationLayoutSolver {
                                      partner_sets[i].end());
     }
 
-    BuildIntervalData(st.get());
+    BuildIntervalData(*st);
 
     st_ = std::move(st);
 
@@ -277,20 +280,22 @@ class NativePermutationLayoutSolver {
   }
 
  private:
-  static void BuildIntervalData(StaticData* st) {
-    const int n = st->n;
+  // Mirrors PermutationBasedLayoutSolverBase._build_interval_data. Takes a
+  // reference (not a pointer): the StaticData is a required, non-null argument.
+  static void BuildIntervalData(StaticData& st) {
+    const int n = st.n;
     std::vector<int64_t> pts;
     pts.reserve(2 * n);
     for (int i = 0; i < n; ++i) {
-      pts.push_back(st->start[i]);
-      pts.push_back(st->end[i]);
+      pts.push_back(st.start[i]);
+      pts.push_back(st.end[i]);
     }
     std::sort(pts.begin(), pts.end());
     pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
     const int k = std::max(0, static_cast<int>(pts.size()) - 1);
-    st->num_intervals = k;
-    st->total_at.assign(k, 0);
-    st->buf_intervals.assign(n, {0, 0});
+    st.num_intervals = k;
+    st.total_at.assign(k, 0);
+    st.buf_intervals.assign(n, {0, 0});
     if (k == 0) return;
     // Delta sweep: +1 at each start interval, -1 at each end interval.
     std::vector<int> deltas(k + 1, 0);
@@ -299,16 +304,16 @@ class NativePermutationLayoutSolver {
                               pts.begin());
     };
     for (int i = 0; i < n; ++i) {
-      int lo = bisect_left(st->start[i]);
-      int hi = bisect_left(st->end[i]);
+      int lo = bisect_left(st.start[i]);
+      int hi = bisect_left(st.end[i]);
       deltas[lo] += 1;
       deltas[hi] -= 1;
-      st->buf_intervals[i] = {lo, hi};
+      st.buf_intervals[i] = {lo, hi};
     }
     int running = 0;
     for (int i = 0; i < k; ++i) {
       running += deltas[i];
-      st->total_at[i] = running;
+      st.total_at[i] = running;
     }
   }
 
@@ -322,7 +327,8 @@ class NativePermutationLayoutSolver {
   }
 
   // Returns (parent, child) for an in-place pair. One of the two members must
-  // declare the other as an in-place parent.
+  // declare the other as an in-place parent. Mirrors
+  // PermutationBasedLayoutSolverBase._in_place_pair.
   std::pair<int, int> InPlacePair(int i, int j) const {
     if (st_->declared_parents[i].count(j)) return {j, i};  // j parents i
     return {i, j};                                         // i parents j
@@ -380,7 +386,8 @@ class NativePermutationLayoutSolver {
   }
 
   // Places every buffer in permutation order with the saturation early-stop,
-  // rebuilding addresses, quality and the allocated count from scratch.
+  // rebuilding addresses, quality and the allocated count from scratch. Mirrors
+  // PermutationBasedLayoutSolverBase._sequential_place.
   void RecomputeAll() {
     const int n = st_->n;
     for (int pos = 0; pos < n; ++pos) position_[permutation_[pos]] = pos;
@@ -473,7 +480,12 @@ class NativePermutationLayoutSolver {
   double total_quality_ = 0.0;
   int total_allocated_count_ = 0;
 
-  // Scratch reused across RecomputeAll / PlaceDecision calls.
+  // Scratch reused across RecomputeAll / PlaceDecision calls. cand_mark_ is a
+  // generation-stamped membership set (replacing Python's
+  // partners.intersection(candidates)): PlaceDecision bumps cand_gen_ and
+  // stamps every candidate, so cand_mark_[p] == cand_gen_ tests "p is a
+  // candidate" without clearing the array each call. uint64_t so the counter
+  // never wraps.
   std::vector<int> cand_;
   std::vector<uint64_t> cand_mark_;
   uint64_t cand_gen_ = 0;
@@ -486,8 +498,9 @@ void register_perm_layout_native(py::module_& m) {
   py::class_<NativePermutationLayoutSolver>(m, "NativePermutationLayoutSolver")
       .def(py::init<const py::list&, std::vector<int>, int64_t, int64_t,
                     const py::object&>(),
-           py::arg("buffers"), py::arg("permutation"), py::arg("size"),
-           py::arg("alignment") = 128, py::arg("eligible") = py::none())
+           py::arg("buffers"), py::arg("permutation"), py::arg("capacity"),
+           py::arg("alignment") = kDefaultAlignment,
+           py::arg("eligible") = py::none())
       .def("swap", &NativePermutationLayoutSolver::swap, py::arg("i"))
       .def("rotate", &NativePermutationLayoutSolver::rotate, py::arg("i"),
            py::arg("j"))
