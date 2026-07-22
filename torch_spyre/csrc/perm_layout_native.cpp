@@ -279,6 +279,33 @@ class NativePermutationLayoutSolver {
     return out;
   }
 
+  // Current allocation order as a Python list (mirrors the Python packer's
+  // ``permutation`` list attribute).
+  py::list permutation() const {
+    py::list out;
+    for (int idx : permutation_) out.append(py::cast(idx));
+    return out;
+  }
+
+  // True if buffers ``i`` and ``j`` are alive at a common tick. Buffer-index
+  // args, bounds-checked; mirrors the Python base ``overlaps(i, j)``.
+  bool overlaps(int i, int j) const {
+    const int n = st_->n;
+    if (i < 0 || i >= n || j < 0 || j >= n) {
+      throw std::invalid_argument("overlaps index out of range");
+    }
+    return Overlaps(i, j);
+  }
+
+  // True if buffer ``idx`` has an address (fits below capacity).
+  // Bounds-checked; mirrors the Python base ``is_fully_allocated(idx)``.
+  bool is_fully_allocated(int idx) const {
+    if (idx < 0 || idx >= st_->n) {
+      throw std::invalid_argument("is_fully_allocated index out of range");
+    }
+    return allocated_[idx] != 0;
+  }
+
  private:
   // Mirrors PermutationBasedLayoutSolverBase._build_interval_data. Takes a
   // reference (not a pointer): the StaticData is a required, non-null argument.
@@ -511,6 +538,12 @@ void register_perm_layout_native(py::module_& m) {
       .def("copy", &NativePermutationLayoutSolver::copy)
       .def("quality", &NativePermutationLayoutSolver::quality)
       .def("count_allocated", &NativePermutationLayoutSolver::count_allocated)
+      .def("overlaps", &NativePermutationLayoutSolver::overlaps, py::arg("i"),
+           py::arg("j"))
+      .def("is_fully_allocated",
+           &NativePermutationLayoutSolver::is_fully_allocated, py::arg("idx"))
+      .def_property_readonly("permutation",
+                             &NativePermutationLayoutSolver::permutation)
       .def_property_readonly("addresses",
                              &NativePermutationLayoutSolver::addresses);
 }
