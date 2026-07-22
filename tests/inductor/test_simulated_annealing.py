@@ -19,7 +19,7 @@ import math
 import os
 import random as rnd
 import unittest
-from unittest import TestCase, mock
+from unittest import TestCase
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
@@ -39,6 +39,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
+from torch_spyre._inductor import config
 
 # Heavy randomized anneals over many seeds, larger problems and longer
 # schedules. Skipped by default (slow); opt in with the env var.
@@ -448,12 +449,10 @@ class NativePackerEquivalenceTests(TestCase):
     Any divergence here is a wiring/parity bug, not a tolerance to loosen."""
 
     def _run(self, buffers, capacity, initial, seed, *, native):
-        # The factory reads TORCH_SPYRE_NATIVE_PACKER at construction time, so the
-        # flag must be set across the whole solver lifetime (construct + solve +
-        # the reconstruction in solve() + finalize).
-        with mock.patch.dict(
-            os.environ, {"TORCH_SPYRE_NATIVE_PACKER": "1" if native else "0"}
-        ):
+        # The factory reads config.native_layout_packer at construction time, so
+        # the knob must be patched across the whole solver lifetime (construct +
+        # solve + the reconstruction in solve() + finalize).
+        with config.patch(native_layout_packer=native):
             solver = SimulatedAnnealingLayoutSolver(
                 buffers,
                 capacity,
