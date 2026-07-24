@@ -1646,18 +1646,16 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         merged = False
         for bufs in captured:
             for b in bufs:
-                if not b.in_place_parents:
-                    continue
-                # output feeder as in-place child, or as in-place parent of another.
-                if b.name in output_feeders or (
-                    set(b.in_place_parents) & output_feeders
-                ):
+                # An output-feeding buffer is used as an in-place *parent*: some
+                # consumer names it in its in_place_parents (matches the docstring;
+                # the sibling aliasing test uses the same tighter check).
+                if set(b.in_place_parents) & output_feeders:
                     merged = True
                     break
         self.assertTrue(
             merged,
-            "expected a graph-output-feeding buffer to participate in an in-place "
-            "merge (output-clone in-place should work via the normal path)",
+            "expected a graph-output-feeding buffer to be reused in place as a "
+            "parent (output-clone in-place should work via the normal path)",
         )
         ref_y, ref_q = fn(x.to("cpu"))
         self.assertTrue(
@@ -1733,6 +1731,71 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(
             torch.allclose(ref_y, ry, atol=1e-2, rtol=1e-3),
             "returned buffer y was corrupted by in-place reuse of its slot",
+        )
+        self.assertTrue(
+            torch.allclose(ref_u, ru, atol=1e-2, rtol=1e-3), "output u changed"
+        )
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_returned_buffer_reused_in_place_correct_in_cooptimizing_path(self):
+        """Same aliasing hazard as the sibling test, exercised on the co-optimizing
+        (joint CP-SAT) path: a returned buffer whose LX slot is reused in place must
+        still be handed back to the caller intact (#3212)."""
+        from torch_spyre._inductor.scratchpad.allocator import (
+            CoOptimizingAllocator,
+            _op_short_name,
+        )
+
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            y = x * 2.0  # returned AND read by z, w, v -> pinned + cloned to HBM
+            z = y * 3.0
+            w = y + z
+            v = y + w  # y's last internal read; v is realized (read by u)
+            u = v + 1.0
+            return y, u
+
+        output_feeders: set[str] = set()
+        captured: list[list] = []
+        orig = CoOptimizingAllocator._build_cd_bound_buffers
+
+        def spy(self, *a, **k):
+            bufs = orig(self, *a, **k)
+            captured.append(list(bufs))
+            return bufs
+
+        def collect_feeders(graph: GraphLowering) -> None:
+            by_name = {op.name: op for op in graph.operations}
+            for name in graph.get_output_names():
+                output_feeders.add(name)
+                op = by_name.get(name)
+                if op is not None and _op_short_name(op) == "clone":
+                    output_feeders.update(d.name for d in op.get_read_writes().reads)
+
+        with self.pre_scheduling_iterating_pass(collect_feeders):
+            with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+                with ts_inductor_config.patch(
+                    lx_planning=True,
+                    layout_solver="cpsat",
+                    co_optimizing_lx_planning=True,
+                ):
+                    compiled = torch.compile(fn, fullgraph=True)
+                    ry, ru = compiled(x)
+                    ry, ru = ry.to("cpu"), ru.to("cpu")
+
+        reused = any(
+            set(b.in_place_parents) & output_feeders for bufs in captured for b in bufs
+        )
+        self.assertTrue(
+            reused,
+            "expected the returned buffer's slot to be reused in place on the "
+            "co-optimizing path (hazard not exercised)",
+        )
+        ref_y, ref_u = fn(x.to("cpu"))
+        self.assertTrue(
+            torch.allclose(ref_y, ry, atol=1e-2, rtol=1e-3),
+            "returned buffer y was corrupted by in-place reuse (co-opt path)",
         )
         self.assertTrue(
             torch.allclose(ref_u, ru, atol=1e-2, rtol=1e-3), "output u changed"

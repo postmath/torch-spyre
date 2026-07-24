@@ -323,7 +323,10 @@ class ScratchpadAllocator:
                 continue
 
             uses = lifetimes[output_name]
-            parents = in_place.get(output_name, [])
+            # Copy: the reverse-parent block below appends to a consumer's
+            # in_place_parents, which would otherwise mutate this list in the shared
+            # ``in_place`` dict (matches the copy in ``_build_cd_bound_buffers``).
+            parents = list(in_place.get(output_name, []))
             size = info["size_per_core"]
 
             buffers.append(
@@ -465,13 +468,13 @@ class ScratchpadAllocator:
         With ``division_invariant`` the last condition (per-core size + core-div) is
         skipped: those depend on a core division the joint solver has not chosen
         yet, so it enforces them itself (``eff_size`` equality + the
-        ``cd_parent_matches`` gate). Only the division-invariant preconditions are
-        checked -- mirroring ``_determine_in_place_division_invariant``, but keeping
-        the per-input pointwise-eligibility check the latter omits.
+        ``cd_parent_matches`` gate). Only the first three (division-invariant)
+        preconditions are checked.
 
         This is the sole definition of a legal in-place edge, shared by
         ``_determine_in_place`` / ``_build_bound_buffers`` (placement path) and
-        ``_build_cd_bound_buffers`` (co-optimizing path), so they cannot drift.
+        ``_determine_in_place_division_invariant`` / ``_build_cd_bound_buffers``
+        (co-optimizing path), so they cannot drift.
         """
         base_ok = (
             parent_name in child_pointwise_inputs
