@@ -1500,23 +1500,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 in_layout = graph.get_buffer(input_buf).layout
                 if not hasattr(in_layout, "device_layout"):
                     continue
-                in_end = lifetimes[input_buf][-1]  # inclusive last use
                 in_ten_layout = in_layout.device_layout
-                # This duplicates the division-invariant subset of
-                # ``_inplace_edge_ok`` (layout match + single handoff tick; per-core
-                # size and core-division deferred to the solver). The helper now
-                # expresses exactly this via ``division_invariant=True`` and is used
-                # for the boundary-clone reverse-parent edges in
-                # ``_build_cd_bound_buffers`` -- but this producer->output loop still
-                # inlines the check and omits the helper's per-input
-                # pointwise-eligibility test (``input_buf in in_place_allowed``),
-                # a likely-unintended divergence that is benign today because
-                # pointwise-tagged ops expose all reads.
-                # TODO(follow-up): route this loop through ``_inplace_edge_ok`` too,
-                # resolving the per-input divergence with test coverage.
-                inp_i_lay_match = out_ten_layout == in_ten_layout
-                inp_i_eol = in_end == out_start  # same op reads input, writes output
-                if inp_i_lay_match and inp_i_eol:
+                # The division-invariant edge gate (layout match + single handoff
+                # tick; per-core size and core-division deferred to the solver). The
+                # ``division_invariant`` mode also applies the per-input
+                # pointwise-eligibility test (``input_buf in in_place_allowed``): for
+                # pointwise-tagged ops that is every read (a no-op), but for a
+                # non-tagged Pointwise op it drops an input read at a different index
+                # than the output write -- which must not be aliased over the output.
+                if self._inplace_edge_ok(
+                    child_pointwise_inputs=in_place_allowed[buf_name],
+                    parent_name=input_buf,
+                    child_device_layout=out_ten_layout,
+                    parent_device_layout=in_ten_layout,
+                    child_start=out_start,
+                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    division_invariant=True,
+                ):
                     allow_inplace[buf_name].append(input_buf)
         return allow_inplace
 

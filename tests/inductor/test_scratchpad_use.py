@@ -1425,6 +1425,70 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
     and the final LX addresses), so they live in a plain non-parameterized class
     rather than the model-sweep ``TestCloneAtGraphBoundaries``."""
 
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_division_invariant_edges_respect_per_input_pointwise(self):
+        """``_determine_in_place_division_invariant`` routes through
+        ``_inplace_edge_ok(division_invariant=True)``, so every in-place parent it
+        returns is a pointwise-eligible read of the child's op -- the per-input
+        check the loop previously omitted (#3212 follow-up).
+
+        Invariant guard: an input read at a different index than the output write
+        must never be offered as an in-place parent pre-solver. For pointwise-tagged
+        ops every read is eligible (so this holds trivially), but the assertion locks
+        the property in against a future regression that drops the per-input check."""
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            a = x + 1.0
+            b = a * 2.0
+            return b + 3.0
+
+        # The check must run inside the spy: _op_inputs_good_for_lx_inplace needs
+        # the virtualized (V) compile context, which is torn down once the
+        # torch.compile block exits.
+        violations: list[str] = []
+        edge_count = [0]
+        called = [False]
+        orig = CoOptimizingAllocator._determine_in_place_division_invariant
+
+        def spy(self, graph):
+            result = orig(self, graph)
+            called[0] = True
+            op_by_name = {op.name: op for op in graph.operations}
+            for buf_name, parents in result.items():
+                op = op_by_name.get(buf_name)
+                if op is None:
+                    continue
+                eligible = self._op_inputs_good_for_lx_inplace(op)
+                for parent in parents:
+                    edge_count[0] += 1
+                    if parent not in eligible:
+                        violations.append(f"{buf_name} -> {parent}")
+            return result
+
+        with patch.object(
+            CoOptimizingAllocator,
+            "_determine_in_place_division_invariant",
+            spy,
+        ):
+            with ts_inductor_config.patch(
+                lx_planning=True,
+                layout_solver="cpsat",
+                co_optimizing_lx_planning=True,
+            ):
+                torch.compile(fn, fullgraph=True)(x)
+
+        self.assertTrue(
+            called[0], "_determine_in_place_division_invariant was not called"
+        )
+        self.assertFalse(
+            violations,
+            f"in-place parents that are not pointwise-eligible reads: {violations}",
+        )
+        self.assertTrue(edge_count[0] > 0, "no in-place edges were produced to verify")
+
     def test_input_clone_reused_in_place_by_last_consumer(self):
         """The input clone's last consumer names the clone as an in-place parent
         (issue #3212), so the two may share an LX slot.
