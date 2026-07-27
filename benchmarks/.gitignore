@@ -1,0 +1,9 @@
+# Build/profiling artifacts (regenerate via standalone_packer/build.sh or setup.py)
+__pycache__/
+*.pyc
+*.so
+build/
+# perf/samply capture outputs
+*.perf
+perf.data*
+profile.json.gz
