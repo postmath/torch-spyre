@@ -370,13 +370,8 @@ class NativePermutationLayoutSolver {
   // the already-placed, time-overlapping, eligible candidates for ``idx``.
   // Returns {placed, addr}: {true, addr} if placed, {false, 0} if evicted
   // (None).
-  //
-  // ``noinline`` here and on the RecomputeAll phase helpers below is purely for
-  // profiling: it keeps each phase a distinct frame so a sampling profiler
-  // (py-spy --native) can attribute wall-clock self-time per phase. The bodies
-  // are large enough that the lost inlining is not measurable (A/B confirmed).
-  [[gnu::noinline]] std::pair<bool, int64_t> PlaceDecision(
-      int idx, const std::vector<int>& cand) {
+  std::pair<bool, int64_t> PlaceDecision(int idx,
+                                         const std::vector<int>& cand) {
     const int64_t cap = st_->capacity;
     if (cand.empty()) {
       // Lone buffer sits on the floor unless it alone exceeds capacity.
@@ -424,11 +419,11 @@ class NativePermutationLayoutSolver {
   // Places every buffer in permutation order with the saturation early-stop,
   // rebuilding addresses, quality and the allocated count from scratch. Mirrors
   // PermutationBasedLayoutSolverBase._sequential_place.
-  // --- RecomputeAll phases (see the noinline note on PlaceDecision) ---
+  // --- RecomputeAll phases ---
 
   // Reset the saturation early-stop state and return the count of not-yet-
   // saturated intervals (those with at least one live buffer).
-  [[gnu::noinline]] int InitIntervals() {
+  int InitIntervals() {
     const int k = st_->num_intervals;
     placed_at_.assign(k, 0);
     has_none_at_.assign(k, 0);
@@ -447,7 +442,7 @@ class NativePermutationLayoutSolver {
 
   // Gather idx's already-placed, time-overlapping, eligible candidates into
   // cand_ (the buffers idx would stack on top of).
-  [[gnu::noinline]] void GatherCandidates(int idx, int pos) {
+  void GatherCandidates(int idx, int pos) {
     cand_.clear();
     for (int w : st_->overlap[idx]) {
       if (position_[w] < pos && eligible_[w]) cand_.push_back(w);
@@ -466,8 +461,7 @@ class NativePermutationLayoutSolver {
   // (The former ineligible branch tested placed_at_ == total_at without the
   // has_none_at_ term; the unified test here is equivalent because has_none_at_
   // can only be true once done_at_ is already set, so it never fires alone.)
-  [[gnu::noinline]] void CommitIntervals(int idx, bool set_none, int64_t top,
-                                         int& not_done) {
+  void CommitIntervals(int idx, bool set_none, int64_t top, int& not_done) {
     const int lo = st_->buf_intervals[idx].first;
     const int hi = st_->buf_intervals[idx].second;
     for (int t = lo; t < hi; ++t) {
