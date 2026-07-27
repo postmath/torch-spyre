@@ -76,7 +76,9 @@ struct StaticData {
   // Possible in-place partners: declared parents + children that declare it.
   std::vector<std::vector<int>> inplace_partners;
   // Parent indices this buffer names in ``in_place_parents`` (for direction).
-  std::vector<std::unordered_set<int>> declared_parents;
+  // A vector (not a set): a typical buffer declares 0-1 parents, and the sole
+  // read is a boolean membership test, so a linear scan beats a hash lookup.
+  std::vector<std::vector<int>> declared_parents;
   // Saturation early-stop interval data (lifetimes only).
   int num_intervals = 0;
   std::vector<int> total_at;                       // alive count per interval
@@ -158,7 +160,7 @@ class NativePermutationLayoutSolver {
         auto it = name_to_idx.find(pname);
         if (it == name_to_idx.end()) continue;
         int parent = it->second;
-        st->declared_parents[child].insert(parent);
+        st->declared_parents[child].push_back(parent);
         partner_sets[child].insert(parent);
         partner_sets[parent].insert(child);
       }
@@ -236,6 +238,7 @@ class NativePermutationLayoutSolver {
     if (idx < 0 || idx >= st_->n) {
       throw std::invalid_argument("resize index out of range");
     }
+    if (sizes_[idx] == new_size) return 0.0;  // no-op: footprint unchanged
     const double old_total = total_quality_;
     sizes_[idx] = new_size;
     // An ineligible buffer is in HBM: its size affects nothing observable, but
@@ -313,10 +316,9 @@ class NativePermutationLayoutSolver {
     const int n = st.n;
     std::vector<int64_t> pts;
     pts.reserve(2 * n);
-    for (int i = 0; i < n; ++i) {
-      pts.push_back(st.start[i]);
-      pts.push_back(st.end[i]);
-    }
+    // Order does not matter -- pts is sorted below -- so bulk-copy both arrays.
+    pts.insert(pts.end(), st.start.begin(), st.start.end());
+    pts.insert(pts.end(), st.end.begin(), st.end.end());
     std::sort(pts.begin(), pts.end());
     pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
     const int k = std::max(0, static_cast<int>(pts.size()) - 1);
@@ -357,24 +359,33 @@ class NativePermutationLayoutSolver {
   // declare the other as an in-place parent. Mirrors
   // PermutationBasedLayoutSolverBase._in_place_pair.
   std::pair<int, int> InPlacePair(int i, int j) const {
-    if (st_->declared_parents[i].count(j)) return {j, i};  // j parents i
-    return {i, j};                                         // i parents j
+    const std::vector<int>& dp = st_->declared_parents[i];
+    if (std::find(dp.begin(), dp.end(), j) != dp.end()) {
+      return {j, i};  // j parents i
+    }
+    return {i, j};  // i parents j
   }
 
   // Mirrors PermutationBasedLayoutSolverBase._placement_decision. ``cand`` are
   // the already-placed, time-overlapping, eligible candidates for ``idx``.
-  // Returns true (with ``*out_addr`` set) if placed, false if evicted (None).
-  bool PlaceDecision(int idx, const std::vector<int>& cand, int64_t* out_addr) {
+  // Returns {placed, addr}: {true, addr} if placed, {false, 0} if evicted
+  // (None).
+  //
+  // ``noinline`` here and on the RecomputeAll phase helpers below is purely for
+  // profiling: it keeps each phase a distinct frame so a sampling profiler
+  // (py-spy --native) can attribute wall-clock self-time per phase. The bodies
+  // are large enough that the lost inlining is not measurable (A/B confirmed).
+  [[gnu::noinline]] std::pair<bool, int64_t> PlaceDecision(
+      int idx, const std::vector<int>& cand) {
     const int64_t cap = st_->capacity;
     if (cand.empty()) {
       // Lone buffer sits on the floor unless it alone exceeds capacity.
-      if (sizes_[idx] > cap) return false;
-      *out_addr = 0;
-      return true;
+      if (sizes_[idx] > cap) return {false, 0};
+      return {true, 0};
     }
     // A None (evicted) candidate dominates: idx would rest on it.
     for (int p : cand) {
-      if (!allocated_[p]) return false;
+      if (!allocated_[p]) return {false, 0};
     }
     int64_t max_top = std::numeric_limits<int64_t>::min();
     for (int p : cand) {
@@ -400,31 +411,29 @@ class NativePermutationLayoutSolver {
           if (top > others_top) others_top = top;
         }
         if (others_top <= partner_addr) {
-          if (partner_addr + sizes_[idx] > cap) return false;
-          *out_addr = partner_addr;
-          return true;
+          if (partner_addr + sizes_[idx] > cap) return {false, 0};
+          return {true, partner_addr};
         }
       }
     }
     const int64_t aligned = AlignUp(max_top);
-    if (aligned + sizes_[idx] > cap) return false;
-    *out_addr = aligned;
-    return true;
+    if (aligned + sizes_[idx] > cap) return {false, 0};
+    return {true, aligned};
   }
 
   // Places every buffer in permutation order with the saturation early-stop,
   // rebuilding addresses, quality and the allocated count from scratch. Mirrors
   // PermutationBasedLayoutSolverBase._sequential_place.
-  void RecomputeAll() {
-    const int n = st_->n;
-    for (int pos = 0; pos < n; ++pos) position_[permutation_[pos]] = pos;
-    total_quality_ = 0.0;
-    total_allocated_count_ = 0;
+  // --- RecomputeAll phases (see the noinline note on PlaceDecision) ---
 
+  // Reset the saturation early-stop state and return the count of not-yet-
+  // saturated intervals (those with at least one live buffer).
+  [[gnu::noinline]] int InitIntervals() {
     const int k = st_->num_intervals;
     placed_at_.assign(k, 0);
     has_none_at_.assign(k, 0);
     done_at_.assign(k, 0);
+    max_top_at_.assign(k, 0);
     int not_done = 0;
     for (int t = 0; t < k; ++t) {
       if (st_->total_at[t] == 0) {
@@ -433,6 +442,59 @@ class NativePermutationLayoutSolver {
         ++not_done;
       }
     }
+    return not_done;
+  }
+
+  // Gather idx's already-placed, time-overlapping, eligible candidates into
+  // cand_ (the buffers idx would stack on top of).
+  [[gnu::noinline]] void GatherCandidates(int idx, int pos) {
+    cand_.clear();
+    for (int w : st_->overlap[idx]) {
+      if (position_[w] < pos && eligible_[w]) cand_.push_back(w);
+    }
+  }
+
+  // Advance the per-interval aggregates over idx's live intervals and update
+  // not_done. ``set_none`` marks the interval as holding an evicted (None)
+  // buffer (only ever set on the eligible-and-evicted path). ``top`` is a
+  // placed buffer's exclusive top (addr + size), folded into the running
+  // per-interval max; pass a negative value for buffers that do not stack
+  // (evicted, or ineligible/HBM) so it never updates the max (max_top_at_ is
+  // always >= 0). These aggregates let the common no-in-place-partner placement
+  // read its floor and eviction straight off its intervals -- see RecomputeAll.
+  //
+  // (The former ineligible branch tested placed_at_ == total_at without the
+  // has_none_at_ term; the unified test here is equivalent because has_none_at_
+  // can only be true once done_at_ is already set, so it never fires alone.)
+  [[gnu::noinline]] void CommitIntervals(int idx, bool set_none, int64_t top,
+                                         int& not_done) {
+    const int lo = st_->buf_intervals[idx].first;
+    const int hi = st_->buf_intervals[idx].second;
+    for (int t = lo; t < hi; ++t) {
+      ++placed_at_[t];
+      if (set_none) {
+        has_none_at_[t] = 1;
+      } else if (top > max_top_at_[t]) {
+        max_top_at_[t] = top;
+      }
+      if (!done_at_[t] &&
+          (has_none_at_[t] || placed_at_[t] == st_->total_at[t])) {
+        done_at_[t] = 1;
+        --not_done;
+      }
+    }
+  }
+
+  void RecomputeAll() {
+    const int n = st_->n;
+    const int64_t cap = st_->capacity;
+    // position_ is the inverse of permutation_ and is maintained incrementally
+    // by every mutator (constructor, swap, rotate/MoveInPermutation) -- resize
+    // and set_eligible leave the permutation untouched -- so it is always in
+    // sync here and needs no rebuild.
+    total_quality_ = 0.0;
+    total_allocated_count_ = 0;
+    int not_done = InitIntervals();
 
     int stop = n;
     for (int pos = 0; pos < n; ++pos) {
@@ -447,49 +509,69 @@ class NativePermutationLayoutSolver {
         // on it), but it is still counted into placed_at so an interval whose
         // remaining occupants are all ineligible can still saturate.
         allocated_[idx] = 0;
-        const int lo = st_->buf_intervals[idx].first;
-        const int hi = st_->buf_intervals[idx].second;
-        for (int t = lo; t < hi; ++t) {
-          ++placed_at_[t];
-          if (!done_at_[t] && placed_at_[t] == st_->total_at[t]) {
-            done_at_[t] = 1;
-            --not_done;
-          }
-        }
+        CommitIntervals(idx, /*set_none=*/false, /*top=*/-1, not_done);
         continue;
-      }
-      cand_.clear();
-      for (int w : st_->overlap[idx]) {
-        if (position_[w] < pos && eligible_[w]) cand_.push_back(w);
-      }
-      int64_t a = 0;
-      const bool placed = PlaceDecision(idx, cand_, &a);
-      allocated_[idx] = placed ? 1 : 0;
-      addr_[idx] = a;
-      const bool evicted = !placed;
-      if (!evicted) {
-        total_quality_ += st_->weight[idx] * static_cast<double>(sizes_[idx]);
-        ++total_allocated_count_;
       }
       const int lo = st_->buf_intervals[idx].first;
       const int hi = st_->buf_intervals[idx].second;
-      for (int t = lo; t < hi; ++t) {
-        ++placed_at_[t];
-        if (evicted) has_none_at_[t] = 1;
-        if (!done_at_[t] &&
-            (has_none_at_[t] || placed_at_[t] == st_->total_at[t])) {
-          done_at_[t] = 1;
-          --not_done;
+      bool evicted;
+      int64_t a;
+      if (st_->inplace_partners[idx].empty()) {
+        // Fast path (no in-place partner): PlaceDecision needs only whether an
+        // overlapping earlier buffer was evicted (a None dominates) and the max
+        // top to stack on -- both are per-interval aggregates, so we skip
+        // gathering the candidate list. Bit-exact with the scan: idx's
+        // intervals are exactly the times it overlaps an earlier buffer, so the
+        // max over them of max_top_at_ equals the candidate max-top, and
+        // has_none_at_ on any of them means a None candidate exists.
+        bool none = false;
+        int64_t max_top = 0;
+        for (int t = lo; t < hi; ++t) {
+          if (has_none_at_[t]) {
+            none = true;
+            break;
+          }
+          if (max_top_at_[t] > max_top) max_top = max_top_at_[t];
         }
+        if (none) {
+          evicted = true;
+          a = 0;
+        } else {
+          const int64_t aligned = AlignUp(max_top);
+          evicted = aligned + sizes_[idx] > cap;
+          a = evicted ? 0 : aligned;
+        }
+      } else {
+        // In-place partner present: needs the real candidate list for the
+        // partner-slot logic.
+        GatherCandidates(idx, pos);
+        const auto [placed, addr] = PlaceDecision(idx, cand_);
+        evicted = !placed;
+        a = addr;
+      }
+      allocated_[idx] = evicted ? 0 : 1;
+      addr_[idx] = a;
+      if (!evicted) {
+        total_quality_ += st_->weight[idx] * static_cast<double>(sizes_[idx]);
+        ++total_allocated_count_;
+        CommitIntervals(idx, /*set_none=*/false, /*top=*/a + sizes_[idx],
+                        not_done);
+      } else {
+        CommitIntervals(idx, /*set_none=*/true, /*top=*/-1, not_done);
       }
     }
     for (int pos = stop; pos < n; ++pos) allocated_[permutation_[pos]] = 0;
   }
 
   void MoveInPermutation(int i, int j) {
-    const int x = permutation_[i];
-    permutation_.erase(permutation_.begin() + i);
-    permutation_.insert(permutation_.begin() + j, x);
+    const auto begin = permutation_.begin();
+    // Move the element at i to j by rotating the [lo, hi] subrange by one: a
+    // left rotate when moving forward (i < j), a right rotate when moving back.
+    if (i < j) {
+      std::rotate(begin + i, begin + i + 1, begin + j + 1);
+    } else {
+      std::rotate(begin + j, begin + i, begin + i + 1);
+    }
     const int lo = std::min(i, j);
     const int hi = std::max(i, j);
     for (int p = lo; p <= hi; ++p) position_[permutation_[p]] = p;
@@ -519,6 +601,7 @@ class NativePermutationLayoutSolver {
   std::vector<int> placed_at_;
   std::vector<char> has_none_at_;
   std::vector<char> done_at_;
+  std::vector<int64_t> max_top_at_;  // running max exclusive-top per interval
 };
 
 void register_perm_layout_native(py::module_& m) {
