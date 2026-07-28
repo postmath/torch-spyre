@@ -60,7 +60,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
-    PermutationBasedLayoutSolver,
+    make_permutation_packer,
 )
 
 
@@ -172,7 +172,7 @@ class SimulatedAnnealingSolverWithBuffers:
         self.buffers = buffers
         self.size = size
         self.alignment = alignment
-        self.plan = PermutationBasedLayoutSolver(buffers, self.initial, size, alignment)
+        self.plan = make_permutation_packer(buffers, self.initial, size, alignment)
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
         self.best_quality = self.plan.quality()
@@ -223,7 +223,7 @@ class SimulatedAnnealingSolverWithBuffers:
         # Commit the best permutation seen, so finalize() writes it rather than
         # whatever state annealing happened to end in.
         if self.plan.permutation != self.best_permutation:
-            self.plan = PermutationBasedLayoutSolver(
+            self.plan = make_permutation_packer(
                 self.buffers, list(self.best_permutation), self.size, self.alignment
             )
 

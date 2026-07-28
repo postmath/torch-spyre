@@ -66,7 +66,7 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
-from typing import Optional
+from typing import Optional, Union
 
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
@@ -82,8 +82,16 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import SolverToPermuta
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
+    _NativePackerAdapter,
+    make_permutation_packer,
 )
 from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
+
+# The packer is either the pure-Python solver or the native C++ adapter; both
+# expose the same permutation-packer interface the co-optimizer drives, so
+# ``make_permutation_packer`` may return either. Use ``.quality()`` (not the
+# Python-only ``total_quality`` attribute) so both work.
+Packer = Union[PermutationBasedLayoutSolver, _NativePackerAdapter]
 
 # Cause recorded for a buffer the SA engine left out of LX (mirrors the
 # substrate's shared drop cause).
@@ -186,7 +194,7 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         # Best-seen over the anneal (set in _anneal, read in _step); declared here
         # so their type is known across methods.
         self._best_score: int
-        self._best_snap: tuple[PermutationBasedLayoutSolver, list[int]]
+        self._best_snap: tuple[Packer, list[int]]
 
     # -- public interface ----------------------------------------------------
 
@@ -345,7 +353,7 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
             )
         return out
 
-    def _build_seed_packer(self) -> PermutationBasedLayoutSolver:
+    def _build_seed_packer(self) -> Packer:
         """Build the packer for the seed state: per-core sizes at index 0, a
         FirstFit-derived ``pi`` (Plan §8.2), and the seed eligibility mask."""
         n = len(self._bufs)
@@ -362,7 +370,7 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
             FirstFitLayoutSolver(self.limit, self.alignment)
         ).permutation(ff_bufs)
 
-        return PermutationBasedLayoutSolver(
+        return make_permutation_packer(
             self._lifetime_buffers(sizes),
             pi,
             self.limit,
@@ -779,8 +787,8 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         steps = int(steps)
         if n < 2 or steps < 1:
             return 0
-        best_q = self.packer.total_quality
-        best_packer: Optional[PermutationBasedLayoutSolver] = None
+        best_q = self.packer.quality()
+        best_packer: Optional[Packer] = None
         for _ in range(steps):
             i = self._rng.randrange(n)
             j = self._rng.randrange(n)
@@ -791,8 +799,8 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
                 )
                 if not keep:
                     self.packer.rotate(j, i)  # revert
-                elif self.packer.total_quality > best_q:
-                    best_q = self.packer.total_quality
+                elif self.packer.quality() > best_q:
+                    best_q = self.packer.quality()
                     best_packer = self.packer.copy()
             elif dq < 0:
                 self.packer.rotate(j, i)  # greedy revert
