@@ -29,7 +29,9 @@ from typing import Optional
 from abc import ABC, abstractmethod
 import bisect
 import heapq
+import math
 
+from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.contact_profile import Profile
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
@@ -299,6 +301,18 @@ class PermutationBasedLayoutSolverBase(ABC):
         if self.addresses[idx] is None:
             return None
         return self.addresses[idx] + self._sizes[idx]  # type: ignore
+
+    def top_or_inf(self, idx: int) -> float:
+        """:meth:`_top` as a float, with ``inf`` for an evicted buffer.
+
+        The public form the annealing search sorts on: an evicted buffer sorts as
+        if it sat arbitrarily high, so it is treated as above any placed buffer
+        and never reordered below one. Lives on the packer (rather than in the
+        search, where it used to read ``buffers[idx].size``) so that it reads the
+        plan-local ``_sizes``, which :meth:`resize` mutates.
+        """
+        top = self._top(idx)
+        return math.inf if top is None else float(top)
 
     def is_fully_allocated(self, idx: int) -> bool:
         """True if buffer ``idx`` has an address (and so fits below ``capacity``).
@@ -1471,146 +1485,20 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
 
 
 # ===========================================================================
-# Native (C++) packer accelerator: opt-in drop-in for the Python packer
+# Native (C++) packer accelerator: the default packer
 # ===========================================================================
 #
-# The Python :class:`PermutationBasedLayoutSolver` above stays canonical. The
-# C++ ``torch_spyre._C.NativePermutationLayoutSolver`` reproduces its *observable*
-# behaviour bit-for-bit (differentially proven in test_perm_layout_solver.py) but
-# never touches a Python object per op. This adapter wraps the native solver so it
-# is a drop-in for the exact surface the simulated-annealing search drives.
-
-
-def _native_solver_class():
-    """The C++ ``NativePermutationLayoutSolver`` class, or ``None`` if the ``_C``
-    extension is not importable / does not expose it (e.g. a pure-Python build)."""
-    try:
-        from torch_spyre._C import NativePermutationLayoutSolver
-
-        return NativePermutationLayoutSolver
-    except (ImportError, AttributeError):
-        return None
-
-
-class _NativePackerAdapter:
-    """Drop-in for :class:`PermutationBasedLayoutSolver` backed by the C++
-    ``NativePermutationLayoutSolver``.
-
-    Delegates every mutating / query op to the native solver and exposes the
-    two list-valued attributes (``permutation``, ``addresses``) the search reads
-    inside its hot loops. The native properties rebuild a fresh Python list per
-    access, so naive delegation would be O(n) per read (O(n^2) per step); this
-    adapter avoids that two ways:
-
-    - ``permutation`` is a *persistent* Python list, mutated in place to mirror
-      each ``swap`` / ``rotate`` (exactly as the Python packer mutates its own
-      ``permutation`` list). Access is O(1) and -- crucially -- a caller that
-      captures ``perm = plan.permutation`` and then calls ``plan.swap(i)`` sees
-      the swap through ``perm``, matching the Python packer's live-list semantics
-      (``annealing_step_swap`` relies on this).
-    - ``addresses`` is cached and invalidated on any mutating op, rebuilt at most
-      once per read burst. Nothing in the search holds an ``addresses`` list
-      across a mutation, so the cache is always fresh when read.
-
-    All other observable state (quality, count, per-op deltas, eviction ==
-    ``None`` address) comes straight from the native solver, which is bit-exact
-    against the Python packer.
-    """
-
-    def __init__(
-        self,
-        native_cls,
-        buffers: list[LifetimeBoundBuffer],
-        permutation: list[int],
-        capacity: int,
-        alignment: int = 128,
-        eligible: Optional[list[bool]] = None,
-    ):
-        self.buffers = buffers
-        self._native = native_cls(
-            buffers, list(permutation), capacity, alignment, eligible
-        )
-        # Persistent, in-place-mutated mirror of the native permutation (see the
-        # class docstring). Seed from the native solver so it reflects any
-        # normalization the constructor did.
-        self._perm: list[int] = list(self._native.permutation)
-        self._addr_cache: Optional[list[Optional[int]]] = None
-
-    # --- list-valued attributes (hot-loop reads) ----------------------------
-
-    @property
-    def permutation(self) -> list[int]:
-        return self._perm
-
-    @property
-    def addresses(self) -> list[Optional[int]]:
-        if self._addr_cache is None:
-            self._addr_cache = list(self._native.addresses)
-        return self._addr_cache
-
-    # --- mutating ops (delegate, then keep the mirror / cache consistent) ----
-
-    def swap(self, i: int) -> float:
-        # Delegate first: the native solver validates ``i`` and raises on a bad
-        # index, so the mirror is only mutated once the op is known valid.
-        delta = self._native.swap(i)
-        self._perm[i], self._perm[i + 1] = self._perm[i + 1], self._perm[i]
-        self._addr_cache = None
-        return delta
-
-    def rotate(self, i: int, j: int) -> float:
-        delta = self._native.rotate(i, j)
-        if i != j:
-            # Native rotate == remove ``permutation[i]`` and reinsert it at ``j``
-            # (a no-op when i == j, which it returns early); mirror that pop/insert.
-            x = self._perm.pop(i)
-            self._perm.insert(j, x)
-        self._addr_cache = None
-        return delta
-
-    def resize(self, idx: int, new_size: int) -> float:
-        delta = self._native.resize(idx, new_size)
-        self._addr_cache = None
-        return delta
-
-    def set_eligible(self, idx: int, flag: bool) -> float:
-        delta = self._native.set_eligible(idx, flag)
-        self._addr_cache = None
-        return delta
-
-    # --- pure queries (straight delegation) ---------------------------------
-
-    def quality(self) -> float:
-        return self._native.quality()
-
-    def count_allocated(self) -> int:
-        return self._native.count_allocated()
-
-    def overlaps(self, i: int, j: int) -> bool:
-        return self._native.overlaps(i, j)
-
-    def is_fully_allocated(self, idx: int) -> bool:
-        return self._native.is_fully_allocated(idx)
-
-    # --- copy / finalize -----------------------------------------------------
-
-    def copy(self) -> "_NativePackerAdapter":
-        """An independent snapshot sharing the (immutable) ``buffers`` list, over
-        an independent native ``copy()``. Mirrors the Python packer's ``copy``."""
-        clone = _NativePackerAdapter.__new__(_NativePackerAdapter)
-        clone.buffers = self.buffers
-        clone._native = self._native.copy()
-        clone._perm = list(self._perm)
-        clone._addr_cache = None
-        return clone
-
-    def finalize(self) -> None:
-        """Write each buffer's address back to the buffer object -- for EVERY
-        index, exactly like :meth:`PermutationBasedLayoutSolverBase.finalize`
-        (an evicted buffer gets ``None``)."""
-        addresses = self.addresses
-        for idx, buf in enumerate(self.buffers):
-            buf.address = addresses[idx]
+# The Python :class:`PermutationBasedLayoutSolver` above stays canonical, and
+# ``torch_spyre._C.NativePermutationLayoutSolver`` reproduces its *observable*
+# behaviour bit-for-bit (differentially proven in test_perm_layout_solver.py)
+# without touching a Python object per operation. The native class implements the
+# full surface the annealing search drives -- including ``finalize()``,
+# ``top_or_inf()`` and a live read-only ``permutation`` view -- so it is used
+# directly, with no Python adapter in the hot path.
+#
+# The import is unconditional, like every other ``torch_spyre._C`` import in the
+# tree: ``_C`` is required for torch-spyre to function at all, so a missing symbol
+# means a stale or incomplete build rather than a supported pure-Python mode.
 
 
 def make_permutation_packer(
@@ -1622,33 +1510,18 @@ def make_permutation_packer(
 ):
     """Construct a permutation packer, using the C++ accelerator by default.
 
-    Returns a :class:`_NativePackerAdapter` (over the C++
-    ``NativePermutationLayoutSolver``) when ``config.native_layout_packer`` is
-    true (the default -- back it off with that config knob, or its
-    ``TORCH_SPYRE_NATIVE_PACKER=0`` env default), and the canonical Python
-    :class:`PermutationBasedLayoutSolver` when it is false. The two packers are
-    behaviourally identical (verified bit-for-bit by the differential and the
-    SA-equivalence tests); the C++ one is the faster default.
-
-    A missing native class is *not* a supported mode: ``_C`` is required for the
-    package to work at all, so its absence means an incomplete or stale build
-    rather than a pure-Python installation. Raise instead of silently falling
-    back, which would otherwise trade a build error for a quiet 2-25x slowdown.
+    Returns the C++ :class:`NativePermutationLayoutSolver` when
+    ``config.native_layout_packer`` is true (the default -- back it off with that
+    config knob, or its ``TORCH_SPYRE_NATIVE_PACKER=0`` env default), and the
+    canonical Python :class:`PermutationBasedLayoutSolver` when it is false. The
+    two are behaviourally identical (verified bit-for-bit by the differential and
+    the SA-equivalence tests); the C++ one is the faster default.
     """
     from torch_spyre._inductor import config
 
     if config.native_layout_packer:
-        native_cls = _native_solver_class()
-        if native_cls is None:
-            raise RuntimeError(
-                "torch_spyre._C.NativePermutationLayoutSolver is unavailable, "
-                "which means the _C extension is missing or stale -- rebuild it. "
-                "To use the pure-Python packer deliberately, set "
-                "config.native_layout_packer = False (or "
-                "TORCH_SPYRE_NATIVE_PACKER=0)."
-            )
-        return _NativePackerAdapter(
-            native_cls, buffers, permutation, capacity, alignment, eligible
+        return NativePermutationLayoutSolver(
+            buffers, permutation, capacity, alignment, eligible
         )
     return PermutationBasedLayoutSolver(
         buffers, permutation, capacity, alignment, eligible

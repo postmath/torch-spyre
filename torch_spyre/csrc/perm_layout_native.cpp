@@ -85,7 +85,44 @@ struct StaticData {
   std::vector<std::pair<int, int>> buf_intervals;  // [lo, hi) interval range
 };
 
-}  // namespace
+// Both classes below stay in this file's anonymous namespace. They are handed
+// to pybind11 by ``register_perm_layout_native`` and are never named from
+// another translation unit, and internal linkage matches the hidden visibility
+// of their pybind11 members (external linkage draws -Wattributes for
+// ``buffers_``).
+class NativePermutationLayoutSolver;
+
+// Read-only, always-live view of a solver's current allocation order.
+//
+// The search captures ``perm = plan.permutation`` once and then mutates the
+// plan through it -- ``annealing_step_swap`` re-reads ``perm[i]`` and ``perm[i
+// + 1]`` after every ``plan.swap(i)`` -- so the object it holds must reflect
+// later mutations. Reading straight through to the owner's ``std::vector``
+// makes that true by construction: there is no mirrored Python list for a
+// future mutator to forget to update. Read-only, so Python cannot corrupt the
+// order behind the solver's back either. ``py::keep_alive`` on the property
+// keeps the owner alive for as long as any view of it.
+class PermutationView {
+ public:
+  explicit PermutationView(const NativePermutationLayoutSolver& owner)
+      : owner_(owner) {}
+
+  int64_t len() const;
+  // Python list indexing, negative offsets included.
+  int getitem(int64_t i) const;
+  bool eq(const py::object& other) const;
+  // A *detached* snapshot. ``copy.copy(view)`` must not alias the live order:
+  // the search stores the best-so-far permutation that way and later compares
+  // the live one against it, a test that would be vacuously equal if the copy
+  // tracked the original.
+  py::list to_list() const;
+  std::string repr() const;
+
+ private:
+  const std::vector<int>& vec() const;
+
+  const NativePermutationLayoutSolver& owner_;
+};
 
 class NativePermutationLayoutSolver {
  public:
@@ -93,6 +130,10 @@ class NativePermutationLayoutSolver {
                                 std::vector<int> permutation, int64_t capacity,
                                 int64_t alignment, const py::object& eligible) {
     auto st = std::make_shared<StaticData>();
+    // Retained (not just read once): ``finalize`` writes each address back onto
+    // the Python buffer objects. Shared, never deep-copied by ``copy()`` --
+    // the same contract as the Python packer's ``self.buffers = buffers``.
+    buffers_ = buffers;
     const int n = static_cast<int>(buffers.size());
     st->n = n;
     st->capacity = capacity;
@@ -319,12 +360,44 @@ class NativePermutationLayoutSolver {
     return out;
   }
 
-  // Current allocation order as a Python list (mirrors the Python packer's
-  // ``permutation`` list attribute).
-  py::list permutation() const {
-    py::list out;
-    for (int idx : permutation_) out.append(py::cast(idx));
-    return out;
+  // Current allocation order, as a live read-only view (see PermutationView).
+  PermutationView permutation() const {
+    return PermutationView(*this);
+  }
+
+  const std::vector<int>& permutation_vec() const {
+    return permutation_;
+  }
+
+  py::list buffers() const {
+    return buffers_;
+  }
+
+  // Exclusive top (``address + size``) of buffer ``idx``, or +inf when it is
+  // evicted. Lives on the packer rather than in the search so it reads the
+  // plan-local ``sizes_`` -- which ``resize`` mutates -- instead of the shared
+  // buffer object's ``size``, which goes stale the moment a co-optimizer starts
+  // driving resizes. An evicted buffer sorting as arbitrarily high is what
+  // keeps it from being reordered below a placed one.
+  double top_or_inf(int idx) const {
+    if (idx < 0 || idx >= st_->n) {
+      throw std::invalid_argument("top_or_inf index out of range");
+    }
+    if (!allocated_[idx]) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return static_cast<double>(addr_[idx] + sizes_[idx]);
+  }
+
+  // Write each buffer's address back onto the Python buffer object, for EVERY
+  // index -- an evicted buffer gets ``None`` -- exactly like
+  // ``PermutationBasedLayoutSolverBase.finalize``.
+  void finalize() const {
+    for (int i = 0; i < st_->n; ++i) {
+      py::object value =
+          allocated_[i] ? py::cast(addr_[i]) : py::object(py::none());
+      buffers_[i].attr("address") = value;
+    }
   }
 
   // True if buffers ``i`` and ``j`` are alive at a common tick. Buffer-index
@@ -610,6 +683,12 @@ class NativePermutationLayoutSolver {
 
   std::shared_ptr<const StaticData> st_;
 
+  // The Python buffer objects, retained for finalize(). Shared with clones (the
+  // copy ctor copies the handle, not the list). Deliberately NOT in StaticData:
+  // that struct is held by const shared_ptr and is Python-free, so it can be
+  // destroyed without the GIL -- and finalize() writes through this handle.
+  py::list buffers_;
+
   // Dynamic per-plan state (deep-copied by copy()).
   std::vector<int> permutation_;
   std::vector<int> position_;   // inverse of permutation_
@@ -635,7 +714,71 @@ class NativePermutationLayoutSolver {
   std::vector<int64_t> max_top_at_;  // running max exclusive-top per interval
 };
 
+const std::vector<int>& PermutationView::vec() const {
+  return owner_.permutation_vec();
+}
+
+int64_t PermutationView::len() const {
+  return static_cast<int64_t>(vec().size());
+}
+
+int PermutationView::getitem(int64_t i) const {
+  const int64_t n = len();
+  if (i < 0) i += n;  // list semantics
+  if (i < 0 || i >= n) {
+    // py::index_error, not invalid_argument: ``list(view)`` and ``for x in
+    // view`` walk the sequence protocol until IndexError stops them.
+    throw py::index_error("permutation index out of range");
+  }
+  return vec()[static_cast<size_t>(i)];
+}
+
+bool PermutationView::eq(const py::object& other) const {
+  if (py::isinstance<PermutationView>(other)) {
+    return vec() == other.cast<const PermutationView&>().vec();
+  }
+  // Elementwise against a plain list -- how the search compares the live order
+  // with its stored best-so-far snapshot.
+  try {
+    return vec() == other.cast<std::vector<int>>();
+  }
+  catch (const py::cast_error&) {
+    return false;
+  }
+}
+
+py::list PermutationView::to_list() const {
+  py::list out;
+  for (int idx : vec()) out.append(py::cast(idx));
+  return out;
+}
+
+std::string PermutationView::repr() const {
+  std::string s = "PermutationView([";
+  const std::vector<int>& v = vec();
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i != 0) s += ", ";
+    s += std::to_string(v[i]);
+  }
+  return s + "])";
+}
+
+}  // namespace
+
 void register_perm_layout_native(py::module_& m) {
+  py::class_<PermutationView>(m, "PermutationView")
+      .def("__len__", &PermutationView::len)
+      .def("__getitem__", &PermutationView::getitem, py::arg("i"))
+      .def("__eq__", &PermutationView::eq, py::arg("other"))
+      .def("__copy__", &PermutationView::to_list)
+      .def(
+          "__deepcopy__",
+          [](const PermutationView& v, const py::object&) {
+            return v.to_list();
+          },
+          py::arg("memo"))
+      .def("__repr__", &PermutationView::repr);
+
   py::class_<NativePermutationLayoutSolver>(m, "NativePermutationLayoutSolver")
       .def(py::init<const py::list&, std::vector<int>, int64_t, int64_t,
                     const py::object&>(),
@@ -656,8 +799,19 @@ void register_perm_layout_native(py::module_& m) {
            py::arg("j"))
       .def("is_fully_allocated",
            &NativePermutationLayoutSolver::is_fully_allocated, py::arg("idx"))
-      .def_property_readonly("permutation",
-                             &NativePermutationLayoutSolver::permutation)
+      .def("top_or_inf", &NativePermutationLayoutSolver::top_or_inf,
+           py::arg("idx"))
+      .def("finalize", &NativePermutationLayoutSolver::finalize)
+      .def_property_readonly("buffers", &NativePermutationLayoutSolver::buffers)
+      // The view borrows the solver, so the solver must outlive it. The
+      // keep_alive has to be attached to an explicit cpp_function: passed as a
+      // trailing extra to def_property_readonly it is applied to the property
+      // rather than to the getter, silently does nothing, and the view is left
+      // reading freed memory once the last reference to the solver goes away.
+      .def_property_readonly(
+          "permutation",
+          py::cpp_function(&NativePermutationLayoutSolver::permutation,
+                           py::keep_alive<0, 1>()))
       .def_property_readonly("addresses",
                              &NativePermutationLayoutSolver::addresses);
 }

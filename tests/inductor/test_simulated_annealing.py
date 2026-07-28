@@ -25,8 +25,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
+    NativePermutationLayoutSolver,
     PermutationBasedLayoutSolver,
-    _NativePackerAdapter,
     buffer_quality,
 )
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
@@ -456,10 +456,11 @@ class NativePackerEquivalenceTests(TestCase):
                 schedule=_short_schedule(),
                 random=rnd.Random(seed),
             )
-            # Guard against a silent fallback masking a real divergence: with the
-            # flag set we must actually be exercising the native adapter.
+            # Guard against the knob silently selecting the wrong packer and
+            # masking a real divergence: with the flag set we must actually be
+            # running on the C++ solver.
             if native:
-                self.assertIsInstance(solver.plan, _NativePackerAdapter)
+                self.assertIsInstance(solver.plan, NativePermutationLayoutSolver)
             else:
                 self.assertIsInstance(solver.plan, PermutationBasedLayoutSolver)
             solver.solve()
