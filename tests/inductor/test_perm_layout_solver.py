@@ -14,6 +14,7 @@
 
 """Tests for the capacity-bounded allocation plans."""
 
+import bisect
 import itertools
 import os
 import random
@@ -1738,3 +1739,195 @@ class ProfileTests(TestCase):
         p.splice(3, 7, [3, 7], [2])
         self.assertEqual(p, Profile([0, 3, 7, 10], [None, 2, None]))
         p.validate()
+
+
+try:
+    from torch_spyre._C import NativeProfile
+
+    _HAVE_NATIVE_PROFILE = True
+except ImportError:  # pragma: no cover - native extension not built
+    NativeProfile = None  # type: ignore[assignment,misc]
+    _HAVE_NATIVE_PROFILE = False
+
+
+@unittest.skipUnless(_HAVE_NATIVE_PROFILE, "torch_spyre._C.NativeProfile not available")
+class NativeProfileDifferentialTests(TestCase):
+    """Differential test of the C++ ``Profile`` (exposed as ``NativeProfile``)
+    against the canonical Python ``contact_profile.Profile``.
+
+    ``splice`` is the operation both solvers mutate their contact profiles
+    through, and ``NativeDifferentialTests`` only ever reaches it via two
+    shapes: a single-segment replacement, and a ``segments()`` round trip out
+    of ``relabel``. These tests drive it directly across the whole shape matrix
+    -- ``a``/``b`` at breakpoints or strictly interior, multi-segment tilings,
+    each seam coalescing or not, segment counts growing and shrinking -- so a
+    divergence is reported at the splice rather than as a mismatched profile
+    several ops downstream.
+
+    The C++ ``splice`` edits in place and reconciles only the two seams, so it
+    requires a canonical tiling (see its precondition comment); the Python one
+    rebuilds through a full coalescing pass and accepts any tiling. The
+    generator here respects that precondition, and ``test_relabel_*`` covers
+    the one caller that has to establish it.
+    """
+
+    LABELS = (None, 0, 1, 2)
+
+    def _random_canonical(self, rng, max_segments=5):
+        """Random canonical profile: strictly increasing starts, no two adjacent
+        labels equal."""
+        n = rng.randint(1, max_segments)
+        starts = [rng.randrange(0, 4)]
+        for _ in range(n):
+            starts.append(starts[-1] + rng.randint(1, 4))
+        labels: list = []
+        for _ in range(n):
+            choices = [x for x in self.LABELS if not labels or x != labels[-1]]
+            labels.append(rng.choice(choices))
+        return starts, labels
+
+    def _random_range(self, rng, starts):
+        """A random ``[a, b)`` within the span, biased towards exact breakpoints
+        so that both seam-coalescing paths are reachable."""
+        lo, hi = starts[0], starts[-1]
+        pts = [
+            rng.choice(starts) if rng.random() < 0.5 else rng.randrange(lo, hi + 1)
+            for _ in range(2)
+        ]
+        return min(pts), max(pts)
+
+    def _random_tiling(self, rng, profile, a, b):
+        """A random canonical tiling of ``[a, b)``, biased so the seam labels
+        often match their neighbour and coalesce."""
+        cuts = [a]
+        while cuts[-1] < b:
+            cuts.append(min(b, cuts[-1] + rng.randint(1, 3)))
+        labels: list = []
+        for _ in range(len(cuts) - 1):
+            choices = [x for x in self.LABELS if not labels or x != labels[-1]]
+            labels.append(rng.choice(choices))
+        # Bias towards coalescing seams, but never at the cost of the
+        # adjacent-distinct precondition inside the tiling itself.
+        if rng.random() < 0.4 and a > profile.span_start:
+            left = profile.label_at(a - 1)
+            if len(labels) == 1 or labels[1] != left:
+                labels[0] = left
+        if rng.random() < 0.4 and b < profile.span_end:
+            right = profile.label_at(b)
+            if len(labels) == 1 or labels[-2] != right:
+                labels[-1] = right
+        return cuts, labels
+
+    def _shapes(self, starts, labels, a, b, seg_labels):
+        """Classify a splice by the index relations the C++ implementation
+        actually branches on, so the coverage assertions below track the code
+        rather than a paraphrase of it."""
+        if a == b:
+            return {"empty_range"}
+        i_a = bisect.bisect_left(starts, a) - 1
+        i_b = bisect.bisect_right(starts, b) - 1
+        coalesced_start = i_a >= 0 and labels[i_a] == seg_labels[0]
+        coalesced_end = i_b < len(labels) and labels[i_b] == seg_labels[-1]
+        if not coalesced_start:
+            i_a += 1
+        if coalesced_end:
+            i_b += 1
+        out = set()
+        out.add("a_at_breakpoint" if a in starts else "a_interior")
+        out.add("b_at_breakpoint" if b in starts else "b_interior")
+        out.add("coalesced_start" if coalesced_start else "no_coalesced_start")
+        out.add("coalesced_end" if coalesced_end else "no_coalesced_end")
+        if coalesced_start and coalesced_end:
+            out.add("coalesced_both")
+        if i_b == i_a - 1:
+            out.add("split_one_segment")  # the duplicated-entry case
+        elif i_b == i_a:
+            out.add("plain_insert")
+        extra = len(seg_labels) - (i_b - i_a)
+        out.add("grows" if extra > 0 else "shrinks" if extra < 0 else "same_count")
+        if len(seg_labels) > 1:
+            out.add("multi_segment_tiling")
+        if a == starts[0] and b == starts[-1]:
+            out.add("whole_span")
+        return out
+
+    _SPLICE_SHAPES = (
+        "empty_range",
+        "a_at_breakpoint",
+        "a_interior",
+        "b_at_breakpoint",
+        "b_interior",
+        "coalesced_start",
+        "no_coalesced_start",
+        "coalesced_end",
+        "no_coalesced_end",
+        "coalesced_both",
+        "split_one_segment",
+        "plain_insert",
+        "grows",
+        "shrinks",
+        "same_count",
+        "multi_segment_tiling",
+        "whole_span",
+    )
+
+    def _assert_same(self, expected, native, tag):
+        self.assertEqual(list(native.starts), expected.starts, f"{tag} starts")
+        self.assertEqual(list(native.labels), expected.labels, f"{tag} labels")
+        # Canonical form, checked independently of the oracle.
+        native.validate()
+
+    def test_splice_matches_python_oracle(self):
+        rng = random.Random(20260730)
+        covered: set = set()
+        for case in range(20_000 if _STRESS else 4_000):
+            starts, labels = self._random_canonical(rng)
+            py_p = Profile(list(starts), list(labels))
+            native = NativeProfile(starts, labels)
+            a, b = self._random_range(rng, starts)
+            if a == b:
+                seg_starts, seg_labels = [a], []
+            else:
+                seg_starts, seg_labels = self._random_tiling(rng, py_p, a, b)
+            tag = (
+                f"case={case} Profile({starts}, {labels})"
+                f".splice({a}, {b}, {seg_starts}, {seg_labels})"
+            )
+            py_p.splice(a, b, list(seg_starts), list(seg_labels))
+            py_p.validate()
+            native.splice(a, b, seg_starts, seg_labels)
+            self._assert_same(py_p, native, tag)
+            covered |= self._shapes(starts, labels, a, b, seg_labels)
+        missing = [s for s in self._SPLICE_SHAPES if s not in covered]
+        self.assertEqual(missing, [], f"generator stopped covering {missing}")
+
+    def test_relabel_matches_python_oracle(self):
+        """``relabel`` is the only caller that can map two adjacent segments
+        onto the same label, so it owns coalescing the tiling before handing it
+        to ``splice``. Without that, the result is silently non-canonical."""
+        rng = random.Random(20260731)
+        saw_duplicate_mapping = False
+        for case in range(20_000 if _STRESS else 4_000):
+            starts, labels = self._random_canonical(rng)
+            py_p = Profile(list(starts), list(labels))
+            native = NativeProfile(starts, labels)
+            a, b = self._random_range(rng, starts)
+            from_label, to_label = rng.choice(self.LABELS), rng.choice(self.LABELS)
+            tag = (
+                f"case={case} Profile({starts}, {labels})"
+                f".relabel({a}, {b}, {{{from_label}: {to_label}}})"
+            )
+            # Did the mapping make two adjacent segments equal, i.e. is this a
+            # case that forces relabel to coalesce before splicing?
+            _, clipped = py_p.segments(a, b)
+            mapped = [to_label if lab == from_label else lab for lab in clipped]
+            if any(x == y for x, y in zip(mapped, mapped[1:])):
+                saw_duplicate_mapping = True
+            py_p.relabel(a, b, {from_label: to_label})
+            py_p.validate()
+            native.relabel(a, b, from_label, to_label)
+            self._assert_same(py_p, native, tag)
+        self.assertTrue(
+            saw_duplicate_mapping,
+            "generator never produced a mapping that needs coalescing",
+        )

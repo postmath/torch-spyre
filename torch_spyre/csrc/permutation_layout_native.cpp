@@ -59,8 +59,9 @@ constexpr int kNone = -1;
 // Profile: a step function from a half-open span to labels (Optional[int]).
 // Faithful port of contact_profile.Profile. Stored as parallel vectors:
 // `starts` of length n+1 and `labels` of length n; segment i covers
-// [starts[i], starts[i+1]) carrying labels[i]. Canonical form: `starts`
-// strictly increasing and no two adjacent segments carry equal labels.
+// [starts[i], starts[i+1]) carrying labels[i]. Note that `starts` can
+// therefore not be empty. Canonical form: `starts` strictly increasing and no
+// two adjacent segments carry equal labels.
 // ---------------------------------------------------------------------------
 struct Profile {
   std::vector<int64_t> starts;
@@ -69,18 +70,18 @@ struct Profile {
   // Merge adjacent segments carrying equal labels into the output vectors.
   static void coalesce(const std::vector<int64_t>& in_starts,
                        const std::vector<int>& in_labels,
-                       std::vector<int64_t>* out_starts,
-                       std::vector<int>* out_labels) {
-    out_starts->clear();
-    out_labels->clear();
-    out_starts->push_back(in_starts[0]);
+                       std::vector<int64_t>& out_starts,
+                       std::vector<int>& out_labels) {
+    out_starts.clear();
+    out_labels.clear();
+    out_starts.push_back(in_starts[0]);
     for (size_t i = 0; i < in_labels.size(); ++i) {
       const int label = in_labels[i];
-      if (!out_labels->empty() && out_labels->back() == label) {
-        out_starts->back() = in_starts[i + 1];  // extend previous segment
+      if (!out_labels.empty() && out_labels.back() == label) {
+        out_starts.back() = in_starts[i + 1];  // extend previous segment
       } else {
-        out_labels->push_back(label);
-        out_starts->push_back(in_starts[i + 1]);
+        out_labels.push_back(label);
+        out_starts.push_back(in_starts[i + 1]);
       }
     }
   }
@@ -95,7 +96,7 @@ struct Profile {
   static Profile from_segments(const std::vector<int64_t>& in_starts,
                                const std::vector<int>& in_labels) {
     Profile p;
-    coalesce(in_starts, in_labels, &p.starts, &p.labels);
+    coalesce(in_starts, in_labels, p.starts, p.labels);
     return p;
   }
 
@@ -106,14 +107,26 @@ struct Profile {
     return starts.back();
   }
 
+  // The greatest i such that starts[i] <= a.
+  size_t starts_index_at_most(int64_t a) const {
+    return std::upper_bound(starts.begin(), starts.end(), a) - starts.begin() -
+           1;
+  }
+
+  // The smallest i such that starts[i] >= a.
+  size_t starts_index_at_least(int64_t a) const {
+    return std::lower_bound(starts.begin(), starts.end(), a) - starts.begin();
+  }
+
   // Label of the segment containing column t (t in span).
   int label_at(int64_t t) const {
-    // bisect_right(starts, t) - 1
-    const size_t idx =
-        static_cast<size_t>(std::upper_bound(starts.begin(), starts.end(), t) -
-                            starts.begin()) -
-        1;
-    return labels[idx];
+    // t < starts.front() underflows to a huge index, so one bound catches both
+    // ends; the limit is labels.size(), since t == span_end has no segment.
+    size_t i = starts_index_at_most(t);
+    if (i >= labels.size()) {
+      throw std::out_of_range("t out of range for label_at");
+    }
+    return labels[i];
   }
 
   // The segments clipped to [a, b) as fresh vectors. An empty range yields
@@ -128,10 +141,7 @@ struct Profile {
     }
     out_starts->push_back(a);
     // i = bisect_right(starts, a) - 1
-    size_t i =
-        static_cast<size_t>(std::upper_bound(starts.begin(), starts.end(), a) -
-                            starts.begin()) -
-        1;
+    size_t i = starts_index_at_most(a);
     while (starts[i] < b) {
       out_labels->push_back(labels[i]);
       out_starts->push_back(std::min(starts[i + 1], b));
@@ -139,29 +149,95 @@ struct Profile {
     }
   }
 
-  // Replace the function on [a, b) with the given segments (which must exactly
-  // tile [a, b)), coalescing at both seams. No-op if a == b.
+  // Replace the function on [a, b) with the given segments, coalescing at both
+  // seams. No-op if a == b.
+  //
+  // Preconditions (both are the caller's responsibility; unlike the Python
+  // implementation, which rebuilds through a full coalescing pass, this edits
+  // in place and so only reconciles the two seams):
+  //   * `*this` is canonical, and
+  //   * seg_starts/seg_labels exactly tile [a, b) and are canonical too --
+  //     strictly increasing starts and no two adjacent labels equal.
+  // A caller that can violate the second (see relabel) must coalesce first.
   void splice(int64_t a, int64_t b, const std::vector<int64_t>& seg_starts,
               const std::vector<int>& seg_labels) {
     if (a == b) {
       return;
     }
-    std::vector<int64_t> left_s, right_s;
-    std::vector<int> left_l, right_l;
-    segments(starts.front(), a, &left_s, &left_l);
-    segments(b, starts.back(), &right_s, &right_l);
-    std::vector<int64_t> new_s;
-    std::vector<int> new_l;
-    new_s.reserve(left_s.size() + seg_starts.size() + right_s.size());
-    new_l.reserve(left_l.size() + seg_labels.size() + right_l.size());
-    // new_s = left_s[:-1] + seg_starts[:-1] + right_s
-    new_s.insert(new_s.end(), left_s.begin(), left_s.end() - 1);
-    new_s.insert(new_s.end(), seg_starts.begin(), seg_starts.end() - 1);
-    new_s.insert(new_s.end(), right_s.begin(), right_s.end());
-    new_l.insert(new_l.end(), left_l.begin(), left_l.end());
-    new_l.insert(new_l.end(), seg_labels.begin(), seg_labels.end());
-    new_l.insert(new_l.end(), right_l.begin(), right_l.end());
-    coalesce(new_s, new_l, &starts, &labels);
+    if (a > b) {
+      throw std::runtime_error("a > b in splice");
+    }
+    if (a < starts.front() || b > starts.back()) {
+      throw std::runtime_error(
+          "[a, b) not contained in bounds of profile in splice");
+    }
+    if (seg_labels.empty() || seg_starts.size() != seg_labels.size() + 1 ||
+        seg_starts.front() != a || seg_starts.back() != b) {
+      throw std::runtime_error("segments do not tile [a, b) in splice");
+    }
+
+    int64_t i_a = static_cast<int64_t>(starts_index_at_least(a)) - 1;
+    int64_t i_b = static_cast<int64_t>(starts_index_at_most(b));
+    // Now i_a is the index of the label we need to check for coalescing at
+    // the start seam, or -1, and i_b is the index of the label we need to
+    // check for coalescing at the end seam, or starts.size(). Using int64_t for
+    // i_a to allow -1, and for i_b for symmetry.
+
+    bool coalesced_start = true;
+    bool coalesced_end = false;
+    if (i_a < 0 || labels[i_a] != seg_labels.front()) {
+      ++i_a;
+      coalesced_start = false;
+    }
+    if (i_b < static_cast<int64_t>(labels.size()) &&
+        labels[i_b] == seg_labels.back()) {
+      ++i_b;
+      coalesced_end = true;
+    }
+    // Now we need to replace labels entries [i_a, i_b) with seg_labels, and
+    // starts entries [i_a, i_b] with seg_starts followed by the start of the
+    // segment that ends up after the replaced range. In Python notation, labels
+    // becomes labels[:i_a] + seg_labels + labels[i_b:], and starts becomes
+    // starts[:i_a] + seg_starts + starts[i_b + 1:].
+    //
+    // Two degenerate index relations are worth calling out: i_b == i_a is a
+    // plain insert (no existing segment is consumed), and i_b == i_a - 1 --
+    // which happens when a and b both fall strictly inside one segment and
+    // neither seam coalesces -- means that segment is *split*, so entry i_b of
+    // both vectors is duplicated: it stays as the left remainder and reappears
+    // after the replaced range as the right remainder.
+
+    const int64_t n_seg = static_cast<int64_t>(seg_labels.size());
+    const int64_t extra_segments = n_seg - (i_b - i_a);
+
+    if (extra_segments > 0) {
+      // Inserting at i_b keeps entries [0, i_b) in place and shifts the tail to
+      // exactly where it belongs. Every inserted slot is overwritten below
+      // except entry i_b in the split case above, which must keep its own old
+      // value -- so seed the new slots with it rather than with a placeholder.
+      const int filler =
+          i_b < static_cast<int64_t>(labels.size()) ? labels[i_b] : kNone;
+      labels.insert(labels.begin() + i_b, extra_segments, filler);
+      starts.insert(starts.begin() + i_b, extra_segments, starts[i_b]);
+    } else if (extra_segments < 0) {
+      labels.erase(labels.begin() + i_b + extra_segments, labels.begin() + i_b);
+      starts.erase(starts.begin() + i_b + extra_segments, starts.begin() + i_b);
+    }
+
+    // Now, overwrite labels[i_a] and further, and starts[i_a] and further --
+    // except that starts[i_a] keeps the value it has when the start seam
+    // coalesced, that being the absorbed neighbouring segment's own start.
+    for (int64_t i = 0; i < n_seg; ++i) {
+      labels[i_a + i] = seg_labels[i];
+      if (i || !coalesced_start) {
+        starts[i_a + i] = seg_starts[i];
+      }
+    }
+    // Likewise, the segment following the replaced range now starts at b,
+    // unless the end seam coalesced, in which case it keeps its own start.
+    if (!coalesced_end) {
+      starts[i_a + n_seg] = b;
+    }
   }
 
   // For every segment within [a, b) whose label == from_label, replace it with
@@ -179,7 +255,34 @@ struct Profile {
         lab = to_label;
       }
     }
-    splice(a, b, seg_s, seg_l);
+    // Mapping can leave two adjacent segments carrying the same label -- when a
+    // relabelled segment abuts one that already carried to_label -- which
+    // splice does not accept, so coalesce before handing the tiling over.
+    std::vector<int64_t> canon_s;
+    std::vector<int> canon_l;
+    coalesce(seg_s, seg_l, canon_s, canon_l);
+    splice(a, b, canon_s, canon_l);
+  }
+
+  // Throws if the canonical-form invariants are broken. Mirrors Python's
+  // Profile.validate; used by the differential tests.
+  void validate() const {
+    if (starts.size() != labels.size() + 1) {
+      throw std::runtime_error("length mismatch");
+    }
+    if (labels.empty()) {
+      throw std::runtime_error("profile must have at least one segment");
+    }
+    for (size_t i = 0; i + 1 < starts.size(); ++i) {
+      if (starts[i] >= starts[i + 1]) {
+        throw std::runtime_error("starts not strictly increasing");
+      }
+    }
+    for (size_t i = 0; i + 1 < labels.size(); ++i) {
+      if (labels[i] == labels[i + 1]) {
+        throw std::runtime_error("adjacent labels equal");
+      }
+    }
   }
 
   bool operator==(const Profile& o) const {
@@ -1110,9 +1213,115 @@ class NativePermutationLayoutSolver {
   int rotate_remove_insert_threshold_ = 2;
 };
 
+// --- Optional[int] <-> kNone at the Python boundary -----------------------
+
+std::vector<int> labels_from_python(const std::vector<std::optional<int>>& in) {
+  std::vector<int> out;
+  out.reserve(in.size());
+  for (const std::optional<int>& v : in) {
+    out.push_back(v.has_value() ? *v : kNone);
+  }
+  return out;
+}
+
+std::vector<std::optional<int>> labels_to_python(const std::vector<int>& in) {
+  std::vector<std::optional<int>> out;
+  out.reserve(in.size());
+  for (const int v : in) {
+    out.push_back(v == kNone ? std::nullopt : std::optional<int>(v));
+  }
+  return out;
+}
+
+std::optional<int> label_to_python(int label) {
+  return label == kNone ? std::nullopt : std::optional<int>(label);
+}
+
+// Exposes the internal Profile to Python so the differential tests can compare
+// it against contact_profile.Profile method by method, rather than only
+// indirectly through the solver's below/above profiles. Test-only: nothing in
+// torch_spyre itself constructs one of these.
+void register_profile(py::module_& m) {
+  py::class_<Profile>(m, "NativeProfile")
+      .def(py::init([](const std::vector<int64_t>& starts,
+                       const std::vector<std::optional<int>>& labels) {
+             Profile p;
+             p.starts = starts;
+             p.labels = labels_from_python(labels);
+             return p;
+           }),
+           py::arg("starts"), py::arg("labels"))
+      .def_static(
+          "uniform",
+          [](int64_t span_start, int64_t span_end, std::optional<int> label) {
+            return Profile::uniform(span_start, span_end,
+                                    label.value_or(kNone));
+          },
+          py::arg("span_start"), py::arg("span_end"), py::arg("label"))
+      .def_static(
+          "from_segments",
+          [](const std::vector<int64_t>& starts,
+             const std::vector<std::optional<int>>& labels) {
+            return Profile::from_segments(starts, labels_from_python(labels));
+          },
+          py::arg("starts"), py::arg("labels"))
+      .def_property_readonly("starts",
+                             [](const Profile& p) { return p.starts; })
+      .def_property_readonly(
+          "labels", [](const Profile& p) { return labels_to_python(p.labels); })
+      .def_property_readonly("span_start", &Profile::span_start)
+      .def_property_readonly("span_end", &Profile::span_end)
+      .def(
+          "label_at",
+          [](const Profile& p, int64_t t) {
+            return label_to_python(p.label_at(t));
+          },
+          py::arg("t"))
+      .def(
+          "segments",
+          [](const Profile& p, int64_t a, int64_t b) {
+            std::vector<int64_t> s;
+            std::vector<int> l;
+            p.segments(a, b, &s, &l);
+            return py::make_tuple(s, labels_to_python(l));
+          },
+          py::arg("a"), py::arg("b"))
+      .def(
+          "splice",
+          [](Profile& p, int64_t a, int64_t b,
+             const std::vector<int64_t>& seg_starts,
+             const std::vector<std::optional<int>>& seg_labels) {
+            p.splice(a, b, seg_starts, labels_from_python(seg_labels));
+          },
+          py::arg("a"), py::arg("b"), py::arg("seg_starts"),
+          py::arg("seg_labels"))
+      .def(
+          "relabel",
+          [](Profile& p, int64_t a, int64_t b, std::optional<int> from_label,
+             std::optional<int> to_label) {
+            p.relabel(a, b, from_label.value_or(kNone),
+                      to_label.value_or(kNone));
+          },
+          py::arg("a"), py::arg("b"), py::arg("from_label"),
+          py::arg("to_label"))
+      .def("validate", &Profile::validate)
+      .def("__eq__", [](const Profile& a, const Profile& b) { return a == b; })
+      .def("__repr__", [](const Profile& p) {
+        std::string out = "NativeProfile(";
+        for (size_t i = 0; i < p.labels.size(); ++i) {
+          out += (i ? ", " : "");
+          out += "[" + std::to_string(p.starts[i]) + "," +
+                 std::to_string(p.starts[i + 1]) + ")=" +
+                 (p.labels[i] == kNone ? "None" : std::to_string(p.labels[i]));
+        }
+        return out + ")";
+      });
+}
+
 }  // namespace
 
 void register_native_permutation_layout(py::module_& m) {
+  register_profile(m);
   py::class_<NativePermutationLayoutSolver>(m, "NativePermutationLayoutSolver")
       .def(py::init<const py::list&, const std::vector<int>&, int64_t, int64_t,
                     const py::object&>(),
