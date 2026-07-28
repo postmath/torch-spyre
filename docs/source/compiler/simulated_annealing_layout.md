@@ -28,6 +28,18 @@ which contains the following files.
 - **`benchmarks/`** and **`examples/scratchpad/`** — profiling scripts, result docs, and runnable
   examples.
 
+**Native packer.** The permutation packer the search drives has two
+interchangeable implementations: the canonical Python
+`PermutationBasedLayoutSolver` and a C++ accelerator
+(`csrc/perm_layout_native.cpp`) that is the default. They are behaviourally
+identical — the differential and SA-equivalence tests assert bit-for-bit
+agreement on addresses, quality, allocation count, and per-operation deltas —
+and the C++ one is substantially faster. Select the Python packer explicitly with
+`config.native_layout_packer = False` or `TORCH_SPYRE_NATIVE_PACKER=0`. Because
+the `_C` extension is required for torch-spyre to function at all, a missing
+native packer means a stale or incomplete build and raises rather than silently
+falling back to Python.
+
 **Validation philosophy:** every incremental operation is checked against the
 from-scratch reference oracle — randomized *differential* tests, a gated *stress* suite
 (`TORCH_SPYRE_STRESS_SCRATCHPAD=1`, tens of thousands of seeds), and in places *exhaustive*

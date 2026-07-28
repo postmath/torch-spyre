@@ -121,25 +121,53 @@ class NativePermutationLayoutSolver {
     std::vector<std::string> names(n);
     std::vector<std::vector<std::string>> parent_names(n);
     for (int i = 0; i < n; ++i) {
-      py::handle b = buffers[i];
-      names[i] = b.attr("name").cast<std::string>();
-      sizes_[i] = b.attr("size").cast<int64_t>();
-      std::vector<int64_t> uses = b.attr("uses").cast<std::vector<int64_t>>();
-      if (uses.empty()) {
-        throw std::invalid_argument("buffer uses must be non-empty");
+      // ``py::object``, not ``py::handle``: a handle is a *borrowed* reference
+      // owned only by ``buffers``, so Python code running during the field
+      // reads below (a property, ``__getattr__``) could drop the element from
+      // the list and free the object out from under us.
+      py::object b = buffers[i];
+      try {
+        names[i] = b.attr("name").cast<std::string>();
+        sizes_[i] = b.attr("size").cast<int64_t>();
+        if (sizes_[i] < 0) {
+          throw std::invalid_argument("buffer " + std::to_string(i) +
+                                      ": size must be non-negative");
+        }
+        std::vector<int64_t> uses = b.attr("uses").cast<std::vector<int64_t>>();
+        if (uses.empty()) {
+          throw std::invalid_argument("buffer uses must be non-empty");
+        }
+        bool first_read = b.attr("first_use_is_read").cast<bool>();
+        parent_names[i] =
+            b.attr("in_place_parents").cast<std::vector<std::string>>();
+        st->start[i] = uses.front();
+        st->end[i] = uses.back() + 1;
+        st->weight[i] =
+            static_cast<double>(uses.size()) + (first_read ? 0.0 : 0.5);
       }
-      bool first_read = b.attr("first_use_is_read").cast<bool>();
-      parent_names[i] =
-          b.attr("in_place_parents").cast<std::vector<std::string>>();
-      st->start[i] = uses.front();
-      st->end[i] = uses.back() + 1;
-      st->weight[i] =
-          static_cast<double>(uses.size()) + (first_read ? 0.0 : 0.5);
+      catch (const py::cast_error&) {
+        // pybind11 turns a failed cast into a RuntimeError whose message names
+        // neither the field nor the buffer (and, in a release build, not even
+        // the target type). Every other rejection in this class is a
+        // ValueError, so restate it as one and name the offending buffer.
+        throw std::invalid_argument(
+            "buffer " + std::to_string(i) +
+            ": could not read fields (name, size, uses, first_use_is_read, "
+            "in_place_parents)");
+      }
     }
 
     std::unordered_map<std::string, int> name_to_idx;
     name_to_idx.reserve(n * 2);
     for (int i = 0; i < n; ++i) name_to_idx.emplace(names[i], i);
+    // Names are the identity in-place parents are resolved by, so a duplicate
+    // makes ``in_place_parents=["a"]`` ambiguous: first-wins (``emplace``) and
+    // last-wins (Python's dict comprehension) are both arbitrary. Reject
+    // instead of silently picking one. Mirrors the assert in
+    // ``PermutationBasedLayoutSolverBase.__init__``.
+    if (static_cast<int>(name_to_idx.size()) != n) {
+      throw std::invalid_argument("buffer names must be unique");
+    }
 
     // Time-overlap sets (half-open [start, end) intervals).
     st->overlap.assign(n, {});
@@ -217,11 +245,13 @@ class NativePermutationLayoutSolver {
   }
 
   double rotate(int i, int j) {
-    if (i == j) return 0.0;
+    // Bounds first, then the i == j no-op: the other way round, an out-of-range
+    // ``rotate(999, 999)`` would return 0.0 instead of raising.
     const int n = st_->n;
     if (i < 0 || i >= n || j < 0 || j >= n) {
       throw std::invalid_argument("rotate index out of range");
     }
+    if (i == j) return 0.0;
     if (!eligible_[permutation_[i]]) {
       // Moving a transparent (HBM) buffer changes no eligible buffer's relative
       // order, so no address moves; just relocate its slot.
@@ -237,6 +267,13 @@ class NativePermutationLayoutSolver {
   double resize(int idx, int64_t new_size) {
     if (idx < 0 || idx >= st_->n) {
       throw std::invalid_argument("resize index out of range");
+    }
+    // A negative footprint puts a buffer's top below its own address, breaking
+    // the "stack on the max top" invariant the placer rests on -- and it is the
+    // one input that made AlignUp overflow and the fast path disagree with the
+    // candidate scan.
+    if (new_size < 0) {
+      throw std::invalid_argument("resize size must be non-negative");
     }
     if (sizes_[idx] == new_size) return 0.0;  // no-op: footprint unchanged
     const double old_total = total_quality_;

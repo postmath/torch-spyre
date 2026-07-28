@@ -27,7 +27,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
     _NativePackerAdapter,
-    _native_solver_class,
     buffer_quality,
 )
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
@@ -436,12 +435,8 @@ class SimulatedAnnealingTests(TestCase):
             self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)
 
 
-@unittest.skipUnless(
-    _native_solver_class() is not None,
-    "the C++ NativePermutationLayoutSolver is not available in this build",
-)
 class NativePackerEquivalenceTests(TestCase):
-    """The C++ packer is an opt-in accelerator that must reproduce the canonical
+    """The C++ packer is the default accelerator and must reproduce the canonical
     Python packer exactly. Native quality is bit-exact against Python and the RNG
     is seeded, so the entire annealing trajectory -- and hence the finalized
     buffer addresses, the plan quality, and the committed permutation -- must be

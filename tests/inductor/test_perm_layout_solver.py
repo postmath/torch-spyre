@@ -1295,6 +1295,12 @@ class ResizeEligibilityDifferentialTests(TestCase):
         # in-place reuse (both size/eligibility dependent) must match exactly.
         rebuilt = _rebuilt_with_state(fast, cap, align)
         self.assertEqual(fast.addresses, rebuilt.addresses, tag)
+        # Quality against the *rebuild*, not just ``ref``: ``_sync_reference``
+        # copies ``_qualities`` into ``ref``, so ``ref.quality()`` only re-sums
+        # whatever ``fast`` already computed and cannot catch a wrong size ->
+        # quality formula in ``resize``. The rebuild derives it independently by
+        # feeding the current ``_sizes`` through a fresh constructor.
+        self.assertEqual(fast.quality(), rebuilt.quality(), tag)
         self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
         self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
         self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
@@ -1390,6 +1396,39 @@ class NativeSolverDifferentialTests(TestCase):
         self.assertEqual(list(cpp_plan.addresses), list(py_plan.addresses), tag)
         self.assertEqual(cpp_plan.quality(), py_plan.quality(), tag)
         self.assertEqual(cpp_plan.count_allocated(), py_plan.count_allocated(), tag)
+
+    def test_fast_path_reads_pokethrough_top_not_dead_parent(self):
+        """The aggregate fast path's boundary case, pinned deterministically.
+
+        ``RecomputeAll`` takes the interval-aggregate fast path for a buffer with
+        no in-place partner and the gather + ``PlaceDecision`` path for one with,
+        so the discriminating state is a partner-free buffer resting on a
+        *poke-through*: ``c`` co-locates into ``p``'s slot, so its top (64) sits
+        below ``p``'s (128), and ``h`` starts at 5 -- after ``p`` dies -- so its
+        only candidate is ``c``. Its floor must therefore be 64, not 128.
+
+        ``h`` overlapping ``p`` as well (as in the contact-profile poke-through
+        test) makes both answers 128, which is why that case cannot distinguish a
+        correct aggregate from one that folds in a dead-but-taller buffer. The
+        alignment must stay 1: at 128-byte alignment ``align_up(64) ==
+        align_up(128)`` and the discrimination vanishes.
+        """
+        p = _buf("p", 128, 0, 5)
+        c = _buf("c", 64, 4, 10, in_place_parents=["p"])
+        h = _buf("h", 32, 5, 10)
+        buffers = [p, c, h]
+        perm = [0, 1, 2]
+
+        cpp_plan = NativePermutationLayoutSolver(buffers, perm, 10_000, 1)
+        self.assertEqual(list(cpp_plan.addresses), [0, 0, 64])
+
+        # Both Python packers agree, so the expectation is the specification's,
+        # not just this implementation's. The from-scratch reference is the
+        # independent oracle the randomized native tests never consult.
+        py_plan = PermutationBasedLayoutSolver(buffers, perm, 10_000, 1)
+        ref_plan = ReferencePermutationBasedLayoutSolver(buffers, perm, 10_000, 1)
+        self._assert_equal(py_plan, cpp_plan, "pokethrough fast path")
+        self._assert_equal(ref_plan, cpp_plan, "pokethrough fast path vs reference")
 
     def test_random_mixed_sequences_match_python(self):
         seeds = 4000 if _STRESS else 800

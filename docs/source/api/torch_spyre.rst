@@ -635,6 +635,12 @@ Environment Variables
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``TORCH_SPYRE_NATIVE_PACKER``
+     - Use the C++ permutation-layout packer accelerator in the
+       simulated-annealing layout solver (default ``1``; set ``0`` to force
+       the pure-Python packer). No effect unless
+       ``LAYOUT_SOLVER=simulated_annealing``.
+       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``

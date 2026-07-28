@@ -29,8 +29,6 @@ from typing import Optional
 from abc import ABC, abstractmethod
 import bisect
 import heapq
-import math
-import warnings
 
 from torch_spyre._inductor.scratchpad.contact_profile import Profile
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -127,6 +125,11 @@ class PermutationBasedLayoutSolverBase(ABC):
         self.capacity = capacity
         self.alignment = alignment
         self._name_to_idx = {buf.name: i for i, buf in enumerate(buffers)}
+        # Names are the identity in-place parents are resolved by, so a
+        # duplicate makes ``in_place_parents=["a"]`` ambiguous -- the dict
+        # comprehension above silently keeps the last such buffer. Reject
+        # instead of resolving to an arbitrary one.
+        assert len(self._name_to_idx) == n, "buffer names must be unique"
 
         # Per-buffer size as a flat list, for fast access in the placement hot
         # loop (avoids a dataclass attribute lookup per candidate). Mutable via
@@ -221,7 +224,14 @@ class PermutationBasedLayoutSolverBase(ABC):
         size-derived footprint and quality move; the shared buffer object is
         **not** mutated (the plan tracks size in ``_sizes``). One of the two
         co-optimization packer extensions (Plan §4.2 / §7.3).
+
+        ``new_size`` must be non-negative. A negative footprint puts a buffer's
+        top below its own address, which breaks the "rest on the max top"
+        invariant the narrow candidate set in :meth:`_recompute_address` relies
+        on -- the incremental result then diverges from a from-scratch place.
+        Zero is allowed: the allocator clamps unsized entries to 0.
         """
+        assert new_size >= 0, "resize size must be non-negative"
         old_total = self.total_quality
         old_q = self._qualities[idx]
         self._sizes[idx] = new_size
@@ -273,8 +283,15 @@ class PermutationBasedLayoutSolverBase(ABC):
         return delta
 
     def _align_up(self, addr: int) -> int:
-        """Round ``addr`` up to the next multiple of ``self.alignment``."""
-        return math.ceil(addr / self.alignment) * self.alignment
+        """Round ``addr`` up to the next multiple of ``self.alignment``.
+
+        Integer ceiling division, not ``math.ceil(addr / alignment)``: the float
+        form loses precision above ``2**53`` and there *under*-aligns, handing
+        back an address below ``addr`` (and so two live buffers the same slot).
+        The C++ packer computes this exactly, so the float form was also the one
+        place the two could disagree on in-range input.
+        """
+        return -(-addr // self.alignment) * self.alignment
 
     def _top(self, idx: int) -> Optional[int]:
         """Return ``address + size`` for a placed buffer (its exclusive top), or
@@ -340,6 +357,29 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # is simply not placed in-place, see ``_can_inplace`` -- so
                     # asserting them would reject plans this solver handles.
                     assert_in_place_parent_is_read(self.buffers[parent], buf.name)
+                    # Single-tick handoff: a valid in-place pair overlaps at
+                    # exactly one tick, the child's first. Both in-place
+                    # candidate generators upstream enforce it
+                    # (``allocator._determine_in_place`` and
+                    # ``_determine_in_place_division_invariant``), and
+                    # ``_assert_in_place_relationships`` re-checks it. The
+                    # incremental machinery *relies* on it and cannot re-derive
+                    # it: ``_placement_decision`` co-locates any overlapping
+                    # partner that fits, while the in-place dirtying in
+                    # :meth:`_propagate_addresses` and the seed in
+                    # :meth:`_inplace_pokethrough_seed` both sample the contact
+                    # profiles at that single tick. On a multi-tick overlap they
+                    # under-seed (stale addresses); when the child starts first
+                    # they index outside the parent's span. Fail here instead.
+                    assert (
+                        self.buffers[parent].end_time
+                        == self.buffers[child].start_time + 1
+                    ), (
+                        f"in-place pair ({self.buffers[parent].name}, "
+                        f"{buf.name}) must hand off at a single tick: parent "
+                        f"end_time {self.buffers[parent].end_time} != child "
+                        f"start_time {self.buffers[child].start_time} + 1"
+                    )
                     partners[child].add(parent)
                     partners[parent].add(child)
         return partners
@@ -1440,10 +1480,6 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
 # never touches a Python object per op. This adapter wraps the native solver so it
 # is a drop-in for the exact surface the simulated-annealing search drives.
 
-# One-time warning latch: emit the "requested but unavailable" fallback warning at
-# most once per process, so a native-less build does not spam every layout plan.
-_native_packer_warned = False
-
 
 def _native_solver_class():
     """The C++ ``NativePermutationLayoutSolver`` class, or ``None`` if the ``_C``
@@ -1589,33 +1625,31 @@ def make_permutation_packer(
     Returns a :class:`_NativePackerAdapter` (over the C++
     ``NativePermutationLayoutSolver``) when ``config.native_layout_packer`` is
     true (the default -- back it off with that config knob, or its
-    ``TORCH_SPYRE_NATIVE_PACKER=0`` env default) and the native class is
-    importable. When the knob is false, or the native class is unavailable, the
-    canonical Python :class:`PermutationBasedLayoutSolver` is used instead. The
-    two packers are behaviourally identical (verified bit-for-bit by the
-    differential and the SA-equivalence tests); the C++ one is the faster default.
-    If the native class is unavailable a one-time warning is emitted before
-    falling back to Python.
+    ``TORCH_SPYRE_NATIVE_PACKER=0`` env default), and the canonical Python
+    :class:`PermutationBasedLayoutSolver` when it is false. The two packers are
+    behaviourally identical (verified bit-for-bit by the differential and the
+    SA-equivalence tests); the C++ one is the faster default.
+
+    A missing native class is *not* a supported mode: ``_C`` is required for the
+    package to work at all, so its absence means an incomplete or stale build
+    rather than a pure-Python installation. Raise instead of silently falling
+    back, which would otherwise trade a build error for a quiet 2-25x slowdown.
     """
     from torch_spyre._inductor import config
 
     if config.native_layout_packer:
         native_cls = _native_solver_class()
-        if native_cls is not None:
-            return _NativePackerAdapter(
-                native_cls, buffers, permutation, capacity, alignment, eligible
+        if native_cls is None:
+            raise RuntimeError(
+                "torch_spyre._C.NativePermutationLayoutSolver is unavailable, "
+                "which means the _C extension is missing or stale -- rebuild it. "
+                "To use the pure-Python packer deliberately, set "
+                "config.native_layout_packer = False (or "
+                "TORCH_SPYRE_NATIVE_PACKER=0)."
             )
-        global _native_packer_warned
-        if not _native_packer_warned:
-            _native_packer_warned = True
-            warnings.warn(
-                "torch_spyre._C.NativePermutationLayoutSolver is unavailable; "
-                "using the Python permutation packer. Set "
-                "config.native_layout_packer = False to select the Python packer "
-                "explicitly and silence this warning.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        return _NativePackerAdapter(
+            native_cls, buffers, permutation, capacity, alignment, eligible
+        )
     return PermutationBasedLayoutSolver(
         buffers, permutation, capacity, alignment, eligible
     )
