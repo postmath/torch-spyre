@@ -305,9 +305,16 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
 
     def _per_core_size(self, idx: int, div_idx: int) -> int:
         """Per-core footprint of buffer ``idx`` under menu index ``div_idx``:
-        ``ceil(total_size / output_partition)`` (Plan §2.2)."""
+        ``ceil(total_size / output_partition)`` (Plan §2.2).
+
+        Clamped to be non-negative: an unsized buffer carries the ``mem_usage``
+        ``-1`` sentinel (a non-placeable "op not allowed" input in the captures),
+        so its footprint is never actually used -- clamp it so a nonsense size can
+        never look placeable, and so the packer never receives a negative size.
+        Mirrors the ``max(0, ...)`` clamp at the other packer-feeding sites in
+        ``allocator.py``."""
         part = self._bufs[idx].core_divisions[div_idx].output_partition
-        return math.ceil(self._bufs[idx].size / part)
+        return max(0, math.ceil(self._bufs[idx].size / part))
 
     def _eligible(self, idx: int) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``
