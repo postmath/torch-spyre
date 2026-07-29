@@ -14,6 +14,8 @@
 
 """Tests for the capacity-bounded allocation plans."""
 
+import copy
+import gc
 import itertools
 import os
 import random
@@ -1796,3 +1798,127 @@ class NativeGuardTests(TestCase):
     def test_zero_alignment_raises(self):
         with self.assertRaises(ValueError):
             NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)
+
+
+class NativePermutationViewTests(TestCase):
+    """Lifetime and reference semantics of the native ``permutation`` view.
+
+    ``plan.permutation`` returns a ``PermutationView`` that *borrows* its solver
+    and reads straight through to the solver's ``std::vector``. Two opposite
+    things must hold, and the rest of the suite establishes neither:
+
+    - It must stay **valid**. Nothing else in these tests lets a view outlive its
+      solver, so a view left reading freed memory would go unnoticed -- and did:
+      the ``py::keep_alive`` securing this was initially attached to the property
+      rather than to the getter, where it silently does nothing, and the whole
+      suite passed regardless.
+    - It must stay **live**. ``annealing_step_swap`` captures the view once and
+      re-reads it after each ``swap``, so a snapshot would make the search read
+      pre-swap values. That degrades rather than breaks: the search would simply
+      explore a different trajectory and still return a feasible layout, so only
+      the cross-packer equivalence test could notice, and only because it demands
+      bit-identical trajectories.
+
+    These are failures where the program keeps running and produces plausible
+    output, which is why they are asserted against the mechanism directly.
+    """
+
+    def _bufs(self):
+        return [_buf("a", 64, 0, 4), _buf("c", 96, 0, 4), _buf("d", 32, 0, 4)]
+
+    def _plan(self, perm=(0, 1, 2), capacity=200, alignment=1):
+        return NativePermutationLayoutSolver(
+            self._bufs(), list(perm), capacity, alignment
+        )
+
+    def test_view_outlives_its_solver(self):
+        """keep_alive must make the view retain the solver it borrows."""
+        plan = self._plan()
+        view = plan.permutation
+        del plan
+        for _ in range(3):
+            gc.collect()
+        self.assertEqual(list(view), [0, 1, 2])
+
+    def test_view_survives_reuse_of_the_solver_s_memory(self):
+        """Stronger than the above: reading freed memory often *appears* to work
+        because the block has not been handed out again. Force it to be reused."""
+        plan = self._plan(perm=(2, 1, 0))
+        view = plan.permutation
+        del plan
+        gc.collect()
+        churn = [self._plan(perm=(1, 0, 2)) for _ in range(200)]
+        self.assertEqual(list(view), [2, 1, 0])
+        self.assertEqual(len(churn), 200)  # keep the churn alive to this point
+
+    def test_captured_view_observes_later_mutation(self):
+        """The liveness half: ``annealing_step_swap`` depends on this exactly."""
+        plan = self._plan()
+        view = plan.permutation  # captured ONCE, before the mutation
+        plan.swap(0)
+        self.assertEqual(list(view), [1, 0, 2])
+        plan.rotate(0, 2)
+        self.assertEqual(list(view), [0, 2, 1])
+
+    def test_copy_detaches_from_the_live_order(self):
+        """The mirror image of liveness. The search stores its best-so-far
+        permutation with a copy and later compares the live order against it; were
+        the copy to track the original, that test would be vacuously equal and
+        "commit the best permutation seen" would quietly stop working."""
+        plan = self._plan()
+        view = plan.permutation
+        snapshot = copy.copy(view)
+        deep = copy.deepcopy(view)
+        plan.swap(0)
+        self.assertIsInstance(snapshot, list)
+        self.assertIsInstance(deep, list)
+        self.assertEqual(snapshot, [0, 1, 2])
+        self.assertEqual(deep, [0, 1, 2])
+        self.assertEqual(list(view), [1, 0, 2])
+        self.assertNotEqual(snapshot, list(view))
+
+    def test_clone_view_tracks_the_clone_not_the_original(self):
+        """``copy()`` deep-copies the order, and the search clones plans."""
+        original = self._plan()
+        clone = original.copy()
+        clone.swap(0)
+        self.assertEqual(list(original.permutation), [0, 1, 2])
+        self.assertEqual(list(clone.permutation), [1, 0, 2])
+
+    def test_view_is_read_only(self):
+        """Read-only by construction, so Python cannot reorder the permutation
+        behind the solver's back (which would desync it from the addresses)."""
+        view = self._plan().permutation
+        with self.assertRaises(TypeError):
+            view[0] = 5
+        with self.assertRaises(TypeError):
+            del view[0]
+
+    def test_view_sequence_protocol(self):
+        """len / indexing / negative offsets / equality against a plain list, and
+        IndexError past the end so ``list(view)`` and iteration terminate."""
+        plan = self._plan(perm=(2, 0, 1))
+        view = plan.permutation
+        self.assertEqual(len(view), 3)
+        self.assertEqual(view[0], 2)
+        self.assertEqual(view[-1], 1)
+        self.assertEqual(list(view), [2, 0, 1])
+        self.assertEqual([x for x in view], [2, 0, 1])
+        self.assertEqual(view, [2, 0, 1])
+        self.assertNotEqual(view, [0, 1, 2])
+        self.assertEqual(view, plan.permutation)
+        for bad in (3, 99, -4):
+            with self.assertRaises(IndexError):
+                view[bad]
+
+    def test_finalize_writes_addresses_back_including_none(self):
+        """``finalize`` writes to EVERY buffer, so an evicted one is cleared to
+        ``None`` rather than left holding a stale address."""
+        buffers = [_buf("x", 150, 0, 3), _buf("y", 150, 0, 3)]
+        plan = NativePermutationLayoutSolver(buffers, [0, 1], 200, 1)
+        plan.finalize()
+        self.assertEqual(
+            [(b.name, b.address) for b in buffers], [("x", 0), ("y", None)]
+        )
+        # The retained list is the caller's, not a copy.
+        self.assertEqual([b.name for b in plan.buffers], ["x", "y"])
