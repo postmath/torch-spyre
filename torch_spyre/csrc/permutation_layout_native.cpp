@@ -669,6 +669,7 @@ class NativePermutationLayoutSolver {
     std::vector<int> placed_at(k, 0);
     std::vector<char> has_none_at(k, 0);
     std::vector<char> done_at(k, 0);
+    std::vector<int> cands;
     int not_done = 0;
     for (int t = 0; t < k; ++t) {
       done_at[t] = (total_at_[t] == 0) ? 1 : 0;
@@ -696,8 +697,9 @@ class NativePermutationLayoutSolver {
         }
         continue;
       }
+      get_candidates(pos, idx, cands);
       const auto [addr, partner] =
-          placement_decision(idx, get_candidates(pos, idx));
+          placement_decision(idx, cands);
       addresses_[idx] = addr;
       reuse_[idx] = partner;
       const bool evicted = !addr.has_value();
@@ -727,15 +729,14 @@ class NativePermutationLayoutSolver {
   void build() {
     reuse_.assign(n_, kNone);
     // Candidates: earlier, time-overlapping, eligible buffers (a prior-scan).
-    sequential_place([this](int pos, int idx) {
-      std::vector<int> cands;
+    sequential_place([this](int pos, int idx, std::vector<int> &cands) {
+      cands.clear();
       for (int p = 0; p < pos; ++p) {
         const int q = permutation_[p];
         if (overlaps(idx, q) && eligible_[q]) {
           cands.push_back(q);
         }
       }
-      return cands;
     });
     position_.assign(n_, 0);
     for (int p = 0; p < n_; ++p) {
@@ -989,14 +990,13 @@ class NativePermutationLayoutSolver {
   }
 
   void recompute_all_addresses() {
-    sequential_place([this](int p, int idx) {
-      std::vector<int> cands;
+    sequential_place([this](int p, int idx, std::vector<int> &cands) {
+      cands.clear();
       for (const int w : overlap_[idx]) {
         if (position_[w] < p && eligible_[w]) {
           cands.push_back(w);
         }
       }
-      return cands;
     });
   }
 
