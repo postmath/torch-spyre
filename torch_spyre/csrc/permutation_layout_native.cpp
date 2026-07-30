@@ -67,13 +67,12 @@ struct Profile {
   std::vector<int64_t> starts;
   std::vector<int> labels;
 
-  // Merge adjacent segments carrying equal labels into the output vectors.
-  static void coalesce(const std::vector<int64_t>& in_starts,
-                       const std::vector<int>& in_labels,
-                       std::vector<int64_t>& out_starts,
-                       std::vector<int>& out_labels) {
-    out_starts.clear();
-    out_labels.clear();
+  // The segments with adjacent equal labels merged, as a (starts, labels) pair.
+  static std::pair<std::vector<int64_t>, std::vector<int>> coalesce(
+      const std::vector<int64_t>& in_starts,
+      const std::vector<int>& in_labels) {
+    std::vector<int64_t> out_starts;
+    std::vector<int> out_labels;
     out_starts.push_back(in_starts[0]);
     for (size_t i = 0; i < in_labels.size(); ++i) {
       const int label = in_labels[i];
@@ -84,20 +83,17 @@ struct Profile {
         out_starts.push_back(in_starts[i + 1]);
       }
     }
+    return {std::move(out_starts), std::move(out_labels)};
   }
 
   static Profile uniform(int64_t span_start, int64_t span_end, int label) {
-    Profile p;
-    p.starts = {span_start, span_end};
-    p.labels = {label};
-    return p;
+    return Profile{{span_start, span_end}, {label}};
   }
 
   static Profile from_segments(const std::vector<int64_t>& in_starts,
                                const std::vector<int>& in_labels) {
-    Profile p;
-    coalesce(in_starts, in_labels, p.starts, p.labels);
-    return p;
+    auto [out_starts, out_labels] = coalesce(in_starts, in_labels);
+    return Profile{std::move(out_starts), std::move(out_labels)};
   }
 
   int64_t span_start() const {
@@ -129,24 +125,23 @@ struct Profile {
     return labels[i];
   }
 
-  // The segments clipped to [a, b) as fresh vectors. An empty range yields
-  // ([a], []).
-  void segments(int64_t a, int64_t b, std::vector<int64_t>* out_starts,
-                std::vector<int>* out_labels) const {
-    out_starts->clear();
-    out_labels->clear();
-    if (a == b) {
-      out_starts->push_back(a);
-      return;
+  // The segments clipped to [a, b) as a (starts, labels) pair. An empty range
+  // yields ([a], []).
+  std::pair<std::vector<int64_t>, std::vector<int>> segments(int64_t a,
+                                                             int64_t b) const {
+    std::vector<int64_t> out_starts;
+    std::vector<int> out_labels;
+    out_starts.push_back(a);
+    if (a != b) {
+      // i = bisect_right(starts, a) - 1
+      size_t i = starts_index_at_most(a);
+      while (starts[i] < b) {
+        out_labels.push_back(labels[i]);
+        out_starts.push_back(std::min(starts[i + 1], b));
+        ++i;
+      }
     }
-    out_starts->push_back(a);
-    // i = bisect_right(starts, a) - 1
-    size_t i = starts_index_at_most(a);
-    while (starts[i] < b) {
-      out_labels->push_back(labels[i]);
-      out_starts->push_back(std::min(starts[i + 1], b));
-      ++i;
-    }
+    return {std::move(out_starts), std::move(out_labels)};
   }
 
   // Replace the function on [a, b) with the given segments, coalescing at both
@@ -247,9 +242,7 @@ struct Profile {
     if (a == b) {
       return;
     }
-    std::vector<int64_t> seg_s;
-    std::vector<int> seg_l;
-    segments(a, b, &seg_s, &seg_l);
+    auto [seg_s, seg_l] = segments(a, b);
     for (int& lab : seg_l) {
       if (lab == from_label) {
         lab = to_label;
@@ -258,9 +251,7 @@ struct Profile {
     // Mapping can leave two adjacent segments carrying the same label -- when a
     // relabelled segment abuts one that already carried to_label -- which
     // splice does not accept, so coalesce before handing the tiling over.
-    std::vector<int64_t> canon_s;
-    std::vector<int> canon_l;
-    coalesce(seg_s, seg_l, canon_s, canon_l);
+    auto [canon_s, canon_l] = coalesce(seg_s, seg_l);
     splice(a, b, canon_s, canon_l);
   }
 
@@ -779,27 +770,25 @@ class NativePermutationLayoutSolver {
   // --- swap incremental machinery ------------------------------------------
 
   void update_profiles_for_swap(int x, int y, int64_t a, int64_t b) {
-    std::vector<int64_t> old_x_below_s, old_y_above_s;
-    std::vector<int> old_x_below_l, old_y_above_l;
-    below_[x].segments(a, b, &old_x_below_s, &old_x_below_l);
-    above_[y].segments(a, b, &old_y_above_s, &old_y_above_l);
+    auto [old_x_below_s, old_x_below_l] = below_[x].segments(a, b);
+    auto [old_y_above_s, old_y_above_l] = above_[y].segments(a, b);
     // Downward and upward are exact mirrors.
-    splice_half(&below_, &above_, x, y, a, b, old_x_below_s, old_x_below_l);
-    splice_half(&above_, &below_, y, x, a, b, old_y_above_s, old_y_above_l);
+    splice_half(below_, above_, x, y, a, b, old_x_below_s, old_x_below_l);
+    splice_half(above_, below_, y, x, a, b, old_y_above_s, old_y_above_l);
   }
 
   // One side of the transposition: `lo` was directly below `hi` in the
   // `primary` direction over [a, b); after the swap `hi` is.
-  void splice_half(std::vector<Profile>* primary, std::vector<Profile>* reverse,
+  void splice_half(std::vector<Profile>& primary, std::vector<Profile>& reverse,
                    int lo, int hi, int64_t a, int64_t b,
                    const std::vector<int64_t>& old_lo_s,
                    const std::vector<int>& old_lo_l) {
-    (*primary)[lo].splice(a, b, {a, b}, {hi});
-    (*primary)[hi].splice(a, b, old_lo_s, old_lo_l);
+    primary[lo].splice(a, b, {a, b}, {hi});
+    primary[hi].splice(a, b, old_lo_s, old_lo_l);
     for (size_t k = 0; k < old_lo_l.size(); ++k) {
       const int label = old_lo_l[k];
       if (label != kNone) {
-        (*reverse)[label].relabel(old_lo_s[k], old_lo_s[k + 1], lo, hi);
+        reverse[label].relabel(old_lo_s[k], old_lo_s[k + 1], lo, hi);
       }
     }
   }
@@ -866,7 +855,7 @@ class NativePermutationLayoutSolver {
       recompute_address(z);
       if (!addresses_[z].has_value()) {
         // z is evicted and final; everything resting on it is evicted too.
-        flip_evicted_closure(z, &flipped);
+        flip_evicted_closure(z, flipped);
         continue;
       }
       total_quality_ += qualities_[z];
@@ -893,7 +882,7 @@ class NativePermutationLayoutSolver {
     }
   }
 
-  void flip_evicted_closure(int z, std::vector<char>* flipped) {
+  void flip_evicted_closure(int z, std::vector<char>& flipped) {
     std::vector<int> stack;
     for (const int w : label_set(above_[z])) {
       if (w != kNone) {
@@ -903,10 +892,10 @@ class NativePermutationLayoutSolver {
     while (!stack.empty()) {
       const int w = stack.back();
       stack.pop_back();
-      if ((*flipped)[w]) {
+      if (flipped[w]) {
         continue;
       }
-      (*flipped)[w] = 1;
+      flipped[w] = 1;
       if (is_fully_allocated(w)) {
         total_quality_ -= qualities_[w];
         total_allocated_count_ -= 1;
@@ -914,7 +903,7 @@ class NativePermutationLayoutSolver {
       addresses_[w] = std::nullopt;
       reuse_[w] = kNone;
       for (const int u : label_set(above_[w])) {
-        if (u != kNone && !(*flipped)[u]) {
+        if (u != kNone && !flipped[u]) {
           stack.push_back(u);
         }
       }
@@ -1280,9 +1269,7 @@ void register_profile(py::module_& m) {
       .def(
           "segments",
           [](const Profile& p, int64_t a, int64_t b) {
-            std::vector<int64_t> s;
-            std::vector<int> l;
-            p.segments(a, b, &s, &l);
+            auto [s, l] = p.segments(a, b);
             return py::make_tuple(s, labels_to_python(l));
           },
           py::arg("a"), py::arg("b"))
