@@ -69,33 +69,42 @@ struct Profile {
   std::vector<int64_t> starts;
   std::vector<int> labels;
 
-  // The segments with adjacent equal labels merged, as a (starts, labels) pair.
-  static std::pair<std::vector<int64_t>, std::vector<int>> coalesce(
-      const std::vector<int64_t>& in_starts,
-      const std::vector<int>& in_labels) {
-    std::vector<int64_t> out_starts;
-    std::vector<int> out_labels;
-    out_starts.push_back(in_starts[0]);
-    for (size_t i = 0; i < in_labels.size(); ++i) {
-      const int label = in_labels[i];
-      if (!out_labels.empty() && out_labels.back() == label) {
-        out_starts.back() = in_starts[i + 1];  // extend previous segment
-      } else {
-        out_labels.push_back(label);
-        out_starts.push_back(in_starts[i + 1]);
+  // Merge adjacent segments carrying equal labels, in place: compact the
+  // segments that survive down to the front and drop the tail. Only shrinking
+  // resizes are used, and those never reallocate, so this allocates nothing --
+  // on any input, not just the already-canonical one. It is idempotent, which
+  // is what lets a caller that only sometimes produces a duplicate pair (see
+  // relabel) run it unconditionally rather than testing first.
+  //
+  // A surviving run keeps the start of its *first* segment and the span end is
+  // restored at the end, which is how the absorbed segments' starts disappear.
+  // Requires a non-empty `starts`, as the Profile invariant already does.
+  static void coalesce(std::vector<int64_t>& starts, std::vector<int>& labels) {
+    const int64_t span_end = starts.back();
+    size_t kept = 0;
+    for (size_t i = 0; i < labels.size(); ++i) {
+      if (kept > 0 && labels[kept - 1] == labels[i]) {
+        continue;  // absorbed into the run at kept - 1, which keeps its start
       }
+      labels[kept] = labels[i];
+      starts[kept] = starts[i];
+      ++kept;
     }
-    return {std::move(out_starts), std::move(out_labels)};
+    labels.resize(kept);
+    starts.resize(kept + 1);
+    starts.back() = span_end;
   }
 
   static Profile uniform(int64_t span_start, int64_t span_end, int label) {
     return Profile{{span_start, span_end}, {label}};
   }
 
-  static Profile from_segments(const std::vector<int64_t>& in_starts,
-                               const std::vector<int>& in_labels) {
-    auto [out_starts, out_labels] = coalesce(in_starts, in_labels);
-    return Profile{std::move(out_starts), std::move(out_labels)};
+  // Takes the segments by value so a caller holding the only copy can move
+  // them in and the coalescing happens in the Profile's own storage.
+  static Profile from_segments(std::vector<int64_t> starts,
+                               std::vector<int> labels) {
+    coalesce(starts, labels);
+    return Profile{std::move(starts), std::move(labels)};
   }
 
   int64_t span_start() const {
@@ -268,8 +277,11 @@ struct Profile {
     // Mapping can leave two adjacent segments carrying the same label -- when a
     // relabelled segment abuts one that already carried to_label -- which
     // splice does not accept, so coalesce before handing the tiling over.
-    auto [canon_s, canon_l] = coalesce(seg_s, seg_l);
-    splice(a, b, canon_s, canon_l);
+    // Whether it actually has to merge anything depends on to_label and on
+    // what the profile already carries, so this runs unconditionally; being
+    // in place and idempotent, the case that needs no merge costs one pass.
+    coalesce(seg_s, seg_l);
+    splice(a, b, seg_s, seg_l);
   }
 
   // Throws if the canonical-form invariants are broken. Mirrors Python's
@@ -778,9 +790,11 @@ class NativePermutationLayoutSolver {
         continue;
       }
       below_s[i].push_back(end_[i]);
-      below_[i] = Profile::from_segments(below_s[i], below_l[i]);
+      below_[i] =
+          Profile::from_segments(std::move(below_s[i]), std::move(below_l[i]));
       above_s[i].push_back(end_[i]);
-      above_[i] = Profile::from_segments(above_s[i], above_l[i]);
+      above_[i] =
+          Profile::from_segments(std::move(above_s[i]), std::move(above_l[i]));
     }
   }
 
@@ -1074,8 +1088,10 @@ class NativePermutationLayoutSolver {
     }
     below_starts.push_back(e_x);
     above_starts.push_back(e_x);
-    below_[x] = Profile::from_segments(below_starts, below_labels);
-    above_[x] = Profile::from_segments(above_starts, above_labels);
+    below_[x] = Profile::from_segments(std::move(below_starts),
+                                       std::move(below_labels));
+    above_[x] = Profile::from_segments(std::move(above_starts),
+                                       std::move(above_labels));
   }
 
   // --- resize / eligibility reflow -----------------------------------------
@@ -1266,9 +1282,10 @@ void register_profile(py::module_& m) {
           py::arg("span_start"), py::arg("span_end"), py::arg("label"))
       .def_static(
           "from_segments",
-          [](const std::vector<int64_t>& starts,
+          [](std::vector<int64_t> starts,
              const std::vector<std::optional<int>>& labels) {
-            return Profile::from_segments(starts, labels_from_python(labels));
+            return Profile::from_segments(std::move(starts),
+                                          labels_from_python(labels));
           },
           py::arg("starts"), py::arg("labels"))
       .def_property_readonly("starts",
