@@ -32,12 +32,14 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <queue>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -147,6 +149,10 @@ struct Profile {
   // Replace the function on [a, b) with the given segments, coalescing at both
   // seams. No-op if a == b.
   //
+  // The tiling is taken as spans so that a caller holding it in anything
+  // contiguous -- a vector, or the stack arrays splice_uniform uses -- can pass
+  // it without materialising a vector for the call.
+  //
   // Preconditions (both are the caller's responsibility; unlike the Python
   // implementation, which rebuilds through a full coalescing pass, this edits
   // in place and so only reconciles the two seams):
@@ -154,8 +160,8 @@ struct Profile {
   //   * seg_starts/seg_labels exactly tile [a, b) and are canonical too --
   //     strictly increasing starts and no two adjacent labels equal.
   // A caller that can violate the second (see relabel) must coalesce first.
-  void splice(int64_t a, int64_t b, const std::vector<int64_t>& seg_starts,
-              const std::vector<int>& seg_labels) {
+  void splice(int64_t a, int64_t b, std::span<const int64_t> seg_starts,
+              std::span<const int> seg_labels) {
     if (a == b) {
       return;
     }
@@ -233,6 +239,17 @@ struct Profile {
     if (!coalesced_end) {
       starts[i_a + n_seg] = b;
     }
+  }
+
+  // Replace the function on [a, b) with a single run carrying `label`. This is
+  // the shape every splice outside relabel has: the caller knows the whole
+  // range takes one label and would otherwise heap-allocate a two-element and
+  // a one-element vector to say so. A one-segment tiling is canonical by
+  // construction, so splice's second precondition is free here.
+  void splice_uniform(int64_t a, int64_t b, int label) {
+    const std::array<int64_t, 2> seg_starts{a, b};
+    const std::array<int, 1> seg_labels{label};
+    splice(a, b, seg_starts, seg_labels);
   }
 
   // For every segment within [a, b) whose label == from_label, replace it with
@@ -783,7 +800,7 @@ class NativePermutationLayoutSolver {
                    int lo, int hi, int64_t a, int64_t b,
                    const std::vector<int64_t>& old_lo_s,
                    const std::vector<int>& old_lo_l) {
-    primary[lo].splice(a, b, {a, b}, {hi});
+    primary[lo].splice_uniform(a, b, hi);
     primary[hi].splice(a, b, old_lo_s, old_lo_l);
     for (size_t k = 0; k < old_lo_l.size(); ++k) {
       const int label = old_lo_l[k];
@@ -982,10 +999,10 @@ class NativePermutationLayoutSolver {
       const int a = old_below.label_at(lo);
       const int b = old_above.label_at(lo);
       if (a != kNone) {
-        above_[a].splice(lo, hi, {lo, hi}, {b});
+        above_[a].splice_uniform(lo, hi, b);
       }
       if (b != kNone) {
-        below_[b].splice(lo, hi, {lo, hi}, {a});
+        below_[b].splice_uniform(lo, hi, a);
       }
     }
   }
@@ -1049,10 +1066,10 @@ class NativePermutationLayoutSolver {
       above_starts.push_back(lo);
       above_labels.push_back(above);
       if (below != kNone) {
-        above_[below].splice(lo, hi, {lo, hi}, {x});
+        above_[below].splice_uniform(lo, hi, x);
       }
       if (above != kNone) {
-        below_[above].splice(lo, hi, {lo, hi}, {x});
+        below_[above].splice_uniform(lo, hi, x);
       }
     }
     below_starts.push_back(e_x);
@@ -1278,10 +1295,17 @@ void register_profile(py::module_& m) {
           [](Profile& p, int64_t a, int64_t b,
              const std::vector<int64_t>& seg_starts,
              const std::vector<std::optional<int>>& seg_labels) {
-            p.splice(a, b, seg_starts, labels_from_python(seg_labels));
+            const std::vector<int> labels = labels_from_python(seg_labels);
+            p.splice(a, b, seg_starts, labels);
           },
           py::arg("a"), py::arg("b"), py::arg("seg_starts"),
           py::arg("seg_labels"))
+      .def(
+          "splice_uniform",
+          [](Profile& p, int64_t a, int64_t b, std::optional<int> label) {
+            p.splice_uniform(a, b, label.value_or(kNone));
+          },
+          py::arg("a"), py::arg("b"), py::arg("label"))
       .def(
           "relabel",
           [](Profile& p, int64_t a, int64_t b, std::optional<int> from_label,

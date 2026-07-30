@@ -1901,6 +1901,39 @@ class NativeProfileDifferentialTests(TestCase):
         missing = [s for s in self._SPLICE_SHAPES if s not in covered]
         self.assertEqual(missing, [], f"generator stopped covering {missing}")
 
+    # Same matrix as _SPLICE_SHAPES, less the one shape a one-segment tiling
+    # cannot have.
+    _UNIFORM_SHAPES = tuple(s for s in _SPLICE_SHAPES if s != "multi_segment_tiling")
+
+    def test_splice_uniform_matches_python_oracle(self):
+        """``splice_uniform`` is the one-segment shape of ``splice``, which is
+        what every caller outside ``relabel`` wants. It carries its tiling in
+        stack arrays rather than two heap vectors, so its equivalence to the
+        general path is pinned here rather than only inferred from the
+        solver-level differential test."""
+        rng = random.Random(20260801)
+        covered: set = set()
+        for case in range(20_000 if _STRESS else 4_000):
+            starts, labels = self._random_canonical(rng)
+            py_p = Profile(list(starts), list(labels))
+            native = NativeProfile(starts, labels)
+            a, b = self._random_range(rng, starts)
+            label = rng.choice(self.LABELS)
+            tag = (
+                f"case={case} Profile({starts}, {labels})"
+                f".splice_uniform({a}, {b}, {label})"
+            )
+            if a == b:
+                py_p.splice(a, b, [a], [])
+            else:
+                py_p.splice(a, b, [a, b], [label])
+            py_p.validate()
+            native.splice_uniform(a, b, label)
+            self._assert_same(py_p, native, tag)
+            covered |= self._shapes(starts, labels, a, b, [label])
+        missing = [s for s in self._UNIFORM_SHAPES if s not in covered]
+        self.assertEqual(missing, [], f"generator stopped covering {missing}")
+
     def test_relabel_matches_python_oracle(self):
         """``relabel`` is the only caller that can map two adjacent segments
         onto the same label, so it owns coalescing the tiling before handing it
