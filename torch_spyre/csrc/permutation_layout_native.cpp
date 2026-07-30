@@ -751,6 +751,9 @@ class NativePermutationLayoutSolver {
         }
       }
     }
+    // TODO: This formula was translated from the python version of this code, so it
+    // should probably be re-derived - but a very brief profiling session suggests that
+    // it is not far off. So let's re-derive it once things are stable.
     rotate_remove_insert_threshold_ = std::max(2, n_ / 8);
     build_profiles();
   }
