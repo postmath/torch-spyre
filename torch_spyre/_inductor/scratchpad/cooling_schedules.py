@@ -121,64 +121,65 @@ class ExponentialCoolingSchedule(CoolingSchedule):
         return self._t
 
 
+# Sentinel move type for the single-band (layout-only) case.
+_SINGLE_MOVE = "default"
+
+
 class SelfCalibratingReheatingSchedule(CoolingSchedule):
     """Self-calibrating simulated-annealing schedule with reheating cycles.
 
-    This is the default schedule. It needs no tuning beyond the step budget: it
-    sizes its temperatures to the instance online from the move scale the
-    annealer streams back, locates the productive temperature, and spends the
-    budget on reheating cycles around it -- concentrating moves where they are
-    useful but not frozen, rather than cooling monotonically once.
+    The default schedule for both the layout-only annealer and the joint
+    work-division + LX co-optimizer. It needs no tuning beyond the step budget:
+    it sizes its temperatures to the instance online from the move scale streamed
+    back, locates the productive temperature, and spends the budget on reheating
+    cycles around it -- concentrating moves where they are useful but not frozen.
 
-    NOTE: like its predecessor this is a *reasonable* self-calibrating default,
-    not a tuned or provably-good one -- we do not yet have representative example
-    models to benchmark against. Two bets are unvalidated for our landscape:
-    that reheating beats a single long cool, and that learning the move scale
-    online beats a pre-committed warm-up. Both are bounded by the solver's
-    best-seen tracking, so they can waste budget but never worsen the result.
-    Expect to revisit ``cycles`` and the acceptance band once we can benchmark.
+    Single band or per move type. A single acceptance band ``(accept_hi,
+    accept_lo)`` is the default (the layout annealer's one move type). Passing
+    ``bands={move_type: (hi, lo)}`` instead gives **one shared reheating carrier
+    with an independent band + move-scale EMA per move type** (the co-optimizer's
+    reorder / flip / region-recolor, with recolor coldest) -- so a move type's
+    large deltas do not freeze the small ones, and a rare move calibrates on its
+    own sample count. ``temperature(move_type)`` / ``update(.., move_type)`` and
+    ``cycle_phase()`` expose the per-move surface; the single-move responsive API
+    (``reset`` / ``update(accepted, scale)`` returning the next temperature, or
+    ``None`` to stop) is unchanged and uses the default move type.
 
-    Temperature scale (self-calibration). With ``A = -ln(accept_hi)`` and
-    ``B = -ln(accept_lo)``, a band centered on temperature ``center`` accepts a
-    mean-magnitude *worsening* move with probability ``accept_hi`` at its top
-    ``center * delta`` and ``accept_lo`` at its bottom ``center / delta``, where::
+    NOTE: a *reasonable* self-calibrating default, not a tuned/provably-good one
+    -- no representative models to benchmark against yet. Reheating-beats-a-single-
+    cool and online-scale-learning are unvalidated bets; both are bounded by the
+    solver's best-seen tracking, so they can waste budget but never worsen the
+    result. Expect to revisit ``cycles`` and the bands once we can benchmark.
 
-        delta  = sqrt(B / A)              # band half-width, scale-independent
-        center = d_hat / sqrt(A * B)      # productive temperature
-
-    ``d_hat`` is an exponential moving average of the streamed move scale (mean
-    ``|Δquality|`` over probed reinsertions), so ``center`` tracks the move scale
-    as the layout improves and the landscape flattens.
+    Temperature scale (per move type ``m``). With ``A = -ln(hi_m)``,
+    ``B = -ln(lo_m)``, a band centered on ``center_m`` accepts a mean-magnitude
+    *worsening* move at ``hi_m`` at its top ``center_m * delta_m`` and ``lo_m`` at
+    its bottom ``center_m / delta_m``, where ``delta_m = sqrt(B/A)`` and
+    ``center_m = d_hat_m / sqrt(A*B)``. ``d_hat_m`` is an EMA of that move type's
+    streamed scale, so its band tracks its move scale as the landscape flattens.
 
     Bootstrap. Before any move scale is known, ``center`` is seeded from the
-    peak-load estimate (:func:`default_initial_temperature`), placed at the band
-    top. That estimate is in bytes rather than quality units, so it is only a
-    rough magnitude -- but it governs a single step before the first real
-    samples snap ``center`` onto the data scale, and best-seen tracking absorbs
-    that step regardless.
+    peak-load estimate (:func:`default_initial_temperature`, placed at the band
+    top) via :meth:`set_buffers`, or from an explicit ``seed_center`` passed in
+    the ctor (the co-optimizer, whose scorer is not in byte units). Only the few
+    pre-snap steps use it, and best-seen tracking absorbs them.
 
     Reheating. The budget is split into ``cycles`` equal cycles (the last
-    absorbing any remainder). Each cools geometrically from ``center * delta``
-    down to ``center / delta``. ``center`` is recomputed from ``d_hat`` *every
-    step*, so the band drifts downward (or re-expands) with the landscape
-    continuously rather than jumping only at cycle boundaries -- which matters
-    most when cycles are long (and for ``cycles = 1``, a single tracked cool,
-    the only case where the boundary-only variant never re-centered at all).
-    The EMA horizon is ``cycle_len / horizons_per_cycle``: with the default
-    ``horizons_per_cycle = 2`` the center lags the move scale by about half a
-    cycle, so a stale band never persists for a large fraction of a cycle.
+    absorbing any remainder) on a single shared carrier; each cools geometrically
+    from band top to band bottom, ``center_m`` recomputed from ``d_hat_m`` every
+    step so bands drift with the landscape continuously. The EMA horizon is
+    ``cycle_len / horizons_per_cycle``.
 
-    Budget knobs:
-        total_steps: the annealing budget (temperatures emitted). ``None`` ->
-            adaptive, ``clamp(steps_per_buffer * n, min_steps, max_steps)``.
-        cycles: number of reheating cycles.
-        horizons_per_cycle: EMA horizons per cycle (``H`` in the design notes);
-            the move-scale EMA horizon is ``cycle_len / horizons_per_cycle``, so
-            larger values track the landscape faster (at the cost of more noise
-            and a stronger pull toward greedy cooling). Guessed default pending
-            benchmarks, like ``cycles``.
-        max_steps: hard cap on the adaptive budget (default 5000, keeping the
-            n=100 random-buffer example bounded).
+    Budget/band knobs:
+        total_steps: annealing budget (temperatures emitted). ``None`` ->
+            adaptive, ``clamp(steps_per_buffer * n, min_steps, max_steps)``, sized
+            in :meth:`set_buffers`.
+        cycles / horizons_per_cycle / max_steps: as before (guessed defaults).
+        accept_hi / accept_lo: the single default band (ignored if ``bands`` set).
+        bands: ``{move_type: (accept_hi, accept_lo)}`` for the multi-move case.
+        seed_center: explicit pre-snap center (co-optimizer). With ``total_steps``
+            also given, the schedule is fully sized in the ctor and needs no
+            :meth:`set_buffers` call.
     """
 
     def __init__(
@@ -192,9 +193,13 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         max_steps: int = 5000,
         accept_hi: float = 0.8,
         accept_lo: float = 0.01,
+        bands: Optional[dict[str, tuple[float, float]]] = None,
+        seed_center: Optional[float] = None,
     ):
-        if not 0.0 < accept_lo < accept_hi < 1.0:
-            raise ValueError("need 0 < accept_lo < accept_hi < 1")
+        self._bands = bands or {_SINGLE_MOVE: (accept_hi, accept_lo)}
+        for name, (hi, lo) in self._bands.items():
+            if not 0.0 < lo < hi < 1.0:
+                raise ValueError(f"{name}: need 0 < accept_lo < accept_hi < 1")
         if cycles < 1:
             raise ValueError("cycles must be >= 1")
         if horizons_per_cycle <= 0.0:
@@ -205,20 +210,36 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         self.steps_per_buffer = steps_per_buffer
         self.min_steps = min_steps
         self.max_steps = max_steps
-        self.accept_hi = accept_hi
-        self.accept_lo = accept_lo
-        # The reheat band is fixed by the two acceptance targets alone: a factor
-        # `delta` above/below the center, with `sqrt(A*B)` converting the move
-        # scale into the center temperature. Both are scale-independent.
-        a = -math.log(accept_hi)
-        b = -math.log(accept_lo)
-        self._rt_ab = math.sqrt(a * b)
-        self._delta = math.sqrt(b / a)
-        # Sized in set_buffers (needs the buffer count and the peak load); _cycle_len
-        # == 0 marks "not yet sized" so reset() can refuse to run uncalibrated.
-        self.total_steps = total_steps or 0
+        # Per-move band geometry (scale-independent): `delta` a factor above/below
+        # the center, `rt_ab` = sqrt(A*B) converting a move scale into the center.
+        self._delta: dict[str, float] = {}
+        self._rt_ab: dict[str, float] = {}
+        for name, (hi, lo) in self._bands.items():
+            a = -math.log(hi)
+            b = -math.log(lo)
+            self._delta[name] = math.sqrt(b / a)
+            self._rt_ab[name] = math.sqrt(a * b)
+        self._explicit_seed = seed_center
+        # ``_cycle_len == 0`` marks "not yet sized" so reset() refuses to run
+        # uncalibrated. Sized here iff both the budget and an explicit seed are
+        # given (co-optimizer path, no buffers); otherwise in set_buffers.
+        self.total_steps = 0
         self._cycle_len = 0
-        self._seed_center = 1.0
+        self._seed_center: dict[str, float] = {}
+        if total_steps is not None and seed_center is not None:
+            self.total_steps = max(1, total_steps)
+            self._size()
+            self._seed_center = {n: seed_center for n in self._bands}
+
+    def _size(self) -> None:
+        self._cycle_len = max(1, self.total_steps // self.cycles)
+        # Cool by delta^2 across one cycle (band top to bottom), per move type.
+        self._alpha = {n: d ** (-2.0 / self._cycle_len) for n, d in self._delta.items()}
+        # EMA horizon of cycle_len / horizons_per_cycle steps; clamped to a valid
+        # rate for short cycles (degrades to "center = latest scale").
+        self._ema_beta = min(1.0, self.horizons_per_cycle / self._cycle_len)
+        # Average this many nonzero samples before a band snaps off its seed.
+        self._snap_after = min(self._cycle_len // 4, 20) or 1
 
     @override
     def set_buffers(self, buffers: list[LifetimeBoundBuffer]) -> None:
@@ -229,70 +250,85 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
             )
         else:
             self.total_steps = max(1, self._total_steps)
-        self._cycle_len = max(1, self.total_steps // self.cycles)
-        # Cool by a factor delta^2 across one cycle (band top to band bottom).
-        self._alpha = self._delta ** (-2.0 / self._cycle_len)
-        # Move-scale EMA horizon of cycle_len / horizons_per_cycle steps, so the
-        # center (recomputed every step) lags the landscape by that fraction of a
-        # cycle. Clamped to a valid EMA rate for short cycles (where the ratio can
-        # reach or exceed 1); there it degrades to "center = latest scale".
-        self._ema_beta = min(1.0, self.horizons_per_cycle / self._cycle_len)
-        # Average this many nonzero samples before snapping center off the seed
-        # (a cheap, low-variance bootstrap; at least one).
-        self._snap_after = min(self._cycle_len // 4, 20) or 1
-        # Seed center so the peak-load estimate lands at the band top.
-        self._seed_center = default_initial_temperature(buffers) / self._delta
+        self._size()
+        # Seed each band so the peak-load estimate lands at its top.
+        peak = default_initial_temperature(buffers)
+        self._seed_center = {n: peak / self._delta[n] for n in self._bands}
 
     @override
     def reset(self) -> Optional[float]:
         if self._cycle_len == 0:
             raise ValueError(
-                "SelfCalibratingReheatingSchedule must be given buffers before "
-                "use; run it through SimulatedAnnealingSolverWithBuffers, or call "
-                "set_buffers() first."
+                "SelfCalibratingReheatingSchedule must be sized before use: give "
+                "total_steps + seed_center, run it through "
+                "SimulatedAnnealingSolverWithBuffers, or call set_buffers() first."
             )
         self._i = 0
         self._s = 0
         self._cycle = 0
-        self._center = self._seed_center
-        self._d_hat: Optional[float] = None
-        self._sample_sum = 0.0
-        self._n_samples = 0
-        return self._temperature()
+        self._center = dict(self._seed_center)
+        self._d_hat: dict[str, Optional[float]] = dict.fromkeys(self._bands, None)
+        self._sample_sum = dict.fromkeys(self._bands, 0.0)
+        self._n_samples = dict.fromkeys(self._bands, 0)
+        # A single-move schedule has one unambiguous starting temperature (the
+        # layout annealer uses it); a multi-move schedule does not -- its caller
+        # queries temperature(move_type) per type, so there is nothing to return.
+        if len(self._bands) == 1:
+            return self.temperature(next(iter(self._bands)))
+        return None
 
-    def _temperature(self) -> float:
-        # Position s within the cycle: s == 0 is the band top (center*delta),
-        # cooling by alpha each step toward the band bottom (center/delta).
-        return self._center * self._delta * self._alpha**self._s
+    @property
+    def finished(self) -> bool:
+        """True once the budget is spent (the co-optimizer's stop condition; the
+        responsive :meth:`update` also signals it by returning ``None``)."""
+        return self._i >= self.total_steps
+
+    def cycle_phase(self) -> float:
+        """Scale-invariant carrier phase ``s / cycle_len`` in ``[0, 1)`` -- 0 at a
+        cycle's hot top, approaching 1 at its cold bottom -- shared across move
+        types (drives the co-optimizer's cycle-phase proposal mix)."""
+        return self._s / self._cycle_len
+
+    def temperature(self, move_type: str = _SINGLE_MOVE) -> float:
+        """Temperature for ``move_type`` at the current carrier position ``s``:
+        ``center_m * delta_m * alpha_m ** s`` (band top at ``s == 0``)."""
+        return (
+            self._center[move_type]
+            * self._delta[move_type]
+            * (self._alpha[move_type] ** self._s)
+        )
 
     @override
-    def update(self, accepted: bool, move_scale: float) -> Optional[float]:
-        # Track the move scale, ignoring no-op reinsertions (move_scale == 0):
-        # they dominate the sample and would collapse the center into a greedy
-        # search. Before the first snap, average a few samples; after it, EMA.
+    def update(
+        self, accepted: bool, move_scale: float, move_type: str = _SINGLE_MOVE
+    ) -> Optional[float]:
+        # Track the move scale, ignoring no-op moves (move_scale == 0): they
+        # dominate the sample and would collapse the band into a greedy search.
+        # Before the first snap, average a few samples; after it, EMA. Then
+        # re-center this move type's band from its current scale.
         if move_scale > 0.0:
-            if self._d_hat is None:
-                self._sample_sum += move_scale
-                self._n_samples += 1
-                if self._n_samples >= self._snap_after:
-                    self._d_hat = self._sample_sum / self._n_samples
+            dh = self._d_hat[move_type]
+            if dh is None:
+                self._sample_sum[move_type] += move_scale
+                self._n_samples[move_type] += 1
+                if self._n_samples[move_type] >= self._snap_after:
+                    self._d_hat[move_type] = (
+                        self._sample_sum[move_type] / self._n_samples[move_type]
+                    )
             else:
-                self._d_hat += self._ema_beta * (move_scale - self._d_hat)
-        # Re-center from the current move scale every step, so the band tracks
-        # the landscape continuously within a cycle rather than only at its
-        # boundaries. Until the first snap ``d_hat`` is None and center stays at
-        # the peak-load seed.
-        if self._d_hat is not None:
-            self._center = self._d_hat / self._rt_ab
+                self._d_hat[move_type] = dh + self._ema_beta * (move_scale - dh)
+            snapped = self._d_hat[move_type]
+            if snapped is not None:
+                self._center[move_type] = snapped / self._rt_ab[move_type]
 
         self._i += 1
         if self._i >= self.total_steps:
             return None
         self._s += 1
-        # Cycle boundary: restart the cool at the band top. The last cycle
-        # absorbs the budget remainder. (Center already tracks every step, so the
+        # Cycle boundary: restart the shared carrier at the band top. The last
+        # cycle absorbs the budget remainder. (Centers track every step, so the
         # boundary only restarts the carrier phase.)
         if self._s >= self._cycle_len and self._cycle < self.cycles - 1:
             self._cycle += 1
             self._s = 0
-        return self._temperature()
+        return self.temperature(move_type)

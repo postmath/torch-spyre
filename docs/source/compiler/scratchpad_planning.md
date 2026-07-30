@@ -638,6 +638,19 @@ The remaining `@expectedFailure` cases motivate the items in
 The extensions below build on the current co-optimization flow through the
 `MemoryPlanSolver` and `ScratchpadOptimizationPass` interfaces, so they can
 be added without disturbing the rest of the planner.
+ 
+### Non-greedy solvers
+ 
+Two non-greedy solver families are being prototyped on top of the same
+`MemoryPlanSolver` interface:
+ 
+- **Simulated Annealing** (Imanishi-Xu) uses a first-fit or best-fit
+- **Simulated Annealing** uses a first-fit or best-fit
+  allocation as the initial guess, then perturbs the order to escape
+  local minima.
+- **Integer Linear Programming** via OR-Tools formulates placement as a
+  2D bin-packing constraint and lets a general-purpose solver search
+  exhaustively for graphs small enough to be tractable.
 
 ### Richer co-optimization
 

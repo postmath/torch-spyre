@@ -1,0 +1,25 @@
+==============================================================================
+WARM-START TRANSFER EXPERIMENT (resize-only == conservative)
+n=40  capacity=4334126 (60% of baseline peak)  budget L=1200  ref_budget=7200  eps=2%
+==============================================================================
+
+[Part A] Steps-to-parity: warm start (from pi0) vs cold start.
+  mag  b=0 warm/Q*   b*_warm   b*_cold  b*_warm/L  warm<cold  reach<=L
+ 0.10        0.889        60       251      0.050 4/6        6/6
+ 0.25        0.972       113       144      0.094 3/6        4/6
+ 0.50        0.951       970       354      0.808 1/6        4/6
+
+  Read: 'b=0 warm/Q*' near 1.0 => the ordering alone (no refinement)
+  nearly recovers the optimum. b*_warm << b*_cold and << L => the warm
+  start carries reusable information; use ~b*_warm as the burst size.
+  b*_warm ~ L => ordering does not transfer; nested baseline is no worse.
+
+[Part B] Do warm-seed scores rank divisions like their own optima?
+  perturbations=24  burst=120 steps (3n)
+  Spearman(warm-seed b=0, Q*)      = +0.380   sign-agreement = 65.3%
+  Spearman(flip+burst, Q*)         = +0.943   sign-agreement = 92.0%
+
+  Read: high sign-agreement (say >~85%) => Metropolis on the warm state
+  ranks divisions almost like their own optima, so good flips are NOT
+  systematically rejected -- the #1 collapse-to-baseline risk is low, and
+  the compound flip+burst row shows how much a small burst buys back.

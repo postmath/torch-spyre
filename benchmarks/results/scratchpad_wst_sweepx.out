@@ -1,0 +1,35 @@
+==============================================================================
+MULTI-INSTANCE BURST-SIZE SWEEP (noise characterization)
+n=40  ref_budget=7200  instances=5 (seeds 100..104)  per_magnitude=32  warm_seed=13
+==============================================================================
+  instance 0 (seed 100): ALL sign-agree b=0=53%  1n=82%  2n=84%  3n=89%  5n=93%  8n=94%
+  instance 1 (seed 101): ALL sign-agree b=0=56%  1n=76%  2n=78%  3n=88%  5n=92%  8n=95%
+  instance 2 (seed 102): ALL sign-agree b=0=82%  1n=94%  2n=95%  3n=95%  5n=96%  8n=97%
+  instance 3 (seed 103): ALL sign-agree b=0=68%  1n=86%  2n=87%  3n=88%  5n=90%  8n=90%
+  instance 4 (seed 104): ALL sign-agree b=0=55%  1n=88%  2n=92%  3n=93%  5n=94%  8n=97%
+
+MEAN sign-agreement across 5 instances:
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10        59%        85%        88%        90%        92%        93%
+  0.25        63%        87%        88%        91%        91%        94%
+  0.50        74%        90%        90%        91%        95%        95%
+   ALL        63%        85%        87%        91%        93%        95%
+
+SPREAD across instances (min-max sign-agreement):
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10    45%-82%    78%-91%    80%-95%    81%-98%    85%-99%   85%-100%
+  0.25    48%-84%    81%-96%    82%-95%    84%-97%    88%-96%    90%-96%
+  0.50    57%-89%    84%-95%    82%-95%    84%-95%    94%-96%    92%-97%
+   ALL    53%-82%    76%-94%    78%-95%    88%-95%    90%-96%    90%-97%
+
+MEAN Spearman(refined, Q*) across 5 instances:
+   mag        b=0         1n         2n         3n         5n         8n
+  0.10      +0.16      +0.77      +0.85      +0.88      +0.90      +0.92
+  0.25      +0.27      +0.85      +0.87      +0.91      +0.93      +0.96
+  0.50      +0.52      +0.89      +0.90      +0.92      +0.97      +0.97
+   ALL      +0.29      +0.80      +0.84      +0.91      +0.95      +0.96
+
+  Read: a tight SPREAD (esp. of the ALL row) at a given burst means the
+  fidelity estimate is stable there. If b=0 swings widely but the burst
+  columns are tight and high, the raw stale layout is the noisy regime and
+  a small burst both raises AND stabilizes decision fidelity.

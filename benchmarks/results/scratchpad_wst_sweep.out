@@ -1,0 +1,23 @@
+==============================================================================
+BURST-SIZE SWEEP (Part B decision fidelity vs burst steps)
+n=40  capacity=4334126 (60% of baseline peak)  ref_budget=7200  per_magnitude=12
+==============================================================================
+
+Sign-agreement (fraction of division comparisons pointing the right way):
+   mag     b=0      1n      2n      3n      5n      8n
+  0.10     89%     89%     98%     98%     97%     97%
+  0.25     89%     97%     97%     97%     97%    100%
+  0.50     89%    100%     97%    100%    100%    100%
+   ALL     91%     96%     98%     99%     99%    100%
+
+Spearman(refined score, Q*):
+   mag     b=0      1n      2n      3n      5n      8n
+  0.10   +0.90   +0.91   +0.99   +0.99   +0.99   +0.99
+  0.25   +0.91   +0.99   +0.99   +0.99   +0.99   +1.00
+  0.50   +0.92   +1.00   +0.98   +1.00   +1.00   +1.00
+   ALL   +0.94   +0.99   +0.99   +1.00   +1.00   +1.00
+
+  Read: find the smallest burst whose row crosses ~85% -- that is the
+  burst to fold into the compound flip+burst move. If large-magnitude
+  rows need a bigger burst than small ones, region-recolor should carry a
+  larger burst (or freeze earlier) than atomic flips.
