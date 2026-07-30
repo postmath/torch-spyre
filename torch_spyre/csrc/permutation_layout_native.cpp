@@ -619,36 +619,42 @@ class NativePermutationLayoutSolver {
   // --- saturation early-stop interval data (static) ------------------------
 
   void build_interval_data() {
+    if(n_ == 0) {
+      return;
+    }
+
     std::set<int64_t> pts;
     for (int i = 0; i < n_; ++i) {
       pts.insert(start_[i]);
       pts.insert(end_[i]);
     }
     interval_starts_.assign(pts.begin(), pts.end());
+
+    // interval_index[j] will be assigned for j = start_[i] and j = end_[i] but not
+    // for other values.
+    std::vector<int> interval_index;
+    interval_index.reserve(interval_starts_.back());
+    for (int i = 0; i < interval_starts_.size(); ++i) {
+      interval_index[interval_starts_[i]] = i;
+    }
+
     const int k = std::max(0, static_cast<int>(interval_starts_.size()) - 1);
     num_intervals_ = k;
-    total_at_.assign(k, 0);
+    total_at_.reserve(k);
     std::vector<int> deltas(k + 1, 0);
     for (int i = 0; i < n_; ++i) {
-      deltas[interval_index(start_[i])] += 1;
-      deltas[interval_index(end_[i])] -= 1;
+      deltas[interval_index[start_[i]]] += 1;
+      deltas[interval_index[end_[i]]] -= 1;
     }
     int running = 0;
     for (int t = 0; t < k; ++t) {
       running += deltas[t];
       total_at_[t] = running;
     }
-    buf_intervals_.assign(n_, {0, 0});
+    buf_intervals_.reserve(n_);
     for (int i = 0; i < n_; ++i) {
-      buf_intervals_[i] = {interval_index(start_[i]), interval_index(end_[i])};
+      buf_intervals_[i] = {interval_index[start_[i]], interval_index[end_[i]]};
     }
-  }
-
-  // bisect_left(interval_starts_, value); value is always an endpoint.
-  int interval_index(int64_t value) const {
-    return static_cast<int>(std::lower_bound(interval_starts_.begin(),
-                                             interval_starts_.end(), value) -
-                            interval_starts_.begin());
   }
 
   // Place every buffer in permutation order with the saturation early-stop.
