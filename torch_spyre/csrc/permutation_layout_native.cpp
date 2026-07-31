@@ -35,7 +35,6 @@
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <optional>
 #include <queue>
 #include <set>
@@ -561,54 +560,116 @@ class NativePermutationLayoutSolver {
     return sizes_[child] <= sizes_[parent];
   }
 
-  // Decide idx's address given the (already-placed, overlapping) candidates.
-  // Returns (address, partner): address == nullopt means evicted; partner is
-  // the candidate whose address was reused in-place, or kNone.
-  std::pair<std::optional<int64_t>, int> placement_decision(
-      int idx, const std::vector<int>& candidates) const {
-    if (candidates.empty()) {
+  // Decide idx's address from the buffers it rests on, read off its
+  // below-profile. Returns (address, partner): address == nullopt means
+  // evicted; partner is the neighbour whose address was reused in-place, or
+  // kNone.
+  //
+  // This is the single eviction authority, mirroring the Python reference:
+  // nullopt is returned whenever idx would not fit entirely below capacity_,
+  // and eviction is upward-closed (resting on an evicted buffer evicts idx).
+  std::pair<std::optional<int64_t>, int> placement_decision(int idx) const {
+    const Profile& below = below_[idx];
+    const std::size_t n_below = below.labels.size();
+    if (n_below == 0) {
+      // This would mean buffer idx has lifetime 0, which is unlikely. But by
+      // guarding against this here, we can assume there is >=1 below-neighbour
+      // for the rest of this method.
       if (sizes_[idx] > capacity_) {
         return {std::nullopt, kNone};
       }
       return {std::optional<int64_t>(0), kNone};
     }
-    // A None (evicted) candidate dominates: idx would rest on it.
-    for (const int p : candidates) {
-      if (!addresses_[p].has_value()) {
+
+    // Eviction is upward-closed: an evicted below-neighbour has no finite top,
+    // and idx would rest on it, so idx is evicted too. A kNone label is the
+    // floor, not an evicted neighbour. Settling this over the whole profile
+    // first is what lets everything below dereference addresses_ unguarded.
+    for (const int buffer : below.labels) {
+      if (buffer != kNone && !addresses_[buffer].has_value()) {
         return {std::nullopt, kNone};
       }
     }
-    int64_t max_top = std::numeric_limits<int64_t>::min();
-    for (const int p : candidates) {
-      max_top = std::max(max_top, *addresses_[p] + sizes_[p]);
-    }
-    // Try to drop into an in-place partner's slot (at most one can qualify).
-    if (!inplace_partners_[idx].empty()) {
-      for (const int partner : inplace_partners_[idx]) {
-        if (std::find(candidates.begin(), candidates.end(), partner) ==
-            candidates.end()) {
-          continue;  // partner not among the candidates
-        }
-        const std::pair<int, int> pr = in_place_pair(idx, partner);
-        if (!can_inplace(pr.first, pr.second)) {
-          continue;
-        }
-        const int64_t partner_addr = *addresses_[partner];
-        int64_t others_top = 0;
-        for (const int q : candidates) {
-          if (q == partner) {
-            continue;
-          }
-          others_top = std::max(others_top, *addresses_[q] + sizes_[q]);
-        }
-        if (others_top <= partner_addr) {
-          if (partner_addr + sizes_[idx] > capacity_) {
-            return {std::nullopt, kNone};
-          }
-          return {std::optional<int64_t>(partner_addr), partner};
-        }
+
+    // See if we could potentially in-place with a parent. This is determined
+    // by in_place_parent_candidate == kNone; if that's not the case, then
+    // in_place_parent_address is the parent's address. Same for in-placing with
+    // a child.
+    int in_place_parent_candidate = below.labels[0];
+    int64_t in_place_parent_address = 0;
+    if (in_place_parent_candidate != kNone) {
+      if (eligible_[in_place_parent_candidate] &&
+          end_[in_place_parent_candidate] == start_[idx] + 1 &&
+          inplace_partners_[idx].contains(in_place_parent_candidate)) {
+        in_place_parent_address = *addresses_[in_place_parent_candidate];
+      } else {
+        in_place_parent_candidate = kNone;
       }
     }
+
+    int in_place_child_candidate = below.labels[n_below - 1];
+    int64_t in_place_child_address = 0;
+    if (in_place_child_candidate != kNone) {
+      if (eligible_[in_place_child_candidate] &&
+          start_[in_place_child_candidate] + 1 == end_[idx] &&
+          inplace_partners_[idx].contains(in_place_child_candidate)) {
+        in_place_child_address = *addresses_[in_place_child_candidate];
+      } else {
+        in_place_child_candidate = kNone;
+      }
+    }
+
+    // Highest top among the below-neighbours: over all of them (the height idx
+    // stacks at), and over all but the parent / all but the child (what each
+    // in-place drop has to clear). A label can recur non-adjacently in the
+    // profile, so exclude a candidate by identity rather than by position.
+    int64_t max_top = 0;
+    int64_t top_without_parent = 0;
+    int64_t top_without_child = 0;
+    for (const int buffer : below.labels) {
+      if (buffer == kNone) {
+        continue;  // floor: contributes no top
+      }
+      const int64_t top = *addresses_[buffer] + sizes_[buffer];
+      max_top = std::max(max_top, top);
+      if (buffer != in_place_parent_candidate) {
+        top_without_parent = std::max(top_without_parent, top);
+      }
+      if (buffer != in_place_child_candidate) {
+        top_without_child = std::max(top_without_child, top);
+      }
+    }
+
+    // Drop into an in-place partner's slot, but only when every other
+    // neighbour already tops out at or below the partner's address -- else idx
+    // would land partway into occupied space. At most one of the two can
+    // qualify - only because the reference implementation does it that way:
+    // if there are both a parent and child candidate at the same base address,
+    // then it would be perfectly legal for all three to be at the same address,
+    // but the reference implementation can only find this if they occur in the
+    // permutation in order or in reverse order, which means we have to reject
+    // that case here, too (or change the reference implementation). Since this
+    // is a rare case (except maybe for base address 0), and we can get the
+    // better result anyway by finding a different order for the buffers, we
+    // don't make this change now.
+    if (in_place_parent_candidate != kNone &&
+        top_without_parent <= in_place_parent_address) {
+      if (in_place_parent_address + sizes_[idx] > capacity_) {
+        return {std::nullopt, kNone};
+      }
+      return {std::optional<int64_t>(in_place_parent_address),
+              in_place_parent_candidate};
+    }
+
+    if (in_place_child_candidate != kNone &&
+        top_without_child <= in_place_child_address) {
+      if (in_place_child_address + sizes_[idx] > capacity_) {
+        return {std::nullopt, kNone};
+      }
+      return {std::optional<int64_t>(in_place_child_address),
+              in_place_child_candidate};
+    }
+
     const int64_t aligned = align_up(max_top);
     if (aligned + sizes_[idx] > capacity_) {
       return {std::nullopt, kNone};
@@ -619,7 +680,7 @@ class NativePermutationLayoutSolver {
   // --- saturation early-stop interval data (static) ------------------------
 
   void build_interval_data() {
-    if(n_ == 0) {
+    if (n_ == 0) {
       return;
     }
 
@@ -659,8 +720,7 @@ class NativePermutationLayoutSolver {
 
   // Place every buffer in permutation order with the saturation early-stop.
   // get_candidates(pos, idx) returns the already-placed candidate list.
-  template <typename F>
-  void sequential_place(F&& get_candidates) {
+  void sequential_place() {
     std::fill(reuse_.begin(), reuse_.end(), kNone);
     total_quality_ = 0.0;
     total_allocated_count_ = 0;
@@ -669,7 +729,6 @@ class NativePermutationLayoutSolver {
     std::vector<int> placed_at(k, 0);
     std::vector<char> has_none_at(k, 0);
     std::vector<char> done_at(k, 0);
-    std::vector<int> cands;
     int not_done = 0;
     for (int t = 0; t < k; ++t) {
       done_at[t] = (total_at_[t] == 0) ? 1 : 0;
@@ -697,9 +756,7 @@ class NativePermutationLayoutSolver {
         }
         continue;
       }
-      get_candidates(pos, idx, cands);
-      const auto [addr, partner] =
-          placement_decision(idx, cands);
+      const auto [addr, partner] = placement_decision(idx);
       addresses_[idx] = addr;
       reuse_[idx] = partner;
       const bool evicted = !addr.has_value();
@@ -728,20 +785,13 @@ class NativePermutationLayoutSolver {
 
   void build() {
     reuse_.assign(n_, kNone);
-    // Candidates: earlier, time-overlapping, eligible buffers (a prior-scan).
-    sequential_place([this](int pos, int idx, std::vector<int> &cands) {
-      cands.clear();
-      for (int p = 0; p < pos; ++p) {
-        const int q = permutation_[p];
-        if (overlaps(idx, q) && eligible_[q]) {
-          cands.push_back(q);
-        }
-      }
-    });
     position_.assign(n_, 0);
     for (int p = 0; p < n_; ++p) {
       position_[permutation_[p]] = p;
     }
+    build_profiles();
+    // Candidates: earlier, time-overlapping, eligible buffers (a prior-scan).
+    sequential_place();
     // Static time-overlap sets.
     overlap_.assign(n_, {});
     for (int a = 0; a < n_; ++a) {
@@ -752,11 +802,11 @@ class NativePermutationLayoutSolver {
         }
       }
     }
-    // TODO: This formula was translated from the python version of this code, so it
-    // should probably be re-derived - but a very brief profiling session suggests that
-    // it is not far off. So let's re-derive it once things are stable.
+    // TODO(postmath): This formula was translated from the python version of
+    // this code, so it should probably be re-derived - but a very brief
+    // profiling session suggests that it is not far off. So let's re-derive it
+    // once things are stable.
     rotate_remove_insert_threshold_ = std::max(2, n_ / 8);
-    build_profiles();
   }
 
   void build_profiles() {
@@ -837,26 +887,7 @@ class NativePermutationLayoutSolver {
   // Re-place z's address from the buffers it actually rests on, read off the
   // (already-spliced) below-profile.
   void recompute_address(int z) {
-    std::vector<int> cand;
-    const Profile& prof = below_[z];
-    for (size_t i = 0; i < prof.labels.size(); ++i) {
-      const int m = prof.labels[i];
-      if (m == kNone) {
-        continue;  // floor (no neighbour), not an evicted neighbour
-      }
-      if (std::find(cand.begin(), cand.end(), m) == cand.end()) {
-        cand.push_back(m);
-      }
-      const int reused = reuse_[m];
-      if (reused != kNone) {
-        if (start_[reused] <= prof.starts[i] && prof.starts[i] < end_[reused]) {
-          if (std::find(cand.begin(), cand.end(), reused) == cand.end()) {
-            cand.push_back(reused);
-          }
-        }
-      }
-    }
-    const auto [addr, partner] = placement_decision(z, cand);
+    const auto [addr, partner] = placement_decision(z);
     addresses_[z] = addr;
     reuse_[z] = partner;  // kNone when not reused / evicted
   }
@@ -990,14 +1021,7 @@ class NativePermutationLayoutSolver {
   }
 
   void recompute_all_addresses() {
-    sequential_place([this](int p, int idx, std::vector<int> &cands) {
-      cands.clear();
-      for (const int w : overlap_[idx]) {
-        if (position_[w] < p && eligible_[w]) {
-          cands.push_back(w);
-        }
-      }
-    });
+    sequential_place();
   }
 
   void patch_profiles_for_move(int x, const Profile& old_below,
