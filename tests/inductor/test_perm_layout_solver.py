@@ -1623,6 +1623,37 @@ class NativeDifferentialTests(TestCase):
                 )
                 self._assert_observably_equal(py_plan, native, tag)
 
+    def test_write_only_in_place_parent_rejected(self):
+        # The native constructor enforces the same in-place-parent read invariant
+        # as the Python solvers, so the two cannot drift. It reports it as a
+        # ValueError, matching its own permutation/eligible validation, where the
+        # Python side asserts -- the same split those two checks already have.
+        parent = LifetimeBoundBuffer("a", 64, [0])
+        child = LifetimeBoundBuffer("b", 64, [0, 2], in_place_parents=["a"])
+        with self.assertRaises(ValueError):
+            NativePermutationLayoutSolver([parent, child], [0, 1], 256, 64)
+        # The Python solver rejects the identical input.
+        with self.assertRaises(AssertionError):
+            PermutationBasedLayoutSolver([parent, child], [0, 1], 256, 64)
+
+    def test_single_use_input_in_place_parent_allowed(self):
+        # A graph input's lone use is a read, so the handoff is legitimate.
+        parent = LifetimeBoundBuffer("a", 64, [0], first_use_is_read=True)
+        child = LifetimeBoundBuffer("b", 64, [0, 2], in_place_parents=["a"])
+        native = NativePermutationLayoutSolver([parent, child], [0, 1], 256, 64)
+        py_plan = PermutationBasedLayoutSolver([parent, child], [0, 1], 256, 64)
+        self.assertEqual(list(native.addresses), py_plan.addresses)
+
+    def test_in_place_chain_allowed(self):
+        # Chains are the case the invariant was chosen to preserve: "b" is both a
+        # child of "a" and the parent of "c", and every parent here has a read.
+        a = LifetimeBoundBuffer("a", 64, [0, 2])
+        b = LifetimeBoundBuffer("b", 64, [2, 4], in_place_parents=["a"])
+        c = LifetimeBoundBuffer("c", 64, [4, 6], in_place_parents=["b"])
+        native = NativePermutationLayoutSolver([a, b, c], [0, 1, 2], 256, 64)
+        py_plan = PermutationBasedLayoutSolver([a, b, c], [0, 1, 2], 256, 64)
+        self.assertEqual(list(native.addresses), py_plan.addresses)
+
     def test_copy_is_independent(self):
         rng = random.Random(12345)
         n = 7

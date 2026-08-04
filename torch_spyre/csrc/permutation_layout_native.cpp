@@ -347,6 +347,12 @@ class NativePermutationLayoutSolver {
     qualities_.resize(n_);
     std::vector<std::vector<std::string>> parent_names(n_);
     std::vector<std::string> names(n_);
+    // Whether a buffer's storage is read before it could be handed over to an
+    // in-place child. A computed buffer's first use is its write, so a lone use
+    // means it is never read; a graph input's uses are all reads, so one is
+    // enough. Collected here because the in-place wiring below runs in a second
+    // pass, and buffer attributes are read from Python exactly once.
+    std::vector<char> readable_before_handoff(n_);
     for (int i = 0; i < n_; ++i) {
       py::object buf = buffers[i];
       names[i] = buf.attr("name").cast<std::string>();
@@ -356,6 +362,14 @@ class NativePermutationLayoutSolver {
       start_[i] = uses.front();
       end_[i] = uses.back() + 1;
       const bool first_use_is_read = buf.attr("first_use_is_read").cast<bool>();
+      // "A use strictly after the first", matching
+      // plan_solver.assert_in_place_parent_is_read: equivalent to a use count
+      // above one while `uses` is strictly increasing, but it cannot be fooled
+      // by a repeated index.
+      const bool has_read_after_write =
+          uses.size() > 1 && uses.back() > uses.front();
+      readable_before_handoff[i] =
+          (first_use_is_read || has_read_after_write) ? 1 : 0;
       // quality = (len(uses) + (0.0 if first_use_is_read else 0.5)) * size.
       weight_[i] =
           static_cast<double>(uses.size()) + (first_use_is_read ? 0.0 : 0.5);
@@ -392,6 +406,19 @@ class NativePermutationLayoutSolver {
           continue;
         }
         const int parent = it->second;
+        // A write-only computed parent has nothing to hand over, so the pair is
+        // not expressible rather than merely unprofitable. Mirrors
+        // plan_solver.assert_in_place_parent_is_read, which the Python solvers
+        // apply while resolving the same declared pairs. Reported as a
+        // value_error to match the permutation/eligible checks above (the
+        // Python side raises AssertionError, as it already does for those two).
+        if (!readable_before_handoff[parent]) {
+          throw py::value_error("in-place parent " + names[parent] +
+                                " is a computed buffer with a single use, so "
+                                "it is never read and "
+                                "cannot hand its storage to child " +
+                                names[child]);
+        }
         parent_set_[child].insert(parent);
         inplace_partners_[child].insert(parent);
         inplace_partners_[parent].insert(child);
