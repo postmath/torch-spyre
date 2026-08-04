@@ -82,6 +82,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    ceil_div,
 )
 from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.permutation_layout import (
@@ -330,6 +331,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Per-core footprint of buffer ``idx`` under menu index ``div_idx``:
         ``ceil(total_size / output_partition)`` (Plan §2.2).
 
+        Uses the substrate's shared :func:`ceil_div` rather than ``math.ceil`` on
+        a float quotient, so this rounds identically to every other
+        footprint-division site (the CP-SAT engine and ``CoreDivisionBuffer``'s
+        own per-core sizes) with no float intermediate to disagree about.
+
         Clamped to be non-negative: an unsized buffer carries the ``mem_usage``
         ``-1`` sentinel (a non-placeable "op not allowed" input in the captures),
         so its footprint is never actually used -- clamp it so a nonsense size can
@@ -337,7 +343,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         Mirrors the ``max(0, ...)`` clamp at the other packer-feeding sites in
         ``allocator.py``."""
         part = self._bufs[idx].core_divisions[div_idx].output_partition
-        return max(0, math.ceil(self._bufs[idx].size / part))
+        return max(0, ceil_div(self._bufs[idx].size, part))
 
     def _eligible(self, idx: int) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``
@@ -565,11 +571,39 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- annealing loop ------------------------------------------------------
 
-    def _snapshot(self):
+    def _snapshot(self) -> tuple[Packer, list[int]]:
+        """An independent copy of the joint state ``(pi, W)``: the packer's
+        dynamic layout (``copy`` shares only plan-lifetime structures) plus the
+        division vector."""
         return (self.packer.copy(), list(self.chosen))
 
-    def _restore(self, snap) -> None:
+    def _adopt(self, snap: tuple[Packer, list[int]]) -> None:
+        """Install ``snap`` as the live state by *taking ownership* of it -- no
+        copy, so the engine goes on mutating those very objects and the caller
+        must treat ``snap`` as dead from here on.
+
+        This is the rejection path's restore, where ``snap`` was taken at the top
+        of the iteration and dies with it, so the transfer is free and safe.
+        Zero-copy deliberately: a step already pays one O(n) packer copy for its
+        snapshot, and copying again on every rejection would double the hot
+        loop's copy traffic for nothing. A snapshot that must *survive* the
+        subsequent mutation (``_best_snap``) needs :meth:`_restore_copy`.
+        """
         self.packer, self.chosen = snap[0], snap[1]
+
+    def _restore_copy(self, snap: tuple[Packer, list[int]]) -> None:
+        """Install a *copy* of ``snap`` as the live state, leaving ``snap``
+        itself untouched and reusable.
+
+        The variant every *retained* snapshot needs, i.e. ``_best_snap``: the
+        nested polish restores it and then keeps mutating the live packer in
+        place, and adopting it there would make those ``rotate`` / ``resize``
+        calls rewrite the recorded best layout. A polish that fails to improve
+        does not refresh ``_best_snap``, so the engine would end up publishing
+        ``_best_score`` (the better number) alongside a state it no longer
+        describes.
+        """
+        self.packer, self.chosen = snap[0].copy(), list(snap[1])
 
     def _calibrate_temperature(self) -> float:
         """A crude scale estimate: the *median* absolute score delta over a sample
@@ -585,7 +619,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             d = abs(self._score() - base)
             if d > 0:
                 deltas.append(d)
-            self._restore(snap)
+            self._adopt(snap)  # snap dies here; a fresh one is taken next probe
         return float(statistics.median(deltas)) if deltas else 1.0
 
     # -- move selection & execution -----------------------------------------
@@ -714,7 +748,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 if name == "recolor":
                     self.recolor_improved += 1
         else:
-            self._restore(snap)
+            self._adopt(snap)  # this step's snapshot is dead either way
         self._record_recolor(name, accepted)
         return cur, accepted, scale
 
@@ -752,7 +786,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 self._anneal_reheating(steps, cur)
 
         self.best_score = self._best_score
-        self._restore(self._best_snap)
+        # Copy, not adopt: ``_best_snap`` stays the record of the published
+        # ``best_score``, so the live state _write_back walks must not alias it.
+        self._restore_copy(self._best_snap)
 
     def _anneal_crude(self, steps: int, cur: int) -> None:
         """Phase-3/4 baseline: one geometric cool + fixed proposal weights. Kept as
@@ -852,14 +888,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Warm-started inner layout anneal: ``steps`` single-buffer reinsertions
         (``rotate`` -- an arbitrary-position move, far faster-mixing than adjacent
         swaps) on the current packer. Greedy-cold (keep only non-worsening) or
-        annealed (Metropolis on the quality delta at ``qtemp``, tracking + restoring
-        the best-quality layout). Returns the number of steps taken."""
+        annealed (Metropolis on the quality delta at ``qtemp``, tracking +
+        restoring the best-quality layout). Either way the layout left behind is
+        never worse than the one handed in. Returns the number of steps taken."""
         n = len(self._bufs)
         steps = int(steps)
         if n < 2 or steps < 1:
             return 0
         best_q = self.packer.quality()
-        best_packer: Optional[Packer] = None
+        # The entry layout is itself a candidate for "best", so the loop can
+        # never hand back something worse than it was given. Only the annealed
+        # variant needs this: an all-accepted run of worsening Metropolis steps
+        # otherwise leaves ``best_packer`` unset and returns the degraded
+        # random-walk endpoint. Greedy-cold never worsens, so it pays no copy.
+        best_packer: Optional[Packer] = (
+            self.packer.copy() if self._inner_annealed else None
+        )
         for _ in range(steps):
             i = self._rng.randrange(n)
             j = self._rng.randrange(n)
@@ -876,7 +920,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             elif dq < 0:
                 self.packer.rotate(j, i)  # greedy revert
         if best_packer is not None:
-            self.packer = best_packer
+            self.packer = best_packer  # a local copy; nothing else holds it
         return steps
 
     def _anneal_nested(self, budget: int, cur: int) -> None:
@@ -933,13 +977,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                     if name == "recolor":
                         self.recolor_improved += 1
             else:
-                self._restore(snap)
+                self._adopt(snap)  # outer snapshot is per-iteration, dead here
             self._record_recolor(name, accepted)
             spent += 1 + used
 
         # Final polish: a long pure-layout anneal on the best structure found.
         if polish > 0:
-            self._restore(self._best_snap)
+            # Copy: the polish mutates the live packer in place and only
+            # refreshes ``_best_snap`` if it improves, so aliasing the retained
+            # snapshot here would corrupt the best-seen layout on a failed polish.
+            self._restore_copy(self._best_snap)
             self._inner_layout_loop(polish, qtemp)
             polished = self._score()
             if polished < self._best_score:

@@ -32,6 +32,7 @@ import copy
 import json
 import math
 import os
+import random as rnd
 import subprocess
 import sys
 import unittest
@@ -213,13 +214,15 @@ def _div(partition):
     )
 
 
-def _cdbuf(name, parents, matches):
+def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
     """A minimal buffer with a 3-entry menu (index 0 trivial, 1 split-2, 2
-    split-4) and the given parent-compatibility pairs."""
+    split-4) and the given parent-compatibility pairs. ``size`` / ``uses`` are
+    overridable for the fixtures that need layout pressure (the flood tests do
+    not care)."""
     return CoreDivisionBuffer(
         name=name,
-        size=1024,
-        uses=[0, 1],
+        size=size,
+        uses=list(uses),
         first_use_is_read=False,
         in_place_parents=[],
         residency_reason=None,
@@ -359,6 +362,131 @@ class RegionRecolorTest(TestCase):
             self.assertEqual(len(accepted), solver.moves_accepted["recolor"], tag)
             self.assertTrue(all(p > 1 for p in proposed), tag)
             self.assertLessEqual(Counter(accepted), Counter(proposed), tag)
+
+
+def _chain(n=8):
+    """A ``B0 -> ... -> B{n-1}`` chain, every edge compatible index-for-index, with
+    varied sizes and staggered lifetimes -- so layout moves genuinely shift
+    addresses and packer quality (equal-sized buffers sharing one lifetime are
+    permutation-insensitive, which would make the assertions below vacuous)."""
+    bufs = []
+    for i in range(n):
+        parents = [f"B{i - 1}"] if i else []
+        matches = {f"B{i - 1}": [(0, 0), (1, 1), (2, 2)]} if i else {}
+        bufs.append(
+            _cdbuf(f"B{i}", parents, matches, size=1024 * (1 + i % 4), uses=[i, i + 3])
+        )
+    return bufs
+
+
+def _chain_caps(buffers):
+    """Roomy plus two spill-forcing capacities for a hand-built fixture."""
+    tot = sum(b.size for b in buffers)
+    return [tot, max(1, tot // 2), max(1, tot // 3)]
+
+
+def _seeded(buffers, capacity, **kwargs):
+    """A solver primed to the seed state (index-0 divisions, FirstFit ``pi``) on
+    hand-built buffers: the prefix of ``plan_layout_and_core_divisions`` up to the
+    anneal, so a unit test can drive the move / snapshot machinery directly."""
+    solver = SaCoOptimizingSolver(capacity, 128, seed=0, **kwargs)
+    solver._bufs = buffers
+    solver._rng = rnd.Random(0)
+    solver._precompute_topology()
+    solver.chosen = [0] * len(buffers)
+    solver.packer = solver._build_seed_packer()
+    solver._flippable_ops = solver._flippable()
+    return solver
+
+
+def _live_state(solver):
+    """The observable joint state: layout addresses, packer quality, divisions."""
+    return (
+        list(solver.packer.addresses),
+        solver.packer.quality(),
+        list(solver.chosen),
+    )
+
+
+def _snap_state(snap):
+    """The same observables read off a snapshot tuple instead of the live state."""
+    return (list(snap[0].addresses), snap[0].quality(), list(snap[1]))
+
+
+class SnapshotRestoreTest(TestCase):
+    """The two restore contracts. ``_adopt`` transfers ownership -- the hot
+    rejection path, where the snapshot was taken this iteration and dies with it,
+    so a second O(n) packer copy would be pure overhead. ``_restore_copy`` leaves
+    the snapshot intact, which is what a *retained* snapshot (``_best_snap``)
+    requires: the engine keeps mutating the live packer in place afterwards, and
+    only refreshes ``_best_snap`` on an improvement, so aliasing would leave the
+    recorded best layout describing a state ``_best_score`` never scored."""
+
+    def _mutate(self, solver):
+        """A division change (resize + eligibility ripple) plus a reinsertion --
+        between them they move addresses, quality and ``chosen``."""
+        solver._atomic_flip(2, 2)
+        solver.packer.rotate(0, 5)
+
+    def test_adopt_round_trips_state(self):
+        for cap in _chain_caps(_chain()):
+            solver = _seeded(_chain(), cap)
+            before = _live_state(solver)
+            snap = solver._snapshot()
+            self._mutate(solver)
+            self.assertNotEqual(_live_state(solver), before, f"cap={cap}")
+            solver._adopt(snap)  # snap is dead after this, by contract
+            self.assertEqual(_live_state(solver), before, f"cap={cap}")
+
+    def test_restore_copy_round_trips_state(self):
+        for cap in _chain_caps(_chain()):
+            solver = _seeded(_chain(), cap)
+            before = _live_state(solver)
+            snap = solver._snapshot()
+            self._mutate(solver)
+            self.assertNotEqual(_live_state(solver), before, f"cap={cap}")
+            solver._restore_copy(snap)
+            self.assertEqual(_live_state(solver), before, f"cap={cap}")
+
+    def test_retained_snapshot_isolated_from_live_packer(self):
+        # The one that pins the aliasing defect: restoring from a snapshot the
+        # engine keeps must not hand the live state those same objects.
+        for cap in _chain_caps(_chain()):
+            solver = _seeded(_chain(), cap)
+            retained = solver._snapshot()
+            recorded = _snap_state(retained)
+            solver._restore_copy(retained)
+            self._mutate(solver)
+            tag = f"cap={cap}"
+            # Non-vacuous: the mutation really did change the live state.
+            self.assertNotEqual(_live_state(solver), recorded, tag)
+            self.assertEqual(_snap_state(retained), recorded, tag)
+
+
+class InnerLayoutLoopTest(TestCase):
+    """``_inner_layout_loop`` must leave a layout no worse than the one it was
+    handed -- the promise its docstring makes and the nested mode relies on."""
+
+    def test_annealed_inner_loop_never_worsens(self):
+        # ``inner_annealed`` accepts worsening reinsertions by Metropolis; at a
+        # huge quality temperature *every* one is accepted, so the walk is a pure
+        # downhill drift and only counting the entry layout as a best-seen
+        # candidate keeps the result from regressing.
+        for cap in _chain_caps(_chain()):
+            solver = _seeded(_chain(), cap, nested=True, inner_annealed=True)
+            entry_q = solver.packer.quality()
+            steps = solver._inner_layout_loop(40, 1e12)
+            self.assertEqual(steps, 40, f"cap={cap}")
+            self.assertGreaterEqual(solver.packer.quality(), entry_q, f"cap={cap}")
+
+    def test_greedy_inner_loop_never_worsens(self):
+        # The default (greedy-cold) path reverts every worsening step in place,
+        # so it needs no entry snapshot -- assert the same guarantee holds.
+        for cap in _chain_caps(_chain()):
+            solver = _seeded(_chain(), cap, nested=True)
+            entry_q = solver.packer.quality()
+            solver._inner_layout_loop(40, 1.0)
+            self.assertGreaterEqual(solver.packer.quality(), entry_q, f"cap={cap}")
 
 
 class ScheduleTest(TestCase):
