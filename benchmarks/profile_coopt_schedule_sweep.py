@@ -47,7 +47,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from tests.inductor.fake_cooptimization_substrate import load_captures  # noqa: E402
+from tests.inductor.cooptimization_capture_loader import load_captures  # noqa: E402
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
     SaCoOptimizingSolver,
 )
@@ -81,7 +81,7 @@ def _load_graphs():
 
 def _solve(bufs, cap, spb, seed, sched):
     s = SaCoOptimizingSolver(cap, 128, seed=seed, steps_per_buffer=spb, schedule=sched)
-    s.plan_layout_and_core_divs(copy.deepcopy(bufs))
+    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
     return s.best_score, s.baseline_score
 
 

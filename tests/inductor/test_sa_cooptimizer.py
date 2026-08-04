@@ -39,10 +39,11 @@ from unittest import TestCase
 
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
-from tests.inductor.fake_cooptimization_substrate import (
-    FakeCoreDivision,
-    FakeCoreDivisionBuffer,
-    load_captures,
+from tests.inductor.cooptimization_capture_loader import load_captures
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    BufferType,
+    CoreDivision,
+    CoreDivisionBuffer,
 )
 from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
 
@@ -119,7 +120,7 @@ class OutputContractTest(TestCase):
             for cap in _capacities(buffers):
                 bufs = copy.deepcopy(buffers)
                 solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                out = solver.plan_layout_and_core_divs(bufs)
+                out = solver.plan_layout_and_core_divisions(bufs)
                 tag = f"{case}[{gi}] cap={cap}"
                 self.assertEqual(len(out), len(bufs), tag)
                 for b in out:
@@ -134,7 +135,7 @@ class OutputContractTest(TestCase):
 
     def test_empty_graph(self):
         solver = SaCoOptimizingSolver(1024, 128, seed=0)
-        self.assertEqual(solver.plan_layout_and_core_divs([]), [])
+        self.assertEqual(solver.plan_layout_and_core_divisions([]), [])
 
 
 class BaselineGuaranteeTest(TestCase):
@@ -145,7 +146,7 @@ class BaselineGuaranteeTest(TestCase):
             for cap in _capacities(buffers):
                 bufs = copy.deepcopy(buffers)
                 solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                solver.plan_layout_and_core_divs(bufs)
+                solver.plan_layout_and_core_divisions(bufs)
                 tag = f"{case}[{gi}] cap={cap}"
                 self.assertLessEqual(solver.best_score, solver.baseline_score, tag)
 
@@ -156,7 +157,7 @@ class DeterminismTest(TestCase):
     def _run(self, buffers, cap, seed):
         bufs = copy.deepcopy(buffers)
         solver = SaCoOptimizingSolver(cap, 128, seed=seed)
-        out = solver.plan_layout_and_core_divs(bufs)
+        out = solver.plan_layout_and_core_divisions(bufs)
         return (
             [b.chosen_division for b in out],
             [b.address for b in out],
@@ -179,7 +180,7 @@ class DeterminismTest(TestCase):
             for seed in (1, 7):
                 bufs = copy.deepcopy(buffers)
                 solver = SaCoOptimizingSolver(cap, 128, seed=seed)
-                solver.plan_layout_and_core_divs(bufs)
+                solver.plan_layout_and_core_divisions(bufs)
                 self.assertLessEqual(
                     solver.best_score, solver.baseline_score, f"{case} seed={seed}"
                 )
@@ -198,7 +199,7 @@ class ImprovementSmokeTest(TestCase):
             for cap in (max(1, tot // 2), max(1, tot // 4)):
                 bufs = copy.deepcopy(buffers)
                 solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                solver.plan_layout_and_core_divs(bufs)
+                solver.plan_layout_and_core_divisions(bufs)
                 if solver.best_score < solver.baseline_score:
                     improved = True
         self.assertTrue(improved, "SA never improved on the seed on any graph")
@@ -206,7 +207,7 @@ class ImprovementSmokeTest(TestCase):
 
 def _div(partition):
     """A core division with the given output partition (1 == trivial/whole)."""
-    return FakeCoreDivision(
+    return CoreDivision(
         output_splits=({1: partition} if partition > 1 else {}),
         reduction_splits={},
     )
@@ -215,19 +216,17 @@ def _div(partition):
 def _cdbuf(name, parents, matches):
     """A minimal buffer with a 3-entry menu (index 0 trivial, 1 split-2, 2
     split-4) and the given parent-compatibility pairs."""
-    return FakeCoreDivisionBuffer(
+    return CoreDivisionBuffer(
         name=name,
         size=1024,
         uses=[0, 1],
         first_use_is_read=False,
         in_place_parents=[],
-        placement=True,
         residency_reason=None,
-        boundary_cost=0,
-        spill_write_cost=1024,
-        parents=parents,
         core_divisions=[_div(1), _div(2), _div(4)],
+        parents=parents,
         cd_parent_matches=matches,
+        boundary=BufferType.Intermediate,
     )
 
 
@@ -302,7 +301,7 @@ class RegionRecolorTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
             solver = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
-            solver.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            solver.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             if solver._anchor_candidates:  # graph has at least one splittable op
                 self.assertGreater(solver.moves_proposed["recolor"], 0, case)
                 self.assertTrue(solver.recolor_region_sizes, case)
@@ -319,7 +318,7 @@ class RegionRecolorTest(TestCase):
             tot = _seed_footprint(buffers)
             for cap in (max(1, tot // 2), max(1, tot // 4)):
                 solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                solver.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                solver.plan_layout_and_core_divisions(copy.deepcopy(buffers))
                 total_improved += solver.recolor_improved
         self.assertGreater(total_improved, 0, "recolor never improved on any graph")
 
@@ -329,7 +328,7 @@ class RegionRecolorTest(TestCase):
 
             def run():
                 s = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
-                s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
                 return (
                     s.moves_proposed,
                     s.moves_accepted,
@@ -352,7 +351,7 @@ class RegionRecolorTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
             solver = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
-            solver.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            solver.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             proposed = solver.recolor_anchor_partitions
             accepted = solver.recolor_accepted_partitions
             tag = f"{case}[{gi}]"
@@ -382,9 +381,9 @@ class ScheduleTest(TestCase):
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
             r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
-            r.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            r.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             c = SaCoOptimizingSolver(cap, 128, seed=0, schedule="crude")
-            c.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             total_reheat += r.best_score
             total_crude += c.best_score
             strictly_better = strictly_better or r.best_score < c.best_score
@@ -397,7 +396,7 @@ class ScheduleTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
             s = SaCoOptimizingSolver(cap, 128, seed=0)
-            s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             for m in ("reorder", "flip", "recolor"):
                 self.assertGreater(s.moves_proposed[m], 0, f"{case} {m}")
                 self.assertLessEqual(
@@ -410,7 +409,7 @@ class ScheduleTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
             s = SaCoOptimizingSolver(cap, 128, seed=0)
-            s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             cv = s.move_scale_cv()
             self.assertEqual(set(cv), {"reorder", "flip", "recolor", "none"})
             for m, v in cv.items():
@@ -423,7 +422,7 @@ class ScheduleTest(TestCase):
 
             def run():
                 s = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
-                out = s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                out = s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
                 return (
                     [b.chosen_division for b in out],
                     [b.address for b in out],
@@ -439,7 +438,7 @@ class ScheduleTest(TestCase):
             for sched in ("reheating", "crude"):
                 cap = max(1, _seed_footprint(buffers) // 2)
                 s = SaCoOptimizingSolver(cap, 128, seed=0, schedule=sched)
-                s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
                 self.assertLessEqual(s.best_score, s.baseline_score, f"{case} {sched}")
 
     def test_rejects_bad_schedule(self):
@@ -451,7 +450,7 @@ class ScheduleTest(TestCase):
 # by CASE) and print its result; used by the cross-process determinism test below.
 _SOLVE_SNIPPET = """
 import copy, json, math
-from tests.inductor.fake_cooptimization_substrate import load_captures
+from tests.inductor.cooptimization_capture_loader import load_captures
 from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 case = {case!r}
@@ -460,7 +459,7 @@ g = src[case][0]
 cap = max(1, sum(math.ceil(b.size / b.core_divisions[0].output_partition)
                  for b in g.buffers) // 2)
 s = SaCoOptimizingSolver(cap, 128, seed=0)
-out = s.plan_layout_and_core_divs(copy.deepcopy(g.buffers))
+out = s.plan_layout_and_core_divisions(copy.deepcopy(g.buffers))
 print("RESULT " + json.dumps({{
     "chosen": [b.chosen_division for b in out],
     "addr": [b.address for b in out],
@@ -522,7 +521,7 @@ class LargeCaptureExperimentTest(TestCase):
 
             def run():
                 s = SaCoOptimizingSolver(cap, 128, seed=0)
-                out = s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+                out = s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
                 return (
                     [b.chosen_division for b in out],
                     [b.address for b in out],
@@ -532,7 +531,7 @@ class LargeCaptureExperimentTest(TestCase):
             a, b = run(), run()
             self.assertEqual(a, b, f"{case}[{gi}] nondeterministic")
             s = SaCoOptimizingSolver(cap, 128, seed=0)
-            s.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             self.assertLessEqual(s.best_score, s.baseline_score, f"{case}[{gi}]")
 
     def test_report_reheating_vs_crude_by_size(self):
@@ -543,9 +542,9 @@ class LargeCaptureExperimentTest(TestCase):
         for case, gi, buffers in list(_all_cases()) + list(_large_cases()):
             cap = max(1, _seed_footprint(buffers) // 2)
             r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
-            r.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            r.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             c = SaCoOptimizingSolver(cap, 128, seed=0, schedule="crude")
-            c.plan_layout_and_core_divs(copy.deepcopy(buffers))
+            c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             d = r.best_score - c.best_score
             tag = "better" if d < 0 else ("worse" if d > 0 else "tie")
             print(

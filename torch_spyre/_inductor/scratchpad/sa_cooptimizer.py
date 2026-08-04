@@ -46,13 +46,15 @@ FirstFit) makes every returned state no worse than the baseline regardless of ho
 crude the moves/schedule are (§8.1).
 
 Objective. The shared scorer (:mod:`cooptimization_scorer`) is authoritative.
-On the (op-metadata-free) fake substrate this reduces to the substrate's own
-HBM-traffic model -- per buffer, ``boundary_cost`` when resident else
-``num_children * size + spill_write_cost`` when it misses LX -- with a zero node
-term and unit cohort multiplicity (Plan §7.1). Residency, per-core sizing, and
-the ``cd_parent_matches`` compatibility gate follow the substrate exactly (mirrors
-``DfsLayoutSolver._evaluate``). The richer per-edge multiplicity and the matmul
-node term are wired in when real ops are available (Phase 6); the scorer already
+Today it reduces to the substrate's own HBM-traffic model: the *differential*
+``spill_cost`` (``read_count`` re-reads plus the producer write, the latter only
+for an ``Intermediate`` buffer) summed over the buffers that miss LX, with a zero
+node term and unit cohort multiplicity (Plan §7.1). Because the cost is
+differential, a resident buffer contributes nothing -- the same shape as the
+CP-SAT engine's objective, so the two are comparable on one yardstick. Residency,
+per-core sizing, and the ``cd_parent_matches`` compatibility gate follow the
+substrate exactly. The richer per-edge multiplicity and the matmul node term are
+wired in when real op metadata is available (Phase 6); the scorer already
 supports them.
 
 Determinism (Plan §7.5): a seeded ``Random`` over index-ordered domains and the
@@ -71,15 +73,16 @@ from typing import Optional, Union
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
 )
-from torch_spyre._inductor.scratchpad.cooptimization_substrate import (
-    CoOptimizingSolver,
-    CoreDivisionBufferProtocol,
-)
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import SolverToPermutation
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    BufferType,
+    CoreDivisionBuffer,
+    CoreDivisionLayoutSolver,
+    LifetimeBoundBuffer,
+)
 from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
@@ -108,7 +111,7 @@ _DEFAULT_MOVE_BANDS = {
 }
 
 
-class SaCoOptimizingSolver(CoOptimizingSolver):
+class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine (see module docstring).
 
     Args:
@@ -198,11 +201,28 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
 
     # -- public interface ----------------------------------------------------
 
-    def plan_layout_and_core_divs(
+    def plan_layout(
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+    ) -> list[LifetimeBoundBuffer]:
+        """Not supported: this engine is joint-only.
+
+        :class:`MemoryPlanSolver` declares this abstract, but the placement-only
+        path deliberately belongs to the standalone layout-only annealer, which
+        Plan §7.3 keeps as its own :class:`MemoryPlanSolver` ("we do not replace
+        it"). ``CoOptimizingAllocator`` -- the only allocator this engine is
+        injected into -- calls :meth:`plan_layout_and_core_divisions` exclusively,
+        so this stays a loud stub rather than a second annealing path to maintain.
+        """
+        raise NotImplementedError(
+            "SaCoOptimizingSolver is a joint core-division + placement engine; "
+            "use plan_layout_and_core_divisions, or "
+            "SimulatedAnnealingLayoutSolver for placement-only annealing."
+        )
+
+    def plan_layout_and_core_divisions(
         self,
-        buffers: Sequence[CoreDivisionBufferProtocol],
-        log_lx_usage: bool = False,
-    ) -> list[CoreDivisionBufferProtocol]:
+        buffers: Sequence[CoreDivisionBuffer],
+    ) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
         same buffers (the one-shot interface satisfied by an internal solve)."""
@@ -253,8 +273,12 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         """Precompute the division-invariant graph structure used every step:
         the name->index map, each buffer's parent indices, and -- keyed by parent
         index -- its children with the ``(parent_div, child_div)`` pairs that keep
-        that edge tiling-compatible (mirrors ``DfsLayoutSolver``'s ``children_of``).
-        ``num_children`` is the consumer count the spill cost is scaled by.
+        that edge tiling-compatible.
+
+        The consumer *count* is no longer derived here: the landed spill cost
+        scales by the buffer's own ``read_count`` instead. The two agree on every
+        captured graph (see ``test_read_count_matches_consumer_count``), and
+        ``_children`` remains available for the Phase-6 cohort multiplicity.
         """
         bufs = self._bufs
         self._name_to_idx = {b.name: i for i, b in enumerate(bufs)}
@@ -280,7 +304,6 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
                     (int(a), int(b)) for a, b in c.cd_parent_matches.get(p_name, [])
                 )
                 self._children[p_idx].append((c_idx, pairs))
-        self._num_children = [len(self._children[i]) for i in range(n)]
 
         # Region-recolor support (Plan §7.2). ``_edge_pairs[(p, c)]`` is the
         # compatible ``(p_div, c_div)`` set on the edge p->c; ``_children_idx``
@@ -329,7 +352,11 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         the substrate never lets a child read from LX, so it never appears as a
         parent index -- such a buffer is always gated out here."""
         b = self._bufs[idx]
-        if not b.residency_allowed:
+        # The fixed pin, read straight off the substrate field. Deliberately not
+        # ``MemoryPlanSolver.excluded()``: that folds in a ``min_footprint >
+        # limit`` capacity test, which is division-*dependent* and is the second
+        # gate below -- routing through it would conflate the two gates.
+        if b.residency_reason is not None:
             return False
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
@@ -367,12 +394,17 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
         sizes = [self._per_core_size(i, 0) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
 
-        # pi from a FirstFit pass over the eligible buffers (ineligible ones are
-        # marked unplaceable so they sort last, matching their HBM residency).
+        # pi from a FirstFit pass over the per-core sizes.
+        #
+        # NOTE: ineligible buffers are *not* excluded from this pass. The former
+        # ``ff_bufs[i].placement = False`` here wrote to a field no substrate
+        # class has, so it never excluded anything; the seed has always been a
+        # FirstFit over every buffer. Forwarding ``residency_reason`` into
+        # ``_lifetime_buffers`` would make ``FirstFitLayoutSolver.excluded()``
+        # drop them for real -- but that shifts the seed, and hence
+        # ``baseline_score`` and every committed benchmark number, so it is left
+        # as a separate deliberate change rather than folded into this rebind.
         ff_bufs = self._lifetime_buffers(sizes)
-        for i in range(n):
-            if not eligible[i]:
-                ff_bufs[i].placement = False
         pi = SolverToPermutation(
             FirstFitLayoutSolver(self.limit, self.alignment)
         ).permutation(ff_bufs)
@@ -387,22 +419,54 @@ class SaCoOptimizingSolver(CoOptimizingSolver):
 
     # -- scoring (shared scorer; lower is better) ----------------------------
 
+    @staticmethod
+    def _spill_cost(buffer: CoreDivisionBuffer) -> int:
+        """Differential HBM traffic a spill adds over residency, in bytes.
+
+        Duplicates :meth:`_LifetimeBufferWithCpVars.spill_cost` in
+        ``ilp_solver_ortools.py`` so the two engines score the same quantity. It
+        is duplicated rather than shared because the landed formula lives on a
+        CP-SAT-private wrapper; lifting it into ``plan_solver.py`` and having both
+        call it is a deliberate follow-up, not a prerequisite.
+
+        ``read_count`` reads (the ones residency would have served from LX) plus
+        the producer's own write, which residency turns into a free LX write. A
+        graph input has no producer write to save and a graph output's write-out
+        is unavoidable either way, so both cancel -- exactly ``boundary !=
+        Intermediate``.
+
+        ``size`` is clamped non-negative for the same reason as in
+        :meth:`_per_core_size`: an unsized buffer carries the ``mem_usage`` ``-1``
+        sentinel, and pricing it as negative traffic would let a mostly-resident
+        state reach a *negative* total, which ``to_fixed_us`` rejects outright.
+        Such buffers are pinned out of LX, so their traffic is the same in every
+        state -- a constant the search cannot act on, and zero is the honest
+        constant when the real size is unknown.
+        """
+        is_intermediate = buffer.boundary == BufferType.Intermediate
+        return (buffer.read_count + (1 if is_intermediate else 0)) * max(0, buffer.size)
+
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
         time units. A buffer with a packer address is LX-resident (its address is
-        ``None`` iff ineligible or spilled), so traffic is ``boundary_cost`` when
-        resident else ``num_children * size + spill_write_cost`` -- the substrate
-        HBM-traffic model (Plan §7.1). The node term is zero on the fake (no op
-        metadata); the scorer's fixed-point conversion keeps this deterministic.
+        ``None`` iff ineligible or spilled).
+
+        The landed substrate objective is *differential* -- ``spill_cost`` is the
+        traffic a spill adds **over** residency -- so a resident buffer
+        contributes exactly zero and only the spilled ones are summed. This is
+        the same shape as the CP-SAT engine's ``spill_cost() * (1 - in_buffer)``,
+        which is what makes the two directly comparable on one yardstick
+        (Plan §7.1).
+
+        The node term is zero until real op metadata is available (Phase 6); the
+        scorer's fixed-point conversion keeps this deterministic.
         """
         traffic = 0
         for i, b in enumerate(self._bufs):
-            if self.packer.addresses[i] is not None:
-                traffic += b.boundary_cost
-            else:
-                traffic += self._spill_cost(b, self._num_children[i])
+            if self.packer.addresses[i] is None:
+                traffic += self._spill_cost(b)
         memory_fixed = scorer.to_fixed_us(traffic / scorer.hbm_bytes_per_us())
-        node_fixed = 0  # no op-kind metadata in the fake substrate (Phase 6)
+        node_fixed = 0  # no op-kind metadata yet (Phase 6)
         return memory_fixed + node_fixed
 
     # -- moves ---------------------------------------------------------------

@@ -52,7 +52,7 @@ import multiprocessing as mp  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 
-from tests.inductor.fake_cooptimization_substrate import load_captures  # noqa: E402
+from tests.inductor.cooptimization_capture_loader import load_captures  # noqa: E402
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
     SaCoOptimizingSolver,
 )
@@ -121,7 +121,7 @@ def _work(task):
         kw = dict(polish_frac=float(kind), **NEST_BASE)
     t0 = time.time()
     s = SaCoOptimizingSolver(cap, 128, seed=seed, steps_per_buffer=spb, **kw)
-    s.plan_layout_and_core_divs(copy.deepcopy(bufs))
+    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
     return task, s.best_score, s.baseline_score, time.time() - t0
 
 

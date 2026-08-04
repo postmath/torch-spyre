@@ -18,13 +18,13 @@ The captured corpus (``cooptimization_captures.json``) is small -- four building
 blocks, ``n`` <= 25, only ``sdpa`` with real pins or multi-op region structure
 (Plan Section 8.4 flags this as the tracked Phase-4 corpus gap). Real captures
 need the (unlanded) substrate and carry a ``solved`` reference validated by
-``test_cooptimization_substrate.py``; these synthetic fixtures deliberately do
+``test_cooptimization_types.py``; these synthetic fixtures deliberately do
 *not* -- they have no ground-truth engine output, so they exercise only the
 **shape-invariant** SA guarantees (output contract, >= baseline, determinism,
 region flood, recolor-finds-regions), never the empirical schedule-quality
 assertions calibrated on the real corpus.
 
-Each graph is a plain list of ``FakeCoreDivisionBuffer`` built to isolate one
+Each graph is a plain list of ``CoreDivisionBuffer`` built to isolate one
 structure the captures under-cover:
 
 * ``chain_long`` / ``chain_short`` -- one uniform region of very different
@@ -39,39 +39,40 @@ structure the captures under-cover:
   consumers via the PSUM ring, plus a reduction-split *producer* that is gated
   out of LX because no child edge carries its partial-write index (Plan
   Section 7.4 second gate).
-* ``pinned_heavy`` -- resident buffers interleaved with several ``placement`` =
-  False pins spanning distinct ``residency_reason`` values, so ``pi`` is built
-  over ``placement`` = True only while pins still gate neighbors and contribute
-  always-HBM traffic (Plan Section 7.4).
+* ``pinned_heavy`` -- resident buffers interleaved with several pinned buffers
+  spanning distinct ``residency_reason`` values, so the fixed pin gate is
+  exercised while pins still gate neighbors and contribute always-HBM traffic
+  (Plan Section 7.4).
 * ``big_chain`` -- a ~50-buffer multi-region graph for compile-time-budget /
   burst-scaling exercise (Plan Appendix H / #9.4) and a heavier determinism load.
 """
 
 from __future__ import annotations
 
-from tests.inductor.fake_cooptimization_substrate import (
-    FakeCoreDivision,
-    FakeCoreDivisionBuffer,
-    FakeGraph,
+from tests.inductor.cooptimization_capture_loader import CapturedGraph
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    BufferType,
+    CoreDivision,
+    CoreDivisionBuffer,
 )
 
 _SIZE = 65536  # bytes; a plausible per-buffer footprint (mirrors capture scale)
 
 
 # --- menu helpers ----------------------------------------------------------- #
-def _trivial() -> FakeCoreDivision:
+def _trivial() -> CoreDivision:
     """Index-0 committed/seed division: whole-buffer, undivided."""
-    return FakeCoreDivision(output_splits={}, reduction_splits={})
+    return CoreDivision(output_splits={}, reduction_splits={})
 
 
-def _osplit(k: int) -> FakeCoreDivision:
+def _osplit(k: int) -> CoreDivision:
     """An output split by ``k`` on dim 1 (output_partition == k)."""
-    return FakeCoreDivision(output_splits={1: k}, reduction_splits={})
+    return CoreDivision(output_splits={1: k}, reduction_splits={})
 
 
-def _rsplit(k: int) -> FakeCoreDivision:
+def _rsplit(k: int) -> CoreDivision:
     """A reduction (K) split by ``k`` -- output_partition stays 1."""
-    return FakeCoreDivision(output_splits={}, reduction_splits={1: k})
+    return CoreDivision(output_splits={}, reduction_splits={1: k})
 
 
 # The standard three-entry output menu shared by most synthetic ops: index 0
@@ -86,31 +87,31 @@ def _buf(
     matches: dict[str, list[tuple[int, int]]],
     *,
     lifetime: tuple[int, int],
-    menu: list[FakeCoreDivision] | None = None,
+    menu: list[CoreDivision] | None = None,
     size: int = _SIZE,
-    placement: bool = True,
     residency_reason: str | None = None,
     in_place_parents: list[str] | None = None,
-) -> FakeCoreDivisionBuffer:
+) -> CoreDivisionBuffer:
     """One synthetic buffer. ``lifetime`` is ``(first_use, last_use)`` -- adjacent
     buffers are given overlapping windows so a tight capacity forces real packing
     pressure (spills / eligibility toggles), mirroring the captures' rolling
     ``uses``. ``matches`` maps each parent name to its ``(parent_idx, child_idx)``
     compatible menu-index pairs."""
     first, last = lifetime
-    return FakeCoreDivisionBuffer(
+    return CoreDivisionBuffer(
         name=name,
         size=size,
         uses=[first, last],
         first_use_is_read=bool(parents),
         in_place_parents=in_place_parents or [],
-        placement=placement,
         residency_reason=residency_reason,
-        boundary_cost=0,
-        spill_write_cost=size,
-        parents=list(parents),
         core_divisions=list(menu if menu is not None else _STD_MENU),
+        parents=list(parents),
         cd_parent_matches=dict(matches),
+        # No synthetic buffer is a graph output, so every one is an intermediate
+        # whose producer write residency saves (matches the captures, where
+        # boundary_cost is zero for all but the single output buffer).
+        boundary=BufferType.Intermediate,
     )
 
 
@@ -120,7 +121,7 @@ _BOUNDARY = [(0, 0)]  # only the trivial tiling crosses -> region boundary
 
 
 # --- graph builders --------------------------------------------------------- #
-def _chain(prefix: str, length: int) -> list[FakeCoreDivisionBuffer]:
+def _chain(prefix: str, length: int) -> list[CoreDivisionBuffer]:
     """A uniform pointwise chain ``b0 -> b1 -> ... `` of ``length`` ops; every edge
     propagates any tiling (one region spanning the whole chain)."""
     bufs = [_buf(f"{prefix}0", [], {}, lifetime=(0, 1))]
@@ -130,15 +131,15 @@ def _chain(prefix: str, length: int) -> list[FakeCoreDivisionBuffer]:
     return bufs
 
 
-def chain_long() -> list[FakeCoreDivisionBuffer]:
+def chain_long() -> list[CoreDivisionBuffer]:
     return _chain("c", 12)
 
 
-def chain_short() -> list[FakeCoreDivisionBuffer]:
+def chain_short() -> list[CoreDivisionBuffer]:
     return _chain("c", 3)
 
 
-def wide_join() -> list[FakeCoreDivisionBuffer]:
+def wide_join() -> list[CoreDivisionBuffer]:
     """``root`` fans out to ``m0..m5``, which all feed one ``sink``. Each middle is
     compatible with the root on the uniform relation, but the sink only matches
     each middle on a *distinct* tiling, so no single sink coloring satisfies every
@@ -153,11 +154,11 @@ def wide_join() -> list[FakeCoreDivisionBuffer]:
     return [root, *middles, sink]
 
 
-def multi_region() -> list[FakeCoreDivisionBuffer]:
+def multi_region() -> list[CoreDivisionBuffer]:
     """Three uniform 3-op chains joined by boundary edges (only the trivial pair
     crosses), so a split tiling floods within a region and stops at each boundary
     -- three distinct regions, not one."""
-    bufs: list[FakeCoreDivisionBuffer] = []
+    bufs: list[CoreDivisionBuffer] = []
     prev_tail: str | None = None
     t = 0
     for r in range(3):
@@ -178,7 +179,7 @@ def multi_region() -> list[FakeCoreDivisionBuffer]:
     return bufs
 
 
-def k_split_consumers() -> list[FakeCoreDivisionBuffer]:
+def k_split_consumers() -> list[CoreDivisionBuffer]:
     """A clean ``producer`` read by two K-split consumers via the PSUM ring, plus a
     reduction-split ``kprod`` whose partial-write index never appears on its child
     edge -- so ``kprod`` is gated out of LX whenever it selects that division
@@ -211,10 +212,10 @@ def k_split_consumers() -> list[FakeCoreDivisionBuffer]:
     return [producer, c0, c1, kprod, tail]
 
 
-def pinned_heavy() -> list[FakeCoreDivisionBuffer]:
-    """Resident ops interleaved with several ``placement`` = False pins spanning
-    distinct ``residency_reason`` values. Pins are excluded from ``pi`` but still
-    gate neighbors via ``cd_parent_matches`` and contribute always-HBM traffic."""
+def pinned_heavy() -> list[CoreDivisionBuffer]:
+    """Resident ops interleaved with several pinned buffers spanning distinct
+    ``residency_reason`` values. Pins still gate neighbors via
+    ``cd_parent_matches`` and contribute always-HBM traffic."""
     reasons = ["extern kernel user", "mutation target", "graph output (no clone)"]
     bufs = [_buf("head", [], {}, lifetime=(0, 1))]
     prev = "head"
@@ -225,7 +226,6 @@ def pinned_heavy() -> list[FakeCoreDivisionBuffer]:
             [prev],
             {prev: _UNIFORM},
             lifetime=(t, t + 2),
-            placement=False,
             residency_reason=reasons[i],
         )
         cur = _buf(
@@ -240,10 +240,10 @@ def pinned_heavy() -> list[FakeCoreDivisionBuffer]:
     return bufs
 
 
-def big_chain() -> list[FakeCoreDivisionBuffer]:
+def big_chain() -> list[CoreDivisionBuffer]:
     """~48 buffers across several regions -- compile-time-budget / burst-scaling
     exercise (Plan Appendix H) and a heavier determinism load."""
-    bufs: list[FakeCoreDivisionBuffer] = []
+    bufs: list[CoreDivisionBuffer] = []
     prev_tail: str | None = None
     t = 0
     for r in range(8):
@@ -262,9 +262,9 @@ def big_chain() -> list[FakeCoreDivisionBuffer]:
     return bufs
 
 
-# name -> [FakeGraph] (single graph per case), mirroring ``load_captures``'s shape
+# name -> [CapturedGraph] (single graph per case), mirroring ``load_captures``'s shape
 # so the SA test harness can chain synthetic and captured cases uniformly.
-def synthetic_graphs() -> dict[str, list[FakeGraph]]:
+def synthetic_graphs() -> dict[str, list[CapturedGraph]]:
     builders = {
         "chain_long": chain_long,
         "chain_short": chain_short,
@@ -274,13 +274,13 @@ def synthetic_graphs() -> dict[str, list[FakeGraph]]:
         "pinned_heavy": pinned_heavy,
         "big_chain": big_chain,
     }
-    return {name: [FakeGraph(buffers=build())] for name, build in builders.items()}
+    return {name: [CapturedGraph(buffers=build())] for name, build in builders.items()}
 
 
 if __name__ == "__main__":
     for case, graphs in synthetic_graphs().items():
         g = graphs[0]
-        pinned = sum(1 for b in g.buffers if not b.residency_allowed)
+        pinned = sum(1 for b in g.buffers if b.residency_reason is not None)
         anchors = sum(
             1
             for b in g.buffers
