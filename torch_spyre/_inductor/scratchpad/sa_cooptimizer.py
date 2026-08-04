@@ -90,6 +90,9 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
 )
 from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 
 # The packer is either the pure-Python solver or the native C++ solver; both
 # expose the same permutation-packer interface the co-optimizer drives, so
@@ -122,6 +125,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         steps_per_buffer: annealing steps scale linearly with the buffer count
             (crude bounded budget; Plan Appendix H tunes this later).
         min_steps: floor on the step budget for tiny graphs.
+        max_steps: ceiling on the *total* step budget, so a large graph cannot
+            run away. Mirrors the layout-only annealer's schedule-level clamp
+            (``SelfCalibratingReheatingSchedule.max_steps``, 5_000) but sits
+            higher: this engine searches divisions as well as layout, so it
+            wants a larger budget at the same buffer count. Note this bounds
+            *steps*, not wall-clock -- per-step cost also grows with ``n``.
         schedule: ``"reheating"`` (Plan §5 -- the multi-move self-calibrating
             reheating schedule + cycle-phase proposal mix) or ``"crude"`` (the
             Phase-3/4 single geometric cool + fixed proposal weights, retained as
@@ -146,6 +155,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         seed: int = 0,
         steps_per_buffer: int = 40,
         min_steps: int = 200,
+        max_steps: int = 15_000,
         schedule: str = "reheating",
         cycles: int = 4,
         horizons_per_cycle: float = 2.0,
@@ -172,6 +182,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._seed = seed
         self._steps_per_buffer = steps_per_buffer
         self._min_steps = min_steps
+        self._max_steps = max_steps
         self._schedule = schedule
         self._cycles = cycles
         self._horizons_per_cycle = horizons_per_cycle
@@ -754,7 +765,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _anneal(self) -> None:
         n = len(self._bufs)
-        steps = max(self._min_steps, self._steps_per_buffer * n)
+        # clamp(steps_per_buffer * n, min_steps, max_steps) -- the same shape the
+        # layout-only annealer's schedule uses, so neither engine's budget grows
+        # without bound. The ceiling binds only well past the validated corpus
+        # (15_000/40 = 375 buffers vs. n <= 79 in the captures), so it is
+        # insurance rather than something the tuned range ever meets.
+        steps = min(self._max_steps, max(self._min_steps, self._steps_per_buffer * n))
+        if self._steps_per_buffer * n > self._max_steps:
+            logger.debug(
+                "SA co-optimizer step budget clamped to max_steps=%d for %d "
+                "buffers (steps_per_buffer=%d would ask for %d); layout quality "
+                "is traded for bounded compile time.",
+                self._max_steps,
+                n,
+                self._steps_per_buffer,
+                self._steps_per_buffer * n,
+            )
         self._flippable_ops = self._flippable()
         # Static proposal-mix neighborhoods (Plan §5.4): reorder ~ n reinsertion
         # points; flip ~ the available local labels; recolor ~ the anchor tilings

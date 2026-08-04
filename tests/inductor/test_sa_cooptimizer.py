@@ -489,6 +489,47 @@ class InnerLayoutLoopTest(TestCase):
             self.assertGreaterEqual(solver.packer.quality(), entry_q, f"cap={cap}")
 
 
+class StepBudgetTest(TestCase):
+    """``clamp(steps_per_buffer * n, min_steps, max_steps)`` -- the same shape the
+    layout-only annealer's schedule uses, so neither engine grows without bound."""
+
+    @staticmethod
+    def _budget(solver, n):
+        """The budget ``_anneal`` would compute for ``n`` buffers."""
+        return min(
+            solver._max_steps,
+            max(solver._min_steps, solver._steps_per_buffer * n),
+        )
+
+    def test_rate_applies_between_the_floor_and_the_ceiling(self):
+        s = SaCoOptimizingSolver(1 << 20, 128)
+        self.assertEqual(self._budget(s, 100), s._steps_per_buffer * 100)
+
+    def test_floor_applies_to_tiny_graphs(self):
+        s = SaCoOptimizingSolver(1 << 20, 128)
+        self.assertEqual(self._budget(s, 1), s._min_steps)
+
+    def test_ceiling_caps_large_graphs(self):
+        s = SaCoOptimizingSolver(1 << 20, 128)
+        binds_at = s._max_steps // s._steps_per_buffer
+        self.assertEqual(self._budget(s, binds_at * 4), s._max_steps)
+        # Inert across the validated corpus: the largest captured graph is n=79,
+        # far below where the ceiling starts binding. If this ever fails, the
+        # clamp has begun changing committed benchmark numbers.
+        self.assertGreater(binds_at, 79)
+
+    def test_ceiling_is_higher_than_the_layout_only_annealer(self):
+        """The joint engine searches divisions too, so it wants a larger budget
+        at the same buffer count (and must not silently inherit the smaller one).
+        """
+        from torch_spyre._inductor.scratchpad.cooling_schedules import (
+            SelfCalibratingReheatingSchedule,
+        )
+
+        layout_only = SelfCalibratingReheatingSchedule().max_steps
+        self.assertGreater(SaCoOptimizingSolver(1 << 20, 128)._max_steps, layout_only)
+
+
 class ScheduleTest(TestCase):
     """Plan §5 / §8.3: the reheating schedule + cycle-phase mix beats the crude
     baseline, records per-move acceptance traces + within-group CVs, and stays

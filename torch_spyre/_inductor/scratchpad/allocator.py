@@ -2384,6 +2384,7 @@ def select_allocator() -> ScratchpadAllocator:
       gap-based solver (greedy/bestfit/firstfit).
     """
     size = _lx_planning_size()
+
     if (
         config.layout_solver == "simulated_annealing"
         and config.co_optimizing_lx_planning
@@ -2426,7 +2427,6 @@ def select_allocator() -> ScratchpadAllocator:
         raise ValueError(
             f"Invalid layout_solver config option '{config.layout_solver}'."
         )
-
     if config.co_optimizing_lx_planning:
         if config.lx_planner_relayout:
             logger.warning(
