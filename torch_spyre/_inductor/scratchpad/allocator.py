@@ -2363,12 +2363,38 @@ def select_allocator() -> ScratchpadAllocator:
       each op's pre-determined core division (the buffers are converted to
       trivial ``CoreDivisionBuffer``s). Falls back to greedy when ortools is
       absent.
-    * ``co_optimizing_lx_planning`` (non-cpsat solver) -> gap-based
-      co-optimization via :class:`StrategyBCoOptimizingAllocator`.
+    * ``layout_solver == "simulated_annealing"`` with ``co_optimizing_lx_planning``
+      -> joint work-division + LX placement via :class:`CoOptimizingAllocator`,
+      driven by :class:`SaCoOptimizingSolver`.
+    * ``layout_solver == "simulated_annealing"`` without co-optimization ->
+      placement-only :class:`ScratchpadAllocator` driven by the layout-only
+      :class:`SimulatedAnnealingLayoutSolver` (via ``_PLACEMENT_SOLVERS`` below).
+
+      Note these two are *different classes*, not one class in two modes (unlike
+      the cpsat pair above, where the same solver simply does less work). Plan
+      §7.3 deliberately keeps the layout-only annealer standalone: it stays a
+      usable :class:`MemoryPlanSolver`, while the joint engine composes the same
+      packer and adds the division moves. Do not merge them.
+    * ``co_optimizing_lx_planning`` (gap-based solver) -> gap-based
+      co-optimization via :class:`StrategyBCoOptimizingAllocator`. Note the joint
+      SA engine is deliberately *not* reachable this way: StrategyB calls
+      ``plan_layout`` once per enumerated split candidate inside its search, so
+      nesting a full anneal there would cost one anneal per candidate.
     * otherwise -> placement-only :class:`ScratchpadAllocator` with the configured
       gap-based solver (greedy/bestfit/firstfit).
     """
     size = _lx_planning_size()
+    if (
+        config.layout_solver == "simulated_annealing"
+        and config.co_optimizing_lx_planning
+    ):
+        # No optional dependency, so unlike cpsat there is no degradation path.
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        return CoOptimizingAllocator(layout_planning=SaCoOptimizingSolver(size))
+
     if config.layout_solver == "cpsat":
         # Both cpsat paths share the same ortools-missing degradation: build the
         # CP-SAT solver factory here and fall back to greedy placement (still

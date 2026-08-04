@@ -1419,6 +1419,34 @@ class TestSelectAllocator(unittest.TestCase):
                 # ortools absent: falls back to greedy placement.
                 self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
+        # simulated_annealing + co-optimization routes to the joint allocator
+        # driven by the SA co-optimizer. This is a *different class* from the
+        # placement-only annealer below, not the same solver doing less work.
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+        from torch_spyre._inductor.scratchpad.simulated_annealing import (
+            SimulatedAnnealingLayoutSolver,
+        )
+
+        with ts_inductor_config.patch(
+            layout_solver="simulated_annealing", co_optimizing_lx_planning=True
+        ):
+            a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            self.assertIsInstance(a.layout_planning, SaCoOptimizingSolver)
+
+        # Without co-optimization the same config value selects the layout-only
+        # annealer, placement-only -- deliberately NOT StrategyB-wrapped, since
+        # StrategyB calls plan_layout once per enumerated search candidate.
+        with ts_inductor_config.patch(
+            layout_solver="simulated_annealing", co_optimizing_lx_planning=False
+        ):
+            a = select_allocator()
+            self.assertIs(type(a), ScratchpadAllocator)
+            self.assertIsInstance(a.layout_planning, SimulatedAnnealingLayoutSolver)
+            self.assertNotIsInstance(a.layout_planning, SaCoOptimizingSolver)
+
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False
         ):
