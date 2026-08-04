@@ -560,6 +560,31 @@ class NativePermutationLayoutSolver {
     return sizes_[child] <= sizes_[parent];
   }
 
+  // True if idx may reuse partner's slot: they have to be a declared in-place
+  // pair, and the child has to fit in the parent's footprint. Mirrors the
+  // reference's _in_place_pair + _can_inplace gate. Reads the plan-local
+  // sizes_, so a resize that crosses the fit boundary flips legality.
+  bool inplace_legal(int idx, int partner) const {
+    if (!inplace_partners_[idx].contains(partner)) {
+      return false;
+    }
+    const std::pair<int, int> pr = in_place_pair(idx, partner);
+    return can_inplace(pr.first, pr.second);
+  }
+
+  // m dies exactly as idx starts (resp. starts exactly as idx ends), so idx may
+  // be able to take over its slot. Deliberately address-free: the caller
+  // settles these before knowing whether anything has been evicted.
+  bool is_inplace_parent_candidate(int idx, int m) const {
+    return m != kNone && eligible_[m] && end_[m] == start_[idx] + 1 &&
+           inplace_legal(idx, m);
+  }
+
+  bool is_inplace_child_candidate(int idx, int m) const {
+    return m != kNone && eligible_[m] && start_[m] + 1 == end_[idx] &&
+           inplace_legal(idx, m);
+  }
+
   // Decide idx's address from the buffers it rests on, read off its
   // below-profile. Returns (address, partner): address == nullopt means
   // evicted; partner is the neighbour whose address was reused in-place, or
@@ -581,54 +606,41 @@ class NativePermutationLayoutSolver {
       return {std::optional<int64_t>(0), kNone};
     }
 
-    // Eviction is upward-closed: an evicted below-neighbour has no finite top,
-    // and idx would rest on it, so idx is evicted too. A kNone label is the
-    // floor, not an evicted neighbour. Settling this over the whole profile
-    // first is what lets everything below dereference addresses_ unguarded.
-    for (const int buffer : below.labels) {
-      if (buffer != kNone && !addresses_[buffer].has_value()) {
-        return {std::nullopt, kNone};
-      }
-    }
+    // See if we could potentially in-place with a parent, and likewise with a
+    // child. This is determined by in_place_*_candidate == kNone. Neither test
+    // reads an address, so both can be settled before the eviction scan below;
+    // a qualifying candidate is a real below-profile label, so that scan then
+    // guarantees it has an address by the time one is read off it.
+    const int in_place_parent_candidate =
+        is_inplace_parent_candidate(idx, below.labels[0]) ? below.labels[0]
+                                                          : kNone;
+    const int in_place_child_candidate =
+        is_inplace_child_candidate(idx, below.labels[n_below - 1])
+            ? below.labels[n_below - 1]
+            : kNone;
 
-    // See if we could potentially in-place with a parent. This is determined
-    // by in_place_parent_candidate == kNone; if that's not the case, then
-    // in_place_parent_address is the parent's address. Same for in-placing with
-    // a child.
-    int in_place_parent_candidate = below.labels[0];
-    int64_t in_place_parent_address = 0;
-    if (in_place_parent_candidate != kNone) {
-      if (eligible_[in_place_parent_candidate] &&
-          end_[in_place_parent_candidate] == start_[idx] + 1 &&
-          inplace_partners_[idx].contains(in_place_parent_candidate)) {
-        in_place_parent_address = *addresses_[in_place_parent_candidate];
-      } else {
-        in_place_parent_candidate = kNone;
-      }
-    }
-
-    int in_place_child_candidate = below.labels[n_below - 1];
-    int64_t in_place_child_address = 0;
-    if (in_place_child_candidate != kNone) {
-      if (eligible_[in_place_child_candidate] &&
-          start_[in_place_child_candidate] + 1 == end_[idx] &&
-          inplace_partners_[idx].contains(in_place_child_candidate)) {
-        in_place_child_address = *addresses_[in_place_child_candidate];
-      } else {
-        in_place_child_candidate = kNone;
-      }
-    }
-
-    // Highest top among the below-neighbours: over all of them (the height idx
-    // stacks at), and over all but the parent / all but the child (what each
-    // in-place drop has to clear). A label can recur non-adjacently in the
+    // Highest top among the buffers idx rests on: over all of them (the height
+    // idx stacks at), and over all but the parent / all but the child (what
+    // each in-place drop has to clear). A label can recur non-adjacently in the
     // profile, so exclude a candidate by identity rather than by position.
+    //
+    // The below-profile's labels alone are not the full set. A neighbour m that
+    // dropped into a partner's slot shares its address with that partner, and
+    // the partner still occupies those columns while never being a
+    // below-neighbour of idx -- m hides it. Its top can even exceed m's, since
+    // m may be the smaller child of the pair. So every neighbour contributes
+    // its reuse partner too, as the candidate scan this replaced used to.
+    //
+    // Eviction is upward-closed: idx resting on a buffer with no address has no
+    // address either. A kNone label is the floor, not an evicted neighbour.
     int64_t max_top = 0;
     int64_t top_without_parent = 0;
     int64_t top_without_child = 0;
-    for (const int buffer : below.labels) {
-      if (buffer == kNone) {
-        continue;  // floor: contributes no top
+    bool evicted = false;
+    const auto contribute = [&](int buffer) {
+      if (!addresses_[buffer].has_value()) {
+        evicted = true;
+        return;
       }
       const int64_t top = *addresses_[buffer] + sizes_[buffer];
       max_top = std::max(max_top, top);
@@ -638,6 +650,21 @@ class NativePermutationLayoutSolver {
       if (buffer != in_place_child_candidate) {
         top_without_child = std::max(top_without_child, top);
       }
+    };
+    for (std::size_t i = 0; i < n_below; ++i) {
+      const int m = below.labels[i];
+      if (m == kNone) {
+        continue;  // floor: contributes no top
+      }
+      contribute(m);
+      const int reused = reuse_[m];
+      if (reused != kNone && start_[reused] <= below.starts[i] &&
+          below.starts[i] < end_[reused]) {
+        contribute(reused);
+      }
+    }
+    if (evicted) {
+      return {std::nullopt, kNone};
     }
 
     // Drop into an in-place partner's slot, but only when every other
@@ -652,22 +679,24 @@ class NativePermutationLayoutSolver {
     // is a rare case (except maybe for base address 0), and we can get the
     // better result anyway by finding a different order for the buffers, we
     // don't make this change now.
-    if (in_place_parent_candidate != kNone &&
-        top_without_parent <= in_place_parent_address) {
-      if (in_place_parent_address + sizes_[idx] > capacity_) {
-        return {std::nullopt, kNone};
+    if (in_place_parent_candidate != kNone) {
+      const int64_t addr = *addresses_[in_place_parent_candidate];
+      if (top_without_parent <= addr) {
+        if (addr + sizes_[idx] > capacity_) {
+          return {std::nullopt, kNone};
+        }
+        return {std::optional<int64_t>(addr), in_place_parent_candidate};
       }
-      return {std::optional<int64_t>(in_place_parent_address),
-              in_place_parent_candidate};
     }
 
-    if (in_place_child_candidate != kNone &&
-        top_without_child <= in_place_child_address) {
-      if (in_place_child_address + sizes_[idx] > capacity_) {
-        return {std::nullopt, kNone};
+    if (in_place_child_candidate != kNone) {
+      const int64_t addr = *addresses_[in_place_child_candidate];
+      if (top_without_child <= addr) {
+        if (addr + sizes_[idx] > capacity_) {
+          return {std::nullopt, kNone};
+        }
+        return {std::optional<int64_t>(addr), in_place_child_candidate};
       }
-      return {std::optional<int64_t>(in_place_child_address),
-              in_place_child_candidate};
     }
 
     const int64_t aligned = align_up(max_top);
@@ -1004,8 +1033,12 @@ class NativePermutationLayoutSolver {
     const Profile old_below = below_[x];
     const Profile old_above = above_[x];
     move_in_permutation(i, j);
-    recompute_all_addresses();
+    // The profiles have to be patched before the addresses are recomputed:
+    // placement_decision reads below_, so a stale profile would just replay the
+    // pre-move addresses. Patching only needs the permutation (already moved),
+    // never addresses_, so this order is the safe one.
     patch_profiles_for_move(x, old_below, old_above);
+    recompute_all_addresses();
     return total_quality_ - old_total;
   }
 
