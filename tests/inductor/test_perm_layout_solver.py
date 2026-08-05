@@ -56,6 +56,13 @@ def _random_buffers(rng, n, horizon=12, max_size=200, inplace_prob=0.25):
             parent_i = rng.randrange(child_i)
             parent = buffers[parent_i]
             child = buffers[child_i]
+            if parent.read_count == 0:
+                # A write-only parent has nothing to hand over, so the pair is
+                # not expressible at all (see ``assert_in_place_parent_is_read``).
+                # Drawing one is possible because a base buffer may land on a
+                # single-tick lifetime; skip rather than reshaping the parent,
+                # which could invalidate a pair already wired to it.
+                continue
             # The child is defined at the parent's last live tick, so that
             # parent.end_time == child.start_time + 1. Its own read has to fall
             # strictly after that write, both because uses is strictly increasing
@@ -233,6 +240,33 @@ class SkeletonTestsMixin(MixinBase):
             self.make_plan(buffers, [0, 0], capacity=128)
         with self.assertRaises(AssertionError):
             self.make_plan(buffers, [0], capacity=128)
+
+    def test_write_only_in_place_parent_rejected(self):
+        # "a" is a computed buffer whose only use is its write, so it is never
+        # read and has no storage to hand over; "b" declaring it as an in-place
+        # parent is not expressible. Rejected while resolving declared pairs, so
+        # it fires for both concrete plans.
+        parent = LifetimeBoundBuffer("a", 64, [0])
+        child = LifetimeBoundBuffer("b", 64, [0, 2], in_place_parents=["a"])
+        with self.assertRaises(AssertionError):
+            self.make_plan([parent, child], [0, 1], capacity=256)
+
+    def test_single_use_input_in_place_parent_allowed(self):
+        # The same shape is legal when the parent is a graph input: all its uses
+        # are reads, so one use still means a genuine read before the handoff.
+        parent = LifetimeBoundBuffer("a", 64, [0], first_use_is_read=True)
+        child = LifetimeBoundBuffer("b", 64, [0, 2], in_place_parents=["a"])
+        plan = self.make_plan([parent, child], [0, 1], capacity=256)
+        self.assertEqual(plan._inplace_partners, [{1}, {0}])
+
+    def test_in_place_chain_allowed(self):
+        # Chains are explicitly supported: "b" is both a child of "a" and the
+        # parent of "c". Every parent here has a read, so nothing is rejected.
+        a = LifetimeBoundBuffer("a", 64, [0, 2])
+        b = LifetimeBoundBuffer("b", 64, [2, 4], in_place_parents=["a"])
+        c = LifetimeBoundBuffer("c", 64, [4, 6], in_place_parents=["b"])
+        plan = self.make_plan([a, b, c], [0, 1, 2], capacity=256)
+        self.assertEqual(plan._inplace_partners, [{1}, {0, 2}, {1}])
 
     def test_align_up(self):
         buffers = [_buf("a", 64, 0, 1)]
@@ -519,10 +553,19 @@ class ContactProfileTests(TestCase):
                 starts = [s for s, _ in life]
                 ends = [e for _, e in life]
                 # in-place parent options: any other buffer whose lifetime makes
-                # it a geometrically valid parent (parent.end == child.start + 1).
+                # it a geometrically valid parent (parent.end == child.start + 1)
+                # *and* that is read before the handoff. A single-tick parent has
+                # only its write, so it has nothing to hand over and the pair is
+                # not expressible (see ``assert_in_place_parent_is_read``).
                 parent_opts = [
                     [None]
-                    + [j for j in range(n) if j != i and ends[j] == starts[i] + 1]
+                    + [
+                        j
+                        for j in range(n)
+                        if j != i
+                        and ends[j] == starts[i] + 1
+                        and ends[j] - starts[j] > 1
+                    ]
                     for i in range(n)
                 ]
                 for sizes in itertools.product((1, 2), repeat=n):

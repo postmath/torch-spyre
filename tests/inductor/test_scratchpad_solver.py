@@ -429,6 +429,25 @@ class BaseLayoutSolverTests:
         with self.assertRaises(AssertionError):
             _assert_in_place_relationships([p, c])
 
+    def test_assert_rejects_write_only_computed_parent(self):
+        # P's single use is its write, so it is never read: C would take over
+        # storage holding data nothing consumes, and the two would come alive on
+        # the same tick. P.end_time == C.start_time + 1 still holds, so only the
+        # read-count invariant rejects this.
+        p = LifetimeBoundBuffer("P", 20, [3])
+        c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
+        self.assertEqual(p.end_time, c.start_time + 1)
+        with self.assertRaises(AssertionError):
+            _assert_in_place_relationships([p, c])
+
+    def test_assert_allows_single_use_input_parent(self):
+        # A graph input's single use is a read, so handing its storage over is
+        # legitimate; first_use_is_read is what distinguishes it from the
+        # computed buffer above.
+        p = LifetimeBoundBuffer("P", 20, [3], first_use_is_read=True)
+        c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
+        _assert_in_place_relationships([p, c])
+
     def test_uses_must_be_strictly_increasing(self):
         # One distinct index per accessing op. A repeat would describe a buffer
         # written and read by the same operation, i.e. with a single live tick,
@@ -442,6 +461,18 @@ class BaseLayoutSolverTests:
         # Empty is allowed: buffers may be registered before their uses are
         # known and filled in afterwards.
         LifetimeBoundBuffer("P", 20, [])
+
+    def test_repeated_index_cannot_pass_as_a_read(self):
+        # The in-place rule tests for a use strictly after the first rather than
+        # relying on read_count, so a buffer whose uses were mutated into a
+        # repeat after construction still cannot be an in-place parent.
+        p = LifetimeBoundBuffer("P", 20, [3, 4])
+        c = LifetimeBoundBuffer("C", 15, [4, 8], in_place_parents=["P"])
+        _assert_in_place_relationships([p, c])  # baseline: accepted
+        p.uses = [3, 3]  # bypasses __post_init__
+        self.assertEqual(p.read_count, 1)  # read_count is fooled...
+        with self.assertRaises(AssertionError):  # ...the invariant is not
+            _assert_in_place_relationships([p, c])
 
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -902,7 +933,17 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         # zero-width time interval, which the 2D propagator ignores -- the child
         # still holds the shared slot. The merge must fire (capacity fits only
         # one 100-byte buffer) and the child must reuse the parent's address.
-        gp = CoreDivisionBuffer("gp", 100, [0], core_divisions=_whole())  # end_time=1
+        #
+        # ``gp`` has to be an input clone (``first_use_is_read``) rather than a
+        # computed buffer: a computed buffer's lone use is its write, so it is
+        # never read and cannot hand storage over at all -- forbidden by
+        # ``_assert_in_place_relationships``. A clone read exactly once is the
+        # real shape of a single-use in-place parent. The flag does not reach the
+        # solver here (``CoreDivisionBuffer`` tracks ``boundary``, which takes
+        # precedence), so it leaves the zero-width interval under test.
+        gp = CoreDivisionBuffer(
+            "gp", 100, [0], first_use_is_read=True, core_divisions=_whole()
+        )  # end_time=1
         c = CoreDivisionBuffer(
             "c",
             100,
