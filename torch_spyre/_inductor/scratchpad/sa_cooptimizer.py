@@ -388,7 +388,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Plain lifetime buffers (name/size/lifetime/in-place) the packer and
         FirstFit consume; ``sizes`` are the current per-core footprints. In-place
         parents are kept in full -- the packer treats an ineligible (absent)
-        parent transparently, so it never in-places onto one."""
+        parent transparently, so it never in-places onto one.
+
+        ``residency_reason`` is carried so that ``MemoryPlanSolver.excluded()``
+        sees the fixed pins during the FirstFit seed pass (Plan §7.4); the packer
+        ignores it, taking an explicit ``eligible`` mask instead.
+        """
         out = []
         for i, b in enumerate(self._bufs):
             out.append(
@@ -400,6 +405,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                     in_place_parents=[
                         p for p in b.in_place_parents if p in self._name_to_idx
                     ],
+                    residency_reason=b.residency_reason,
                 )
             )
         return out
@@ -411,16 +417,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         sizes = [self._per_core_size(i, 0) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
 
-        # pi from a FirstFit pass over the per-core sizes.
+        # pi from a FirstFit pass over the per-core sizes. ``_lifetime_buffers``
+        # carries ``residency_reason``, so ``FirstFitLayoutSolver.excluded()``
+        # leaves the fixed pins unplaced and ``SolverToPermutation`` sorts them
+        # after every placed buffer (Plan §7.4: pi is ordered over the buffers
+        # that can ever be resident). They keep their slot in pi -- it stays a
+        # permutation of all n indices, so the packer's ``eligible`` mask still
+        # lines up index-for-index -- they simply stop occupying prefix slots and
+        # displacing eligible buffers to higher addresses.
         #
-        # NOTE: ineligible buffers are *not* excluded from this pass. The former
-        # ``ff_bufs[i].placement = False`` here wrote to a field no substrate
-        # class has, so it never excluded anything; the seed has always been a
-        # FirstFit over every buffer. Forwarding ``residency_reason`` into
-        # ``_lifetime_buffers`` would make ``FirstFitLayoutSolver.excluded()``
-        # drop them for real -- but that shifts the seed, and hence
-        # ``baseline_score`` and every committed benchmark number, so it is left
-        # as a separate deliberate change rather than folded into this rebind.
+        # Transient, division-dependent ineligibility is deliberately *not*
+        # expressed here: a buffer whose seed-division footprint exceeds capacity
+        # is already tail-sorted by ``excluded()``'s ``min_footprint`` test (that
+        # predates this and is unchanged), and eligibility that comes and goes
+        # with ``W`` must keep its slot so it can re-enter coherently.
         ff_bufs = self._lifetime_buffers(sizes)
         pi = SolverToPermutation(
             FirstFitLayoutSolver(self.limit, self.alignment)

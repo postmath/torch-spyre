@@ -152,6 +152,76 @@ class BaselineGuaranteeTest(TestCase):
                 self.assertLessEqual(solver.best_score, solver.baseline_score, tag)
 
 
+class SeedPermutationTest(TestCase):
+    """Plan §7.4: ``pi`` is *ordered* over the buffers that can ever be resident.
+
+    A fixed pin can never be resident for any ``(pi, W)``, so it must not occupy a
+    prefix slot and displace an eligible buffer. It keeps its index -- ``pi`` stays
+    a permutation of all ``n`` -- but sorts after everything the seed placed.
+    """
+
+    @staticmethod
+    def _seed(buffers, cap):
+        solver = SaCoOptimizingSolver(cap, 128, seed=0)
+        solver.spill_reasons = {}
+        solver._bufs = buffers
+        solver._rng = rnd.Random(0)
+        solver._precompute_topology()
+        solver.chosen = [0] * len(buffers)
+        solver.packer = solver._build_seed_packer()
+        return solver
+
+    def test_pins_sort_after_every_placed_buffer(self):
+        checked = 0
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            bufs = copy.deepcopy(buffers)
+            if not any(b.residency_reason is not None for b in bufs):
+                continue
+            for cap in _capacities(bufs):
+                solver = self._seed(copy.deepcopy(bufs), cap)
+                pi = list(solver.packer.permutation)
+                addrs = solver.packer.addresses
+                pos = {idx: p for p, idx in enumerate(pi)}
+                placed = [i for i in range(len(bufs)) if addrs[i] is not None]
+                pinned = [
+                    i
+                    for i, b in enumerate(solver._bufs)
+                    if b.residency_reason is not None
+                ]
+                if not placed or not pinned:
+                    continue
+                checked += 1
+                tag = f"{case}[{gi}] cap={cap}"
+                self.assertLess(
+                    max(pos[i] for i in placed),
+                    min(pos[i] for i in pinned),
+                    f"{tag}: a pinned buffer sits before a placed one in pi",
+                )
+        self.assertGreater(checked, 0, "no pinned graph exercised")
+
+    def test_pi_remains_a_permutation_of_every_buffer(self):
+        """Pins are re-ordered, never dropped: the packer's ``eligible`` mask is
+        index-aligned with the buffer list, so ``pi`` must keep all ``n`` slots."""
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                solver = self._seed(copy.deepcopy(buffers), cap)
+                pi = list(solver.packer.permutation)
+                self.assertEqual(
+                    sorted(pi), list(range(len(buffers))), f"{case}[{gi}] cap={cap}"
+                )
+
+    def test_pins_are_never_placed_by_the_seed(self):
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                solver = self._seed(copy.deepcopy(buffers), cap)
+                for i, b in enumerate(solver._bufs):
+                    if b.residency_reason is not None:
+                        self.assertIsNone(
+                            solver.packer.addresses[i],
+                            f"{case}[{gi}] cap={cap} {b.name}: pinned but placed",
+                        )
+
+
 class DeterminismTest(TestCase):
     """Two runs on identical input are bit-for-bit identical (Plan §6.5/§7.5)."""
 
