@@ -630,17 +630,17 @@ class NativePermutationLayoutSolver {
     }
     interval_starts_.assign(pts.begin(), pts.end());
 
-    // interval_index[j] will be assigned for j = start_[i] and j = end_[i] but not
-    // for other values.
-    std::vector<int> interval_index;
-    interval_index.reserve(interval_starts_.back());
-    for (int i = 0; i < interval_starts_.size(); ++i) {
-      interval_index[interval_starts_[i]] = i;
+    // interval_index[j] will be assigned for j = start_[i] and j = end_[i] but
+    // not for other values. The largest such j is the last breakpoint, so the
+    // vector has to be one longer than that to be indexable there.
+    std::vector<int> interval_index(interval_starts_.back() + 1, 0);
+    for (std::size_t i = 0; i < interval_starts_.size(); ++i) {
+      interval_index[interval_starts_[i]] = static_cast<int>(i);
     }
 
     const int k = std::max(0, static_cast<int>(interval_starts_.size()) - 1);
     num_intervals_ = k;
-    total_at_.reserve(k);
+    total_at_.assign(k, 0);
     std::vector<int> deltas(k + 1, 0);
     for (int i = 0; i < n_; ++i) {
       deltas[interval_index[start_[i]]] += 1;
@@ -651,7 +651,7 @@ class NativePermutationLayoutSolver {
       running += deltas[t];
       total_at_[t] = running;
     }
-    buf_intervals_.reserve(n_);
+    buf_intervals_.assign(n_, {0, 0});
     for (int i = 0; i < n_; ++i) {
       buf_intervals_[i] = {interval_index[start_[i]], interval_index[end_[i]]};
     }
