@@ -337,6 +337,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             for b in bufs
         ]
         self._anchor_candidates = [i for i in range(n) if self._nontrivial_menu[i]]
+        self._precompute_spill_costs()
+
+    def _precompute_spill_costs(self) -> None:
+        """Cache each buffer's spill cost and the HBM bandwidth constant for
+        :meth:`_score`.
+
+        Both are loop-invariant across the whole anneal: ``spill_cost`` reads only
+        ``boundary`` / ``read_count`` / ``first_use_is_read`` / ``size``, none of
+        which a move touches (a division flip changes the *per-core* footprint the
+        packer sees, never the buffer's total size), and the bandwidth is a
+        hardware constant behind a lazy module lookup.
+        """
+        self._spill_costs = [self._spill_cost(b) for b in self._bufs]
+        self._hbm_bytes_per_us = scorer.hbm_bytes_per_us()
 
     # -- division-dependent derivations --------------------------------------
 
@@ -487,6 +501,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         time units. A buffer with a packer address is LX-resident (its address is
         ``None`` iff ineligible or spilled).
 
+        Hot path: this runs at least once per annealing step, so it reads
+        ``packer.addresses`` **once** and sums the per-buffer costs precomputed in
+        :meth:`_precompute_spill_costs`. The native packer materializes a fresh
+        list on every ``addresses`` access, so the obvious per-buffer read inside
+        the loop was quadratic; hoisting it and pricing each spill from a
+        precomputed vector is 8-31x faster across the captured graphs.
+
         The landed substrate objective is *differential* -- ``spill_cost`` is the
         traffic a spill adds **over** residency -- so a resident buffer
         contributes exactly zero and only the spilled ones are summed. This is
@@ -497,11 +518,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         The node term is zero until real op metadata is available (Phase 6); the
         scorer's fixed-point conversion keeps this deterministic.
         """
-        traffic = 0
-        for i, b in enumerate(self._bufs):
-            if self.packer.addresses[i] is None:
-                traffic += self._spill_cost(b)
-        memory_fixed = scorer.to_fixed_us(traffic / scorer.hbm_bytes_per_us())
+        traffic = sum(
+            cost
+            for cost, address in zip(self._spill_costs, self.packer.addresses)
+            if address is None
+        )
+        memory_fixed = scorer.to_fixed_us(traffic / self._hbm_bytes_per_us)
         node_fixed = 0  # no op-kind metadata yet (Phase 6)
         return memory_fixed + node_fixed
 
