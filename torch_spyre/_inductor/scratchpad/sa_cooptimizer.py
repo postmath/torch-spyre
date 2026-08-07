@@ -288,9 +288,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         that edge tiling-compatible.
 
         The consumer *count* is no longer derived here: the landed spill cost
-        scales by the buffer's own ``read_count`` instead. The two agree on every
-        captured graph (see ``test_read_count_matches_consumer_count``), and
-        ``_children`` remains available for the Phase-6 cohort multiplicity.
+        scales by the buffer's reads-served count instead -- ``read_count``
+        discounted by an input's unavoidable clone-in, see :meth:`spill_cost`.
+        The two agree on every captured graph (see
+        ``test_read_count_matches_consumer_count``), and ``_children`` remains
+        available for the Phase-6 cohort multiplicity.
         """
         bufs = self._bufs
         self._name_to_idx = {b.name: i for i, b in enumerate(bufs)}
@@ -456,11 +458,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         CP-SAT-private wrapper; lifting it into ``plan_solver.py`` and having both
         call it is a deliberate follow-up, not a prerequisite.
 
-        ``read_count`` reads (the ones residency would have served from LX) plus
-        the producer's own write, which residency turns into a free LX write. A
-        graph input has no producer write to save and a graph output's write-out
-        is unavoidable either way, so both cancel -- exactly ``boundary !=
-        Intermediate``.
+        The reads residency would have served from LX, plus the producer's own
+        write, which residency turns into a free LX write. A graph input has no
+        producer write to save and a graph output's write-out is unavoidable
+        either way, so both cancel -- exactly ``boundary != Intermediate``.
+
+        ``read_count`` counts the buffer's reads, not the savings: an input's
+        first read is the clone-in that pinning cannot avoid, so it is discounted
+        here. For a computed buffer the first use is the producing write and
+        ``read_count`` already excludes it, hence the discount is keyed on
+        ``first_use_is_read`` -- the same reasoning, and the same expression, as
+        ``_LifetimeBufferWithCpVars.spill_cost``.
 
         ``size`` is clamped non-negative for the same reason as in
         :meth:`_per_core_size`: an unsized buffer carries the ``mem_usage`` ``-1``
@@ -471,7 +479,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         constant when the real size is unknown.
         """
         is_intermediate = buffer.boundary == BufferType.Intermediate
-        return (buffer.read_count + (1 if is_intermediate else 0)) * max(0, buffer.size)
+        reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
+        return (reads_served + (1 if is_intermediate else 0)) * max(0, buffer.size)
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point

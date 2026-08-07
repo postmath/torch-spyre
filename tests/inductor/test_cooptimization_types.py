@@ -199,13 +199,20 @@ class CaptureAssumptionsTest(TestCase):
             )
 
     def test_read_count_matches_consumer_count(self):
-        """``read_count`` equals the distinct-consumer count on every capture.
+        """Reads-served equals the distinct-consumer count on every capture.
 
         The objective used to scale the spill cost by the number of consumer
         buffers (``len(children)``); the landed formula scales by the buffer's own
-        ``read_count``. They agree on all 308 captured buffers, which is what
+        reads-served count. They agree on all 308 captured buffers, which is what
         makes adopting the landed formula score-preserving. If a future capture
         breaks this, the two engines' objectives diverge and this fires.
+
+        Reads-served is ``read_count`` minus an input's clone-in, not
+        ``read_count`` itself: ``read_count`` counts every read, and for a graph
+        input the first one is the clone-in that pinning cannot avoid. Both
+        engines discount it -- ``SACoOptimizer.spill_cost`` and
+        ``_LifetimeBufferWithCpVars.spill_cost`` -- so the equivalence this test
+        protects is against the discounted count.
         """
         for tag, g in _all_captures():
             by_name = g.by_name()
@@ -215,10 +222,11 @@ class CaptureAssumptionsTest(TestCase):
                     if p in by_name:
                         kids[p] += 1
             for b in g.buffers:
+                reads_served = b.read_count - (1 if b.first_use_is_read else 0)
                 self.assertEqual(
-                    b.read_count,
+                    reads_served,
                     kids[b.name],
-                    f"{tag} {b.name}: read_count {b.read_count} != "
+                    f"{tag} {b.name}: reads served {reads_served} != "
                     f"consumers {kids[b.name]}",
                 )
 

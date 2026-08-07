@@ -57,7 +57,16 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
         buffers.append(LifetimeBoundBuffer(f"b{i}", size, uses))
     for child_i in range(1, n):
         if rng.random() < 0.25:
-            parent = buffers[rng.randrange(child_i)]
+            # Only a parent that is read can hand its storage over: the child
+            # takes it at the parent's last use, so that use has to be a read.
+            # These are computed buffers (``first_use_is_read`` defaults False),
+            # so the first use is the write and a lone use means written-never-
+            # read -- a pair the allocator never emits and
+            # ``assert_in_place_parent_is_read`` rejects.
+            eligible = [b for b in buffers[:child_i] if len(b.uses) > 1]
+            if not eligible:
+                continue
+            parent = eligible[rng.randrange(len(eligible))]
             child = buffers[child_i]
             if parent.read_count == 0:
                 # A write-only parent has nothing to hand over, so the pair is
