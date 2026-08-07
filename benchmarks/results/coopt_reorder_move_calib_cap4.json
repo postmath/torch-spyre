@@ -1,0 +1,761 @@
+{
+ "softmax": {
+  "n": 5,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 12.200934687499887,
+    "secs": 0.0391565338941291,
+    "cpu": 0.03904299099999964,
+    "steps": 3200,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 13.09057593749996,
+    "secs": 0.04200144798960537,
+    "cpu": 0.04188984299999987,
+    "steps": 3200,
+    "probes_per_sweep": 3.7545454545454544,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0729158275809418,
+    "spb_grid": [
+     149,
+     597,
+     2386,
+     9544
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 13.087643750000073,
+    "secs": 0.04197737097274512,
+    "cpu": 0.04188046000000023,
+    "steps": 3200,
+    "probes_per_sweep": 3.707920792079208,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0726755027554273,
+    "spb_grid": [
+     149,
+     597,
+     2387,
+     9546
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 13.207714374999929,
+    "secs": 0.0423841099254787,
+    "cpu": 0.042264685999999774,
+    "steps": 3200,
+    "probes_per_sweep": 3.806167400881057,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0825166033001972,
+    "spb_grid": [
+     148,
+     591,
+     2365,
+     9459
+    ]
+   }
+  }
+ },
+ "rms_norm": {
+  "n": 6,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 11.033950260416642,
+    "secs": 0.04248541791457683,
+    "cpu": 0.04237036899999991,
+    "steps": 3840,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 13.608298958333343,
+    "secs": 0.05237250600475818,
+    "cpu": 0.05225586800000004,
+    "steps": 3840,
+    "probes_per_sweep": 4.885997521685254,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.2333116098186483,
+    "spb_grid": [
+     130,
+     519,
+     2076,
+     8303
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 14.514721093750067,
+    "secs": 0.05591687106061727,
+    "cpu": 0.05573652900000026,
+    "steps": 3840,
+    "probes_per_sweep": 4.885997521685254,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.3154600801328962,
+    "spb_grid": [
+     122,
+     487,
+     1946,
+     7784
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 13.237302864583384,
+    "secs": 0.05097343504894525,
+    "cpu": 0.05083124300000019,
+    "steps": 3840,
+    "probes_per_sweep": 4.900240384615385,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.1996884662486726,
+    "spb_grid": [
+     133,
+     533,
+     2134,
+     8536
+    ]
+   }
+  }
+ },
+ "mlp": {
+  "n": 7,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 12.647773660714218,
+    "secs": 0.05679814494214952,
+    "cpu": 0.0566620259999997,
+    "steps": 4480,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9173228346456693,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 13.379372767857127,
+    "secs": 0.06007792102172971,
+    "cpu": 0.05993958999999993,
+    "steps": 4480,
+    "probes_per_sweep": 5.61214953271028,
+    "evals_per_sweep": 1.0186915887850467,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0578441017975646,
+    "spb_grid": [
+     151,
+     605,
+     2420,
+     9680
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 14.599546651785705,
+    "secs": 0.06559715699404478,
+    "cpu": 0.06540596899999995,
+    "steps": 4480,
+    "probes_per_sweep": 5.61214953271028,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.154317514167254,
+    "spb_grid": [
+     139,
+     554,
+     2218,
+     8871
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 13.625197544642793,
+    "secs": 0.06118772306945175,
+    "cpu": 0.06104088499999971,
+    "steps": 4480,
+    "probes_per_sweep": 5.612903225806452,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0772803111558353,
+    "spb_grid": [
+     149,
+     594,
+     2376,
+     9505
+    ]
+   }
+  }
+ },
+ "swiglu": {
+  "n": 8,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 15.841296289062502,
+    "secs": 0.08130929595790803,
+    "cpu": 0.081107437,
+    "steps": 5120,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9413919413919414,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 16.54636132812507,
+    "secs": 0.08491702796891332,
+    "cpu": 0.08471737000000035,
+    "steps": 5120,
+    "probes_per_sweep": 6.856031128404669,
+    "evals_per_sweep": 1.0038910505836576,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0445080393799195,
+    "spb_grid": [
+     153,
+     613,
+     2451,
+     9804
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 17.112687695312445,
+    "secs": 0.08785282296594232,
+    "cpu": 0.08761696099999972,
+    "steps": 5120,
+    "probes_per_sweep": 6.856031128404669,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0802580409488185,
+    "spb_grid": [
+     148,
+     592,
+     2370,
+     9479
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 16.678005664062454,
+    "secs": 0.08559269004035741,
+    "cpu": 0.08539138899999976,
+    "steps": 5120,
+    "probes_per_sweep": 6.933852140077821,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.052818239096863,
+    "spb_grid": [
+     152,
+     608,
+     2432,
+     9726
+    ]
+   }
+  }
+ },
+ "simple_attn": {
+  "n": 9,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 16.156749131944483,
+    "secs": 0.0933043269906193,
+    "cpu": 0.09306287500000021,
+    "steps": 5760,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.79,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 18.11620798611117,
+    "secs": 0.10458913503680378,
+    "cpu": 0.10434935800000034,
+    "steps": 5760,
+    "probes_per_sweep": 7.947712418300654,
+    "evals_per_sweep": 1.2222222222222223,
+    "reorder_accept": 0.9722222222222222,
+    "cost_ratio": 1.1212780391751285,
+    "spb_grid": [
+     143,
+     571,
+     2283,
+     9132
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 18.810578125000003,
+    "secs": 0.10859246703330427,
+    "cpu": 0.10834893000000001,
+    "steps": 5760,
+    "probes_per_sweep": 7.975165562913907,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9685430463576159,
+    "cost_ratio": 1.1642551339618483,
+    "spb_grid": [
+     137,
+     550,
+     2199,
+     8795
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 17.85171180555545,
+    "secs": 0.10311314801219851,
+    "cpu": 0.10282585999999938,
+    "steps": 5760,
+    "probes_per_sweep": 7.874149659863946,
+    "evals_per_sweep": 1.1547619047619047,
+    "reorder_accept": 0.9778911564625851,
+    "cost_ratio": 1.1049074080292398,
+    "spb_grid": [
+     145,
+     579,
+     2317,
+     9268
+    ]
+   }
+  }
+ },
+ "sdpa": {
+  "n": 25,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 40.08236375000002,
+    "secs": 0.6428796869004145,
+    "cpu": 0.6413178200000003,
+    "steps": 16000,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.8018018018018018,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 42.54988337500004,
+    "secs": 0.682791896048002,
+    "cpu": 0.6807981340000007,
+    "steps": 16000,
+    "probes_per_sweep": 23.581204379562045,
+    "evals_per_sweep": 1.187043795620438,
+    "reorder_accept": 0.9917883211678832,
+    "cost_ratio": 1.0615612302804878,
+    "spb_grid": [
+     151,
+     603,
+     2412,
+     9646
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 45.60076725000001,
+    "secs": 0.731576703954488,
+    "cpu": 0.7296122760000001,
+    "steps": 16000,
+    "probes_per_sweep": 23.581204379562045,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9917883211678832,
+    "cost_ratio": 1.1376765984765553,
+    "spb_grid": [
+     141,
+     563,
+     2250,
+     9001
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 41.75272356249993,
+    "secs": 0.6697439550189301,
+    "cpu": 0.6680435769999988,
+    "steps": 16000,
+    "probes_per_sweep": 23.51241134751773,
+    "evals_per_sweep": 1.1418439716312057,
+    "reorder_accept": 0.9946808510638298,
+    "cost_ratio": 1.041673186315014,
+    "spb_grid": [
+     154,
+     614,
+     2458,
+     9830
+    ]
+   }
+  }
+ },
+ "block_x2": {
+  "n": 28,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 34.75103381696424,
+    "secs": 0.6245568619342521,
+    "cpu": 0.6227385259999991,
+    "steps": 17920,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9838383838383838,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 37.64456897321435,
+    "secs": 0.6771390739595518,
+    "cpu": 0.6745906760000011,
+    "steps": 17920,
+    "probes_per_sweep": 26.981081081081083,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0832647216048459,
+    "spb_grid": [
+     148,
+     591,
+     2363,
+     9453
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 40.40435033482141,
+    "secs": 0.7258870200021192,
+    "cpu": 0.7240459579999996,
+    "steps": 17920,
+    "probes_per_sweep": 26.981081081081083,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.1626805276537535,
+    "spb_grid": [
+     138,
+     550,
+     2202,
+     8807
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 36.31570574776782,
+    "secs": 0.6526219520019367,
+    "cpu": 0.6507774469999994,
+    "steps": 17920,
+    "probes_per_sweep": 26.97679180887372,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.045025190877624,
+    "spb_grid": [
+     153,
+     612,
+     2450,
+     9799
+    ]
+   }
+  }
+ },
+ "block_x3": {
+  "n": 42,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 49.00741019345241,
+    "secs": 1.3211399990832433,
+    "cpu": 1.3173191860000006,
+    "steps": 26880,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9925268566090611,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 52.560698400297554,
+    "secs": 1.4161587569396943,
+    "cpu": 1.4128315729999983,
+    "steps": 26880,
+    "probes_per_sweep": 40.994881340158216,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0725051210177983,
+    "spb_grid": [
+     149,
+     597,
+     2387,
+     9548
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 58.216363988095175,
+    "secs": 1.5684311670484021,
+    "cpu": 1.5648558639999983,
+    "steps": 26880,
+    "probes_per_sweep": 40.99314442413163,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.187909415296406,
+    "spb_grid": [
+     135,
+     539,
+     2155,
+     8620
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 51.97256677827378,
+    "secs": 1.4002581300446764,
+    "cpu": 1.3970225949999993,
+    "steps": 26880,
+    "probes_per_sweep": 40.99439252336449,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0605042497270654,
+    "spb_grid": [
+     151,
+     603,
+     2414,
+     9656
+    ]
+   }
+  }
+ },
+ "flash_attention": {
+  "n": 43,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 40.19053880813948,
+    "secs": 1.1085588739952073,
+    "cpu": 1.1060436279999983,
+    "steps": 27520,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9624368686868687,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 44.84124349563953,
+    "secs": 1.2368544019991532,
+    "cpu": 1.2340310209999998,
+    "steps": 27520,
+    "probes_per_sweep": 40.22204724409449,
+    "evals_per_sweep": 1.0138582677165355,
+    "reorder_accept": 0.9996850393700787,
+    "cost_ratio": 1.115716405537668,
+    "spb_grid": [
+     143,
+     574,
+     2294,
+     9178
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 53.62249742005831,
+    "secs": 1.4793765150243416,
+    "cpu": 1.4756911290000048,
+    "steps": 27520,
+    "probes_per_sweep": 39.93944148101663,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.3342069803054881,
+    "spb_grid": [
+     120,
+     480,
+     1919,
+     7675
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 43.56312180232554,
+    "secs": 1.2021540839923546,
+    "cpu": 1.198857111999999,
+    "steps": 27520,
+    "probes_per_sweep": 41.03022670025189,
+    "evals_per_sweep": 1.0031486146095718,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0839148489719435,
+    "spb_grid": [
+     148,
+     590,
+     2362,
+     9447
+    ]
+   }
+  }
+ },
+ "block_x4": {
+  "n": 56,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 61.90292536272314,
+    "secs": 2.2243969140108675,
+    "cpu": 2.2186008449999974,
+    "steps": 35840,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9976517946997652,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 66.29472840401773,
+    "secs": 2.382203799090348,
+    "cpu": 2.3760030659999956,
+    "steps": 35840,
+    "probes_per_sweep": 54.9958932238193,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0709466154557417,
+    "spb_grid": [
+     149,
+     598,
+     2390,
+     9562
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 74.96016651785715,
+    "secs": 2.693754934007302,
+    "cpu": 2.686572368,
+    "steps": 35840,
+    "probes_per_sweep": 54.9958932238193,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.2109309225472702,
+    "spb_grid": [
+     132,
+     529,
+     2114,
+     8456
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 65.21576953124985,
+    "secs": 2.343679280951619,
+    "cpu": 2.3373331799999946,
+    "steps": 35840,
+    "probes_per_sweep": 54.996562392574766,
+    "evals_per_sweep": 1.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0535167627234892,
+    "spb_grid": [
+     152,
+     607,
+     2430,
+     9720
+    ]
+   }
+  }
+ },
+ "flash_big": {
+  "n": 79,
+  "arms": {
+   "random": {
+    "cpu_per_step_us": 83.99049827927216,
+    "secs": 4.258322280016728,
+    "cpu": 4.246559593000001,
+    "steps": 50560,
+    "probes_per_sweep": 0.0,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 0.9691170898067449,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     160,
+     640,
+     2560,
+     10240
+    ]
+   },
+   "sweep-q": {
+    "cpu_per_step_us": 91.92637608781642,
+    "secs": 4.660261043929495,
+    "cpu": 4.6477975749999985,
+    "steps": 50560,
+    "probes_per_sweep": 77.01183987972186,
+    "evals_per_sweep": 1.007705318549145,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0944854236030022,
+    "spb_grid": [
+     146,
+     585,
+     2339,
+     9356
+    ]
+   },
+   "sweep-s": {
+    "cpu_per_step_us": 118.1073752966772,
+    "secs": 5.991843694937415,
+    "cpu": 5.9715088949999995,
+    "steps": 50560,
+    "probes_per_sweep": 76.99031116079746,
+    "evals_per_sweep": 0.0,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.40619924534755,
+    "spb_grid": [
+     114,
+     455,
+     1821,
+     7282
+    ]
+   },
+   "sweep-q-unbi": {
+    "cpu_per_step_us": 91.57918736155061,
+    "secs": 4.643519127974287,
+    "cpu": 4.630243712999999,
+    "steps": 50560,
+    "probes_per_sweep": 77.3560382916053,
+    "evals_per_sweep": 1.010861561119293,
+    "reorder_accept": 1.0,
+    "cost_ratio": 1.0903517568980925,
+    "spb_grid": [
+     147,
+     587,
+     2348,
+     9391
+    ]
+   }
+  }
+ }
+}
