@@ -627,12 +627,10 @@ class ScheduleTest(TestCase):
         # *reverses*: the sweep lifts ``crude`` far more than ``reheating`` --
         # 41.44M -> 35.10M on flash_attention against 41.38M -> 41.26M -- so crude
         # wins the aggregate. See ``test_sweep_reverses_the_schedule_ordering``,
-        # which pins that finding; the likely cause is that reheating's
-        # ``reorder`` acceptance band (0.6, 0.02) is unreachable for a move whose
-        # realized acceptance never drops below ~0.96, so its self-calibration
-        # cools a move that was never rejecting. Retuning the bands for the sweep
-        # is the open Phase-5 follow-up; until then this keeps testing the claim
-        # on the configuration it was made for rather than silently inverting it.
+        # which pins that finding and explains the (geometric, not feedback)
+        # cause. Retuning the schedule for the sweep is the open Phase-5
+        # follow-up; until then this keeps testing the claim on the configuration
+        # it was made for rather than silently inverting it.
         total_reheat = total_crude = 0
         strictly_better = False
         for case, gi, buffers in _all_cases():
@@ -656,13 +654,18 @@ class ScheduleTest(TestCase):
         aggregate -- the opposite of ``test_reheating_beats_crude_overall``.
 
         Pinned deliberately. The sweep is a much stronger reorder, and ``crude``
-        (fixed proposal weights, one geometric cool) converts that into a large
-        win, while ``reheating`` barely moves: its ``reorder`` acceptance band is
-        (0.6, 0.02), but the realized acceptance rate under any reorder variant
-        sits at 0.96-1.00, so the band is unreachable and the self-calibration
-        spends the run cooling a move that is not rejecting. Retuning the bands
-        for the sweep is the open follow-up; this test fails the day that lands,
-        which is exactly when someone should revisit both assertions.
+        (fixed weights, one geometric cool to ``t0 / 1000``) converts that into a
+        large win while ``reheating`` barely moves.
+
+        The cause is the band's *geometry*, not any acceptance feedback --
+        ``SelfCalibratingReheatingSchedule.update`` ignores its ``accepted``
+        argument. A band ``(hi, lo)`` only fixes the temperature range in units of
+        the streamed move scale ``d_hat``: top ``d_hat / -ln(hi)``, bottom
+        ``d_hat / -ln(lo)``. The shipped ``reorder`` band (0.6, 0.02) thus cycles
+        between 1.96*d_hat and 0.256*d_hat and never reaches a cold, near-greedy
+        phase, which is precisely what a strong reorder move exploits. Retuning is
+        the open follow-up; this test fails the day it lands, which is exactly
+        when both assertions should be revisited.
         """
         total_reheat = total_crude = 0
         for case, gi, buffers in _all_cases():
@@ -676,11 +679,18 @@ class ScheduleTest(TestCase):
         self.assertLess(total_crude, total_reheat)
 
     def test_reorder_acceptance_rate_overshoots_its_band(self):
-        """The band mismatch behind the reversal above, asserted directly: the
-        realized ``reorder`` acceptance rate sits far above the schedule's
-        ``accept_hi``. The objective only prices *spilled* buffers, so it is a
-        coarse step function of ``pi`` that most rotations leave unchanged -- a
-        zero delta is always accepted, and no amount of cooling changes that."""
+        """The realized ``reorder`` acceptance rate sits far above the band's
+        ``accept_hi``, under every reorder variant.
+
+        Not the cause of the reversal above -- the band is geometry, not a
+        control loop, so nothing is trying to hold the rate inside it. It is
+        pinned because it characterizes the *objective*: only spilled buffers are
+        priced, making the score a coarse step function of ``pi`` that most
+        rotations leave exactly unchanged. A zero delta is accepted
+        unconditionally, so the floor on the acceptance rate is
+        ``P(delta <= 0)``, which no temperature can lower. That is also why
+        ranking the sweep by the packer's continuous ``quality()`` beats ranking
+        it by the objective itself."""
         accept_hi = _DEFAULT_MOVE_BANDS["reorder"][0]
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)

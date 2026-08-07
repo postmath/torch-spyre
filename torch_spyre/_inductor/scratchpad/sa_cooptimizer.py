@@ -171,6 +171,19 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             acceptance runs at 96-100%); the continuous quality breaks ties among
             those score-identical positions and steers the layout toward states a
             later structural move can exploit.
+        reorder_neighborhood_scale: multiplier on ``reorder``'s neighborhood size
+            in the reheating schedule's cycle-phase proposal mix (§5.4). Exists
+            for investigation, **not** as a tuning recommendation: leave it at 1.
+
+            The mix weights each move by its neighborhood, and ``reorder``'s
+            (``n``) is dwarfed by the flip/recolor menus, so reheating spends only
+            7-12% of its proposals on reorder against ``crude``'s ~50%. That is
+            why the (much stronger) sweep pays off far less under reheating. But
+            raising this does *not* recover the difference: a sweep over
+            1..32 x 2 cycle counts found arms at -2.5 to -2.8% whose advantage
+            then collapsed to within noise on held-out seeds, while ``crude``'s
+            ~3.3% lead replicated. See ``benchmarks/coopt_band_retune_scale.md``
+            and ``..._validate.md``.
         sweep_biased_i: bias the sweep's choice of which buffer to lift toward
             ones that are not fully allocated (the layout-only annealer's
             weighting). Carries a real part of the win -- turning it off erases
@@ -200,6 +213,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
         reorder_move: str = "sweep_quality",
+        reorder_neighborhood_scale: float = 1.0,
         sweep_biased_i: bool = True,
         sweep_cleanup: bool = False,
         nested: bool = False,
@@ -235,6 +249,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
         self._reorder_move = reorder_move
+        if reorder_neighborhood_scale <= 0.0:
+            raise ValueError("reorder_neighborhood_scale must be > 0")
+        self._reorder_neighborhood_scale = reorder_neighborhood_scale
         self._sweep_biased_i = sweep_biased_i
         self._sweep_cleanup = sweep_cleanup
         # Per-step sweep cost instrumentation (populated only by the sweep
@@ -1045,7 +1062,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # (n_regions x n_colors, with the anchor's non-trivial menu size as
         # n_colors, §7.2).
         self._neighborhoods = {
-            "reorder": n,
+            "reorder": n * self._reorder_neighborhood_scale,
             "flip": sum(
                 len(self._bufs[i].core_divisions) - 1 for i in self._flippable_ops
             ),
