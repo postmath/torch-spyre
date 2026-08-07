@@ -38,7 +38,13 @@ import sys
 import unittest
 from unittest import TestCase
 
-from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+    _DEFAULT_MOVE_BANDS,
+    SaCoOptimizingSolver,
+)
+from torch_spyre._inductor.scratchpad.permutation_layout import (
+    make_permutation_packer,
+)
 
 from tests.inductor.cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -615,8 +621,50 @@ class ScheduleTest(TestCase):
         # flash_attention capture) while the aggregate still favors reheating. That
         # per-graph regression is a Phase-5 schedule-tuning signal, not a bug, so
         # the test tracks the honest aggregate claim.
+        #
+        # Pinned to ``reorder_move="random"``, the move the §5.1 claim was
+        # measured against. Under the (now default) best-first sweep the ordering
+        # *reverses*: the sweep lifts ``crude`` far more than ``reheating`` --
+        # 41.44M -> 35.10M on flash_attention against 41.38M -> 41.26M -- so crude
+        # wins the aggregate. See ``test_sweep_reverses_the_schedule_ordering``,
+        # which pins that finding; the likely cause is that reheating's
+        # ``reorder`` acceptance band (0.6, 0.02) is unreachable for a move whose
+        # realized acceptance never drops below ~0.96, so its self-calibration
+        # cools a move that was never rejecting. Retuning the bands for the sweep
+        # is the open Phase-5 follow-up; until then this keeps testing the claim
+        # on the configuration it was made for rather than silently inverting it.
         total_reheat = total_crude = 0
         strictly_better = False
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            r = SaCoOptimizingSolver(
+                cap, 128, seed=0, schedule="reheating", reorder_move="random"
+            )
+            r.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            c = SaCoOptimizingSolver(
+                cap, 128, seed=0, schedule="crude", reorder_move="random"
+            )
+            c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            total_reheat += r.best_score
+            total_crude += c.best_score
+            strictly_better = strictly_better or r.best_score < c.best_score
+        self.assertLess(total_reheat, total_crude)
+        self.assertTrue(strictly_better, "reheating never beat crude on any graph")
+
+    def test_sweep_reverses_the_schedule_ordering(self):
+        """Under the default best-first sweep, ``crude`` beats ``reheating`` in
+        aggregate -- the opposite of ``test_reheating_beats_crude_overall``.
+
+        Pinned deliberately. The sweep is a much stronger reorder, and ``crude``
+        (fixed proposal weights, one geometric cool) converts that into a large
+        win, while ``reheating`` barely moves: its ``reorder`` acceptance band is
+        (0.6, 0.02), but the realized acceptance rate under any reorder variant
+        sits at 0.96-1.00, so the band is unreachable and the self-calibration
+        spends the run cooling a move that is not rejecting. Retuning the bands
+        for the sweep is the open follow-up; this test fails the day that lands,
+        which is exactly when someone should revisit both assertions.
+        """
+        total_reheat = total_crude = 0
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
             r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
@@ -625,9 +673,22 @@ class ScheduleTest(TestCase):
             c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
             total_reheat += r.best_score
             total_crude += c.best_score
-            strictly_better = strictly_better or r.best_score < c.best_score
-        self.assertLess(total_reheat, total_crude)
-        self.assertTrue(strictly_better, "reheating never beat crude on any graph")
+        self.assertLess(total_crude, total_reheat)
+
+    def test_reorder_acceptance_rate_overshoots_its_band(self):
+        """The band mismatch behind the reversal above, asserted directly: the
+        realized ``reorder`` acceptance rate sits far above the schedule's
+        ``accept_hi``. The objective only prices *spilled* buffers, so it is a
+        coarse step function of ``pi`` that most rotations leave unchanged -- a
+        zero delta is always accepted, and no amount of cooling changes that."""
+        accept_hi = _DEFAULT_MOVE_BANDS["reorder"][0]
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            for move in ("random", "sweep_quality"):
+                s = SaCoOptimizingSolver(cap, 128, seed=0, reorder_move=move)
+                s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                rate = s.moves_accepted["reorder"] / s.moves_proposed["reorder"]
+                self.assertGreater(rate, accept_hi, f"{case} {move} rate={rate}")
 
     def test_per_move_acceptance_traces_recorded(self):
         # Every applicable move type is proposed and its accepted count is a valid
@@ -790,6 +851,183 @@ class LargeCaptureExperimentTest(TestCase):
                 f"  {case:16} {len(buffers):3d}  {r.best_score:12d}  "
                 f"{c.best_score:12d}  {d:+d} {tag}"
             )
+
+
+_SWEEP_ARMS = [
+    dict(reorder_move="sweep_quality"),
+    dict(reorder_move="sweep_score"),
+    dict(reorder_move="sweep_quality", sweep_biased_i=False),
+    dict(reorder_move="sweep_score", sweep_cleanup=True),
+]
+
+
+def _armed(buffers, cap, seed=0, **kwargs):
+    """A solver stopped just short of annealing: topology precomputed, seed state
+    built, per-step bookkeeping initialized. Lets a test drive one move directly.
+    """
+    s = SaCoOptimizingSolver(cap, 128, seed=seed, **kwargs)
+    s.spill_reasons = {}
+    zeros = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
+    s.moves_proposed = dict(zeros)
+    s.moves_accepted = dict(zeros)
+    s._ms_n = dict(zeros)
+    s._ms_sum = {k: 0.0 for k in zeros}
+    s._ms_sqsum = {k: 0.0 for k in zeros}
+    s.sweep_probes = s.sweep_evals = s.sweep_steps = 0
+    s._bufs = buffers
+    s._rng = rnd.Random(seed)
+    s._precompute_topology()
+    s.chosen = [0] * len(buffers)
+    s.packer = s._build_seed_packer()
+    s._best_score = s._score()
+    s._best_snap = s._snapshot()
+    return s
+
+
+def _score_after_rotate(s, i, j):
+    """The objective reached by rotating position ``i`` to ``j``, leaving ``s``
+    exactly as it was found."""
+    snap = s._snapshot()
+    s.packer.rotate(i, j)
+    value = s._score()
+    s._adopt(snap)  # a fresh snapshot is taken per call, so this transfer is safe
+    return value
+
+
+class SweepReorderMoveTest(TestCase):
+    """The layout-only annealer's best-first reinsertion move, ported to the joint
+    objective (``reorder_move="sweep_quality" | "sweep_score"``)."""
+
+    def test_rejects_unknown_reorder_move(self):
+        with self.assertRaises(ValueError):
+            SaCoOptimizingSolver(1024, 128, reorder_move="best_first")
+
+    def test_sweep_arms_hold_the_shape_invariants(self):
+        # The same contract every arm owes: a division and a spill reason or an
+        # address for every buffer, never worse than the seed, bit-reproducible.
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                for arm in _SWEEP_ARMS:
+                    tag = f"{case}[{gi}] cap={cap} {arm}"
+                    runs = []
+                    for _ in range(2):
+                        s = SaCoOptimizingSolver(cap, 128, seed=0, **arm)
+                        out = s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                        self.assertLessEqual(s.best_score, s.baseline_score, tag)
+                        for b in out:
+                            self.assertIsNotNone(b.chosen_division, f"{tag} {b.name}")
+                            if b.address is None:
+                                self.assertIn(
+                                    b.name, s.spill_reasons, f"{tag} {b.name}"
+                                )
+                            else:
+                                self.assertNotIn(b.name, s.spill_reasons, tag)
+                        runs.append((s.best_score, [b.chosen_division for b in out]))
+                    self.assertEqual(runs[0], runs[1], f"{tag} not deterministic")
+
+    def test_probe_walk_leaves_the_packer_consistent(self):
+        """The sweep walks the *live* packer and restores from the step snapshot,
+        so a bookkeeping slip would show up as incremental state that disagrees
+        with a packer rebuilt from scratch on the same permutation."""
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            for arm in _SWEEP_ARMS:
+                s = _armed(copy.deepcopy(buffers), cap, **arm)
+                if len(s._bufs) < 2:
+                    continue
+                cur = s._score()
+                for step in range(40):
+                    cur, _, _ = s._step_reorder_sweep(1000.0, cur)
+                    tag = f"{case}[{gi}] {arm} step={step}"
+                    # The returned running score must be the state's real score.
+                    self.assertEqual(cur, s._score(), tag)
+                    # And the incrementally-maintained placement must match a
+                    # from-scratch rebuild on the permutation it ended up with.
+                    sizes = [
+                        s._per_core_size(i, s.chosen[i]) for i in range(len(s._bufs))
+                    ]
+                    fresh = make_permutation_packer(
+                        s._lifetime_buffers(sizes),
+                        list(s.packer.permutation),
+                        s.limit,
+                        s.alignment,
+                        eligible=[s._eligible(i) for i in range(len(s._bufs))],
+                    )
+                    self.assertEqual(
+                        list(fresh.addresses), list(s.packer.addresses), tag
+                    )
+                    self.assertEqual(fresh.quality(), s.packer.quality(), tag)
+
+    def test_cold_sweep_lands_on_the_best_reinsertion(self):
+        """At a temperature that accepts nothing uphill, ``sweep_score`` must end
+        on the best-scoring reinsertion it probed -- that is what "best-first"
+        buys over one random sample."""
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            s = _armed(copy.deepcopy(buffers), cap, reorder_move="sweep_score")
+            n = len(s._bufs)
+            if n < 2:
+                continue
+            cur = s._score()
+            for step in range(25):
+                perm = s.packer.permutation
+                allocated = [s.packer.is_fully_allocated(perm[k]) for k in range(n)]
+                # Replay the source pick against a clone of the RNG so the brute
+                # force below targets the same buffer the step will lift.
+                probe_rng = copy.deepcopy(s._rng)
+                saved, s._rng = s._rng, probe_rng
+                i = s._choose_reinsertion_source(allocated)
+                s._rng = saved
+                upper = s._sweep_upper_bound(i, allocated)
+                brute = {
+                    j: _score_after_rotate(s, i, j) for j in range(upper + 1) if j != i
+                }
+                before = cur
+                cur, accepted, _ = s._step_reorder_sweep(1e-12, cur)
+                tag = f"{case}[{gi}] step={step} i={i}"
+                best = min(brute.values())
+                if best <= before:
+                    self.assertTrue(accepted, tag)
+                    self.assertEqual(cur, best, tag)
+                else:
+                    # Everything reachable is uphill and the temperature is cold,
+                    # so the step must decline and leave the score where it was.
+                    self.assertFalse(accepted, tag)
+                    self.assertEqual(cur, before, tag)
+
+    def test_monotonicity_bound_hides_no_better_position(self):
+        """The sweep inherits the layout-only annealer's bound: an unallocated
+        buffer is only probed up to the last allocated position + 1. Check on real
+        graphs that nothing past the bound would have scored better."""
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            s = _armed(copy.deepcopy(buffers), cap, reorder_move="sweep_score")
+            n = len(s._bufs)
+            if n < 2:
+                continue
+            cur = s._score()
+            for step in range(25):
+                perm = s.packer.permutation
+                allocated = [s.packer.is_fully_allocated(perm[k]) for k in range(n)]
+                for i in range(n):
+                    upper = s._sweep_upper_bound(i, allocated)
+                    if upper >= n - 1:
+                        continue  # unbounded; nothing was skipped
+                    inside = min(
+                        (
+                            _score_after_rotate(s, i, j)
+                            for j in range(upper + 1)
+                            if j != i
+                        ),
+                        default=cur,
+                    )
+                    for j in range(upper + 1, n):
+                        self.assertGreaterEqual(
+                            _score_after_rotate(s, i, j),
+                            inside,
+                            f"{case}[{gi}] step={step} i={i} j={j} beat the bound",
+                        )
+                cur, _, _ = s._step_reorder_sweep(1000.0, cur)
 
 
 if __name__ == "__main__":

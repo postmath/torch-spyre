@@ -145,6 +145,40 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         burst_fraction: layout-burst length as a fraction of the buffer count
             (Plan §4.4; the burst warms ``pi`` to the new footprints before the
             compound move is judged).
+        reorder_move: how a ``reorder`` proposal picks its reinsertion position.
+
+            * ``"sweep_quality"`` (default) -- the layout-only annealer's
+              best-first sweep: lift one buffer, probe every reinsertion
+              position, and try them in descending packer ``quality()`` order.
+            * ``"sweep_score"`` -- the same sweep ranked by the true objective at
+              every position. Exact, but it buys nothing over the proxy (see
+              below) while costing up to 1.4x per step.
+            * ``"random"`` -- the original single random ``(i, j)`` rotation,
+              retained as the A/B baseline.
+
+            The sweep is the default on benchmark evidence
+            (``benchmarks/coopt_reorder_move.md``): at matched *wall-clock* it is
+            better on every capture that discriminates between the two and worse
+            on none, by ~3% mean at capacity ``footprint//4`` (11 of 12
+            graph x budget cells, sign-test p = 0.003). It is affordable because
+            a sweep step costs only ~1.1x a random one -- per-step cost is
+            dominated by the O(n) state snapshot, while the n probes are
+            incremental packer swaps plus an O(1) quality read.
+
+            Ranking by ``quality()`` rather than the objective is deliberate. The
+            objective counts only *spilled* buffers, so it is a coarse step
+            function of ``pi`` that most rotations leave untouched (reorder
+            acceptance runs at 96-100%); the continuous quality breaks ties among
+            those score-identical positions and steers the layout toward states a
+            later structural move can exploit.
+        sweep_biased_i: bias the sweep's choice of which buffer to lift toward
+            ones that are not fully allocated (the layout-only annealer's
+            weighting). Carries a real part of the win -- turning it off erases
+            the sweep's advantage -- so it is on by default.
+        sweep_cleanup: run a placement-neutral tidy pass after an accepted sweep
+            rotation, sorting adjacent non-overlapping buffers into address
+            order. Off by default: it is O(n) swaps per accepted move with
+            quadratic worst-case backtracking, and it showed no benefit.
     """
 
     def __init__(
@@ -165,6 +199,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         flip_weight: float = 0.3,
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
+        reorder_move: str = "sweep_quality",
+        sweep_biased_i: bool = True,
+        sweep_cleanup: bool = False,
         nested: bool = False,
         inner_curve: str = "convex",
         inner_annealed: bool = False,
@@ -179,6 +216,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             raise ValueError("schedule must be 'reheating' or 'crude'")
         if inner_curve not in ("constant", "linear", "convex", "adaptive"):
             raise ValueError("inner_curve must be constant|linear|convex|adaptive")
+        if reorder_move not in ("random", "sweep_quality", "sweep_score"):
+            raise ValueError("reorder_move must be random|sweep_quality|sweep_score")
         self._seed = seed
         self._steps_per_buffer = steps_per_buffer
         self._min_steps = min_steps
@@ -195,6 +234,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
+        self._reorder_move = reorder_move
+        self._sweep_biased_i = sweep_biased_i
+        self._sweep_cleanup = sweep_cleanup
+        # Per-step sweep cost instrumentation (populated only by the sweep
+        # reorder): positions probed and candidates score-evaluated, so a
+        # benchmark can price a step without guessing at the acceptance depth.
+        self.sweep_probes = 0
+        self.sweep_evals = 0
+        self.sweep_steps = 0
         # Nested two-timescale mode (experimental): the outer loop anneals over
         # structure (flip/recolor) and each proposal runs an inner layout loop
         # whose length grows over the run; see :meth:`_anneal_nested`.
@@ -263,6 +311,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._ms_n = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self._ms_sum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
         self._ms_sqsum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
+        # Sweep-reorder cost counters, per solve (see :meth:`_step_reorder_sweep`).
+        self.sweep_probes = 0
+        self.sweep_evals = 0
+        self.sweep_steps = 0
         n = len(buffers)
         if n == 0:
             return list(buffers)
@@ -778,10 +830,175 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- annealing loop ------------------------------------------------------
 
+    def _choose_reinsertion_source(self, allocated: list[bool]) -> int:
+        """Pick the permutation *position* to lift out for a sweep reorder.
+
+        With ``sweep_biased_i`` this is the layout-only annealer's bias (weight
+        ``n`` for a fully-allocated buffer, ``n_allocated + 1`` for one that is
+        not): the buffers that miss LX are the ones the objective actually prices,
+        so they get sampled far above their share. Unbiased is the A/B control
+        that separates "sweep over j" from "bias over i".
+        """
+        n = len(allocated)
+        if not self._sweep_biased_i:
+            return self._rng.randrange(n)
+        n_allocated = sum(1 for a in allocated if a)
+        return self._rng.choices(
+            range(n), weights=[n if a else n_allocated + 1 for a in allocated]
+        )[0]
+
+    def _sweep_upper_bound(self, i: int, allocated: list[bool]) -> int:
+        """Highest reinsertion position worth probing for the buffer at position
+        ``i`` -- the layout-only annealer's monotonicity bound.
+
+        A buffer's address is non-decreasing in its position, so one that is
+        *not* legally allocated can only be made to fit by moving it earlier:
+        past the last legally-allocated position nothing it can reach changes the
+        outcome. A buffer that is allocated has no such bound and sweeps to the
+        end.
+        """
+        n = len(allocated)
+        if allocated[i]:
+            return n - 1
+        last = max((pos for pos, a in enumerate(allocated) if a), default=0)
+        return min(n - 1, last + 1)
+
+    def _step_reorder_sweep(
+        self, temperature: float, cur: int
+    ) -> tuple[int, bool, float]:
+        """One best-first reinsertion reorder, the layout-only annealer's move
+        (:meth:`SimulatedAnnealingLayoutSolver.annealing_step_rotate`) ported to
+        the joint objective. Same contract as :meth:`_step`.
+
+        Lift the buffer at position ``i`` out, probe every reinsertion position by
+        rotating it to 0 and bubbling it forward one adjacent swap at a time, then
+        try the positions **best-first**, accepting the first that clears the
+        Metropolis test. A random ``(i, j)`` rotation gets one blind sample of a
+        size-``n`` neighborhood; this sees the whole neighborhood and spends its
+        acceptance budget on the good end of it.
+
+        Two rankings, which is the point of the A/B:
+
+        - ``sweep_quality`` ranks by the packer's own ``quality()`` -- O(1) per
+          position, so the sweep is O(n) -- and pays a real ``_score()`` only for
+          the candidates it actually tries, in rank order. Quality is a *proxy*:
+          it weights a resident buffer by uses x size, where the objective prices
+          a spilled one by reads-served x size.
+        - ``sweep_score`` ranks by the true objective at every position, which is
+          exact but costs a rescore per probe.
+
+        The probe walks the live packer and restores from the step's own snapshot,
+        rather than sweeping a second copy: the step already pays one O(n) packer
+        copy, and placement is a pure function of the permutation, so the state
+        reached by rotate-to-``j`` is the same whichever intermediate positions the
+        walk passed through.
+        """
+        packer = self.packer
+        perm = packer.permutation
+        n = len(self._bufs)
+        allocated = [packer.is_fully_allocated(perm[k]) for k in range(n)]
+        i = self._choose_reinsertion_source(allocated)
+        upper = self._sweep_upper_bound(i, allocated)
+        exact = self._reorder_move == "sweep_score"
+
+        snap = self._snapshot()
+        self.moves_proposed["reorder"] += 1
+
+        # keys[p] ranks position p (higher is better); None = not a candidate.
+        # scores[p] caches the true objective there, which only the exact sweep
+        # knows for free.
+        keys: list[Optional[float]] = [None] * n
+        scores: list[Optional[int]] = [None] * n
+
+        def probe(p: int) -> None:
+            if exact:
+                scores[p] = self._score()
+                keys[p] = -float(scores[p])  # type: ignore[arg-type]
+            else:
+                keys[p] = packer.quality()
+
+        if i != 0:
+            packer.rotate(i, 0)
+            probe(0)
+        for p in range(1, upper + 1):
+            packer.swap(p - 1)  # bubble the lifted buffer from p-1 to p
+            if p != i:
+                probe(p)
+        pos = max(upper, 0)  # where the lifted buffer now sits
+
+        order = sorted(
+            (p for p, k in enumerate(keys) if k is not None),
+            key=lambda p: -keys[p],  # type: ignore[operator]
+        )
+        self.sweep_steps += 1
+        self.sweep_probes += len(order)
+
+        deltas: list[float] = []
+        for j in order:
+            if scores[j] is None:
+                packer.rotate(pos, j)
+                pos = j
+                scores[j] = self._score()
+                self.sweep_evals += 1
+            candidate = scores[j]
+            assert candidate is not None
+            delta = candidate - cur
+            if delta != 0:
+                deltas.append(float(abs(delta)))
+            # `or` short-circuits, so the RNG is drawn only when delta > 0.
+            if delta <= 0 or self._rng.random() < math.exp(-delta / temperature):
+                if pos != j:
+                    packer.rotate(pos, j)
+                self.moves_accepted["reorder"] += 1
+                cur = candidate
+                if self._sweep_cleanup:
+                    cur = self._reorder_cleanup()
+                if cur < self._best_score:
+                    self._best_score = cur
+                    self._best_snap = self._snapshot()
+                scale = sum(deltas) / len(deltas) if deltas else 0.0
+                self._record_move_scale("reorder", scale)
+                return cur, True, scale
+
+        self._adopt(snap)  # nothing accepted; this step's snapshot dies here
+        scale = sum(deltas) / len(deltas) if deltas else 0.0
+        self._record_move_scale("reorder", scale)
+        return cur, False, scale
+
+    def _reorder_cleanup(self) -> int:
+        """The layout-only annealer's post-rotation tidy pass
+        (:meth:`SimulatedAnnealingLayoutSolver.annealing_step_swap`), generalized
+        to sweep the whole permutation.
+
+        Swap any adjacent pair whose buffers do not overlap in time and sit in
+        decreasing address order. That is placement-neutral *now* -- neither
+        buffer can affect the other's address -- but it leaves the permutation in
+        a form from which a later rotation can reach states the unsorted order
+        could not. Returns the objective afterwards, read rather than assumed:
+        the invariant says quality is preserved, and the score is a different
+        functional of the same allocation set, so this stays honest if a swap ever
+        does move something.
+        """
+        packer = self.packer
+        perm = packer.permutation
+        n = len(perm)
+        top_or_inf = packer.top_or_inf
+        k = 0
+        while k < n - 1:
+            a, b = perm[k], perm[k + 1]
+            if (not packer.overlaps(a, b)) and top_or_inf(a) > top_or_inf(b):
+                packer.swap(k)
+                k = max(0, k - 1)  # the new pair below may now be out of order
+            else:
+                k += 1
+        return self._score()
+
     def _step(self, name: str, temperature: float, cur: int) -> tuple[int, bool, float]:
         """Execute one judged move: propose ``name``, apply the Metropolis test
         against ``temperature``, and update best-seen + instrumentation. Returns
         ``(new_cur, accepted, |dE|)``."""
+        if name == "reorder" and self._reorder_move != "random":
+            return self._step_reorder_sweep(temperature, cur)
         snap = self._snapshot()
         self._execute_move(name)
         self.moves_proposed[name] += 1
