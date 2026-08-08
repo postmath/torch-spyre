@@ -145,6 +145,42 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         burst_fraction: layout-burst length as a fraction of the buffer count
             (Plan §4.4; the burst warms ``pi`` to the new footprints before the
             compound move is judged).
+        node_term: add the cross-core reduction (PSUM-ring) cost of the chosen
+            divisions to the objective. **Off by default, and deliberately so.**
+
+            Today the objective is memory-only, so a division only matters if it
+            changes what fits in LX -- which is why four of the eleven captures
+            reach the objective's floor (all traffic from permanently-pinned
+            buffers) and can never distinguish any move set or schedule.
+
+            Enabling this prices the reduction half of the §6.3 node term, which
+            is computable from a buffer alone. The matmul half is not (it needs
+            the producing op's b/m/n/k extents and axis roles; see
+            :meth:`_precompute_node_costs`), and that asymmetry is the hazard:
+            the reduction term charges for splitting a reduction axis while the
+            matmul term that would *reward* splitting stays unmodelled. So this
+            is a one-sided objective, biased against reduction splits, and it is
+            an instrument for measuring whether a node term restores the corpus's
+            discriminating power -- not a better objective to solve against.
+            Landing the matmul half is what would make it a default.
+
+            Measured: enabling it does **not** restore discriminating power. The
+            search drives every reduction split to zero -- final node cost 0 on
+            all eleven captures, 0 ops keeping a split -- because a term that is
+            pure cost with no modelled reward has its minimum at "never split".
+            The same three graphs discriminate as before.
+
+            Deliberately a bool rather than a scale. The intended pairing is an
+            external cost model's matmul term (``macs / cores``), which supplies
+            the missing reward. Against *that* scale this term acts only as a
+            tie-breaker: that model reads neither ``reduction_cores`` nor, at
+            fixed core count, anything separating a K-split from an output split
+            (identical predictions for ``(m, n, k)`` of ``(8, 4, 1)``,
+            ``(8, 1, 4)`` and ``(4, 2, 4)``). Any positive coefficient therefore
+            yields the same decisions, so a magnitude is not identifiable from
+            the available evidence and a float knob would be false precision. It
+            stays at the hardware-fitted ``_PSUM_PER_CORE_ELEM_US``; add a scale
+            only if a K-split calibration ever makes one identifiable.
         reorder_move: how a ``reorder`` proposal picks its reinsertion position.
 
             * ``"sweep_quality"`` (default) -- the layout-only annealer's
@@ -212,6 +248,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         flip_weight: float = 0.3,
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
+        node_term: bool = False,
         reorder_move: str = "sweep_quality",
         reorder_neighborhood_scale: float = 1.0,
         sweep_biased_i: bool = True,
@@ -248,6 +285,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
+        self._node_term = node_term
+        # Set in _precompute_node_costs, which _precompute_topology calls.
+        self._node_costs: Optional[list[list[int]]] = None
         self._reorder_move = reorder_move
         if reorder_neighborhood_scale <= 0.0:
             raise ValueError("reorder_neighborhood_scale must be > 0")
@@ -408,6 +448,53 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._anchor_candidates = [i for i in range(n) if self._nontrivial_menu[i]]
         self._precompute_spill_costs()
 
+    def _precompute_node_costs(self) -> None:
+        """Table of ``node_costs[buffer][division]`` -- the cross-core reduction
+        (PSUM-ring) cost of choosing that division, in fixed-point time units.
+        ``None`` when the node term is off.
+
+        Only the *reduction* half of the §6.3 node term is expressible here. It
+        needs the reduction split (a product of ``reduction_splits`` values) and
+        the per-core output size -- a split factor and an output-side quantity,
+        both of which a buffer carries. The matmul half needs the producing op's
+        b/m/n/k iteration-space *extents* and axis roles; ``CoreDivision`` records
+        only how each axis is split, keyed by index coefficient, and the K extent
+        is contracted away entirely so no output-side quantity can recover it. See
+        the class docstring for what that asymmetry means for the search.
+
+        ``shared_weight`` is not recoverable from a buffer either; it only selects
+        between two PSUM coefficients, so this takes ``ReductionNode``'s default
+        (the shared-weight coefficient) rather than inventing a per-op answer.
+
+        The table is division-invariant, so :meth:`_score` stays a pair of list
+        walks rather than recomputing products in the hot loop.
+        """
+        if not self._node_term:
+            self._node_costs = None
+            return
+        elem = scorer.dtype_bytes()
+        table: list[list[int]] = []
+        for idx, buf in enumerate(self._bufs):
+            row = []
+            for div_idx in range(len(buf.core_divisions)):
+                cd = buf.core_divisions[div_idx]
+                split = math.prod(cd.reduction_splits.values())
+                if split <= 1:
+                    row.append(0)
+                    continue
+                row.append(
+                    scorer.node_cost_fixed(
+                        scorer.ReductionNode(
+                            reduction_split=split,
+                            output_elems_per_core=(
+                                self._per_core_size(idx, div_idx) // elem
+                            ),
+                        )
+                    )
+                )
+            table.append(row)
+        self._node_costs = table
+
     def _precompute_spill_costs(self) -> None:
         """Cache each buffer's spill cost and the HBM bandwidth constant for
         :meth:`_score`.
@@ -420,6 +507,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """
         self._spill_costs = [self._spill_cost(b) for b in self._bufs]
         self._hbm_bytes_per_us = scorer.hbm_bytes_per_us()
+        self._precompute_node_costs()
 
     # -- division-dependent derivations --------------------------------------
 
@@ -593,7 +681,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             if address is None
         )
         memory_fixed = scorer.to_fixed_us(traffic / self._hbm_bytes_per_us)
-        node_fixed = 0  # no op-kind metadata yet (Phase 6)
+        # Reduction (PSUM) node cost of the current division vector; 0 unless the
+        # node term is enabled. The matmul half stays unmodelled -- see
+        # :meth:`_precompute_node_costs`.
+        node_fixed = (
+            0
+            if self._node_costs is None
+            else sum(row[d] for row, d in zip(self._node_costs, self.chosen))
+        )
         return memory_fixed + node_fixed
 
     # -- moves ---------------------------------------------------------------
