@@ -68,7 +68,7 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
@@ -91,6 +91,9 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
 )
 from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 
@@ -249,6 +252,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
         node_term: bool = False,
+        cost_objective: Optional["BundleCostObjective"] = None,
         reorder_move: str = "sweep_quality",
         reorder_neighborhood_scale: float = 1.0,
         sweep_biased_i: bool = True,
@@ -286,6 +290,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
         self._node_term = node_term
+        self._cost_objective = cost_objective
         # Set in _precompute_node_costs, which _precompute_topology calls.
         self._node_costs: Optional[list[list[int]]] = None
         self._reorder_move = reorder_move
@@ -675,6 +680,18 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         The node term is zero until real op metadata is available (Phase 6); the
         scorer's fixed-point conversion keeps this deterministic.
         """
+        if self._cost_objective is not None:
+            # The cost model prices compute as well as traffic, so it replaces
+            # this objective rather than adding to it -- summing the two would
+            # double-count the HBM term, which the model already carries.
+            addresses = self.packer.addresses
+            resident = frozenset(
+                b.name
+                for b, address in zip(self._bufs, addresses)
+                if address is not None
+            )
+            return self._cost_objective.score(self.chosen, resident)
+
         traffic = sum(
             cost
             for cost, address in zip(self._spill_costs, self.packer.addresses)
@@ -793,6 +810,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         division vector."""
         return (self.packer.copy(), list(self.chosen))
 
+    def _invalidate_cost_objective(self) -> None:
+        """Tell the cost objective its diff baseline is stale.
+
+        Restoring a snapshot rewinds ``(pi, W)`` behind the objective's back; its
+        cached bundle *values* stay valid (they are keyed on state) but the
+        baseline it diffs against no longer describes the live state."""
+        if self._cost_objective is not None:
+            self._cost_objective.invalidate()
+
     def _adopt(self, snap: tuple[Packer, list[int]]) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those very objects and the caller
@@ -806,8 +832,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         subsequent mutation (``_best_snap``) needs :meth:`_restore_copy`.
         """
         self.packer, self.chosen = snap[0], snap[1]
+        self._invalidate_cost_objective()
 
-    def _restore_copy(self, snap: tuple[Packer, list[int]]) -> None:
+    def _restore_copy(self, snap: tuple[Packer, list[int]]) -> None:  # noqa: D401
         """Install a *copy* of ``snap`` as the live state, leaving ``snap``
         itself untouched and reusable.
 
@@ -820,6 +847,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         describes.
         """
         self.packer, self.chosen = snap[0].copy(), list(snap[1])
+        self._invalidate_cost_objective()
 
     def _calibrate_temperature(self) -> float:
         """A crude scale estimate: the *median* absolute score delta over a sample

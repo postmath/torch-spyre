@@ -40,6 +40,7 @@ applied at scoring time by :func:`with_residency`.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Optional
 
 from torch_spyre._inductor.cost_model import OpFeatures
