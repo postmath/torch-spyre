@@ -40,13 +40,8 @@ applied at scoring time by :func:`with_residency`.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
-from torch._inductor.ir import ComputedBuffer
-
-from torch_spyre._inductor import config
-from torch_spyre._inductor.constants import DEVICE_NAME
 from torch_spyre._inductor.cost_model import OpFeatures
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -97,70 +92,7 @@ def features_for_menu(op, divisions) -> list[Optional[OpFeatures]]:
     return [features_for_division(op, cd) for cd in divisions]
 
 
-def _is_fusable_operation(op) -> bool:
-    """The IR-operation analogue of ``fusion._is_fusable_node``.
-
-    A ``ComputedBuffer`` on the Spyre device is what becomes a fusable
-    ``SchedulerNode`` later; anything else -- an extern kernel, a fallback, a CPU
-    op -- forces a bundle boundary. This is an *estimate*: whether a given
-    operation ends up fused or extern is a scheduling decision that has not been
-    made yet at this point in the pipeline.
-    """
-    if not isinstance(op, ComputedBuffer):
-        return False
-    device = op.get_device()
-    return device is not None and device.type == DEVICE_NAME
-
-
-def estimate_bundles(operations: Sequence) -> list[list]:
-    """Estimate the SuperDSC bundles (fused kernels) ``operations`` will become.
-
-    The cost model scores one bundle at a time and bundle membership changes the
-    result -- external inputs are deduplicated across a bundle, the pointwise
-    arity derate counts its ops, the underfill derate takes its worst tile, and
-    the turnaround term uses its totals -- so the co-optimizer needs the grouping
-    to score anything faithfully.
-
-    It cannot ask for the real one. This runs in the last *pre-scheduling* pass,
-    where ``V.graph.scheduler`` is still ``None``; fusion is decided two stages
-    later by :func:`fusion.spyre_fuse_nodes`. What makes an estimate viable is
-    that the real rule is order-preserving and structural, so it is reproduced
-    here by sharing :func:`fusion.group_contiguous_fusable` and supplying the
-    IR-level predicate.
-
-    Returns groups of the input operations, in order, so ``[op.get_name() ...]``
-    per group gives the buffer names in each bundle.
-
-    Fusion can be off entirely (``config.bundle_symbolic_args``), in which case
-    the real pass leaves every node alone and this returns one bundle per
-    operation to match.
-
-    Accuracy, measured against the real grouping on a softmax graph (estimate at
-    allocator time vs. :func:`fusion.spyre_fuse_nodes` output at fusion time,
-    compared by written buffer name):
-
-    ==============  ==================  ==========================
-    ..              boundary bundle     fused bundle
-    ==============  ==================  ==========================
-    estimated       ``buf6``            ``buf0`` .. ``buf5``
-    actual          ``buf6`` (extern)   ``buf7``, ``buf0`` .. ``buf5``
-    ==============  ==================  ==========================
-
-    The bundle count, the run structure and the boundary placement all came out
-    right -- the extern kernel was correctly identified as a boundary. What the
-    estimate missed is ``buf7``, a ``SchedulerNode`` that does not exist in
-    ``graph.operations`` at this point because it is created later in scheduling.
-    So expect the shape to be right and the membership to under-count by any
-    nodes that scheduling introduces.
-    """
-    from torch_spyre._inductor.fusion import group_contiguous_fusable
-
-    if not config.bundle_symbolic_args:
-        return [[op] for op in operations]
-    return group_contiguous_fusable(list(operations), _is_fusable_operation)
-
-
-def with_residency(features: OpFeatures, lx_names: set[str]) -> OpFeatures:
+def with_residency(features: OpFeatures, lx_names: AbstractSet[str]) -> OpFeatures:
     """``features`` with each argument's ``is_lx`` set from ``lx_names``.
 
     The cost model charges an LX-resident argument no HBM traffic

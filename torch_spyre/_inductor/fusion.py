@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
+from torch._inductor.ir import ComputedBuffer
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
@@ -56,13 +57,13 @@ def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
     non-fusable entry its own single-element run.
 
     This is the *policy* behind :func:`spyre_fuse_nodes` -- one SuperDSC bundle
-    per maximal run of fusable ops, order preserved -- factored out so that the
-    co-optimizer, which must estimate the same grouping two stages earlier (from
-    IR operations, before any scheduler exists), shares it rather than carrying a
+    per maximal run of fusable ops, order preserved -- factored out so that
+    callers which must estimate the same grouping earlier in the pipeline (from
+    IR operations, before any scheduler exists) share it rather than carrying a
     copy that can drift. Callers differ only in ``is_fusable``, which is the
     irreducible difference: one sees scheduler nodes, the other IR operations.
 
-    See ``scratchpad/op_features.estimate_bundles`` for the early-stage caller.
+    See :func:`estimate_bundles` for the early-stage caller.
     """
     groups: list[list] = []
     run: list = []
@@ -100,3 +101,63 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if fused := _make_fused(group):
             fused_nodes.append(fused)
     return fused_nodes
+
+
+def _is_fusable_operation(op) -> bool:
+    """The IR-operation analogue of :func:`_is_fusable_node`.
+
+    A ``ComputedBuffer`` on the Spyre device is what becomes a fusable
+    ``SchedulerNode`` later; anything else -- an extern kernel, a fallback, a CPU
+    op -- forces a bundle boundary. This is an *estimate*: whether a given
+    operation ends up fused or extern is a scheduling decision that has not been
+    made yet at this point in the pipeline.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    device = op.get_device()
+    return device is not None and device.type == DEVICE_NAME
+
+
+def estimate_bundles(operations: Sequence) -> list[list]:
+    """Estimate the SuperDSC bundles (fused kernels) ``operations`` will become.
+
+    Callers that score a graph -- a cost model, for instance -- need the grouping
+    because bundle membership changes the result: external inputs are
+    deduplicated across a bundle, the pointwise arity derate counts its ops, and
+    the underfill derate takes its worst tile.
+
+    Such a caller cannot ask for the real grouping if it runs as a
+    *pre-scheduling* pass, where ``V.graph.scheduler`` is still ``None``; fusion
+    is decided two stages later by :func:`spyre_fuse_nodes`. What makes an
+    estimate viable is that the real rule is order-preserving and structural, so
+    it is reproduced here by sharing :func:`group_contiguous_fusable` and
+    supplying the IR-level predicate.
+
+    Returns groups of the input operations, in order, so ``[op.get_name() ...]``
+    per group gives the buffer names in each bundle.
+
+    Fusion can be off entirely (``config.bundle_symbolic_args``), in which case
+    the real pass leaves every node alone and this returns one bundle per
+    operation to match.
+
+    Accuracy, measured against the real grouping on a softmax graph (the estimate
+    vs. the :func:`spyre_fuse_nodes` output at fusion time, compared by written
+    buffer name):
+
+    ==============  ==================  =============================
+    ..              boundary bundle     fused bundle
+    ==============  ==================  =============================
+    estimated       ``buf6``            ``buf0`` .. ``buf5``
+    actual          ``buf6`` (extern)   ``buf7``, ``buf0`` .. ``buf5``
+    ==============  ==================  =============================
+
+    The bundle count, the run structure and the boundary placement all came out
+    right -- the extern kernel was correctly identified as a boundary. What the
+    estimate missed is ``buf7``, a ``SchedulerNode`` that does not exist in
+    ``graph.operations`` at this point because it is created later in scheduling.
+    So expect the shape to be right and the membership to under-count by any
+    nodes that scheduling introduces.
+    """
+    if not config.bundle_symbolic_args:
+        return [[op] for op in operations]
+    return group_contiguous_fusable(list(operations), _is_fusable_operation)
