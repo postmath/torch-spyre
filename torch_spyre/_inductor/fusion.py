@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
@@ -38,6 +40,45 @@ def _is_spyre_node(node: BaseSchedulerNode) -> bool:
     return device is not None and device.type == DEVICE_NAME
 
 
+def _is_fusable_node(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` may join the run being fused: a Spyre compute node.
+
+    Everything else -- fallback nodes, CPU nodes, extern kernels -- forces a
+    bundle boundary.
+    """
+    return isinstance(node, (SchedulerNode, CountedLoopSchedulerNode)) and (
+        _is_spyre_node(node)
+    )
+
+
+def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
+    """Split ``items`` into maximal contiguous runs of fusable entries, with each
+    non-fusable entry its own single-element run.
+
+    This is the *policy* behind :func:`spyre_fuse_nodes` -- one SuperDSC bundle
+    per maximal run of fusable ops, order preserved -- factored out so that the
+    co-optimizer, which must estimate the same grouping two stages earlier (from
+    IR operations, before any scheduler exists), shares it rather than carrying a
+    copy that can drift. Callers differ only in ``is_fusable``, which is the
+    irreducible difference: one sees scheduler nodes, the other IR operations.
+
+    See ``scratchpad/op_features.estimate_bundles`` for the early-stage caller.
+    """
+    groups: list[list] = []
+    run: list = []
+    for item in items:
+        if is_fusable(item):
+            run.append(item)
+            continue
+        if run:
+            groups.append(run)
+            run = []
+        groups.append([item])  # a boundary is its own bundle
+    if run:
+        groups.append(run)
+    return groups
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
@@ -51,23 +92,11 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         # exceed that slot count, so disable fusion when symbolic args are off.
         return nodes
 
+    # One bundle per maximal contiguous run of fusable nodes; a boundary node
+    # comes back as a single-element run, and ``_make_fused`` returns it
+    # unchanged, so this preserves the previous behaviour exactly.
     fused_nodes: list[BaseSchedulerNode] = []
-    cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
-
-    for n in nodes:
-        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(
-            n
-        ):
-            cur_nodes.append(n)
-        else:
-            # Non-Spyre nodes (Fallback nodes, CPU SchedulerNodes) force a
-            # bundle boundary.
-            if fused := _make_fused(cur_nodes):
-                fused_nodes.append(fused)
-            fused_nodes.append(n)
-            cur_nodes = []
-
-    if fused := _make_fused(cur_nodes):
-        fused_nodes.append(fused)
-
+    for group in group_contiguous_fusable(nodes, _is_fusable_node):
+        if fused := _make_fused(group):
+            fused_nodes.append(fused)
     return fused_nodes
