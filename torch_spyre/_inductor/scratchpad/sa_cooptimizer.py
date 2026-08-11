@@ -98,6 +98,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 
+
 # The packer is either the pure-Python solver or the native C++ solver; both
 # expose the same permutation-packer interface the co-optimizer drives, so
 # ``make_permutation_packer`` may return either. Use ``.quality()`` (not the
@@ -420,24 +421,41 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._parents_idx: list[set[int]] = [set() for _ in range(n)]
         # parent_idx -> list of (child_idx, frozenset of compatible (p_idx, c_idx))
         self._children: list[list[tuple[int, frozenset]]] = [[] for _ in range(n)]
+        foreign_parents = 0
         for c_idx, c in enumerate(bufs):
             for p_name in c.parents:
-                # Every parent resolves: the substrate builds ``parents`` by
-                # intersecting an op's reads with the solver's buffer set (reads of
-                # graph inputs / constants / externs are dropped), so
-                # ``parents ⊆ buffer set`` by construction. Assert it rather than
-                # silently skipping -- a miss would signal a coupling-surface change
-                # in the (in-flux) substrate branch (Plan §8.1), not stale input.
+                # A parent that is not a solver buffer is skipped, not asserted.
+                # This used to assert, on the premise that the substrate built
+                # ``parents`` by intersecting an op's reads with the solver's
+                # buffer set. It does not: ``_build_cd_bound_buffers`` assigns
+                # ``parents=info["op_inputs"]`` unfiltered, so graph inputs,
+                # constants and extern outputs appear here and the assert fired on
+                # 10 of the 11 corpus graphs -- i.e. on essentially every real
+                # compile. (The sibling in-place path in the same builder already
+                # guards this way, for the same reason.)
+                #
+                # Skipping is the correct semantics, not just the convenient one.
+                # The edge exists to gate a child's division against reading the
+                # parent's per-core slice *from LX*; a buffer the solver does not
+                # own is never LX-resident, so there is nothing to gate. Note this
+                # does not silently drop clone-eligible graph inputs -- those *are*
+                # solver buffers (``rms_norm`` owns ``arg0_1``) and resolve here
+                # normally.
                 p_idx = self._name_to_idx.get(p_name)
-                assert p_idx is not None, (
-                    f"parent {p_name!r} of {c.name!r} is not in the solver's "
-                    f"buffer set (unexpected substrate shape)"
-                )
+                if p_idx is None:
+                    foreign_parents += 1
+                    continue
                 self._parents_idx[c_idx].add(p_idx)
                 pairs = frozenset(
                     (int(a), int(b)) for a, b in c.cd_parent_matches.get(p_name, [])
                 )
                 self._children[p_idx].append((c_idx, pairs))
+        if foreign_parents:
+            logger.debug(
+                "dropped %d parent edge(s) naming buffers outside the solver's "
+                "set (graph inputs / constants / externs)",
+                foreign_parents,
+            )
 
         # Region-recolor support (Plan §7.2). ``_edge_pairs[(p, c)]`` is the
         # compatible ``(p_div, c_div)`` set on the edge p->c; ``_children_idx``

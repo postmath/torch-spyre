@@ -50,13 +50,14 @@ Run from the repo root, on a Spyre machine::
     python3 benchmarks/capture_op_features.py
     python3 benchmarks/capture_op_features.py --out /tmp/features.json --only mlp
 
-Note: the co-optimizing solver currently raises on a freshly compiled graph --
-``parent 'argN_1' of 'bufM' is not in the solver's buffer set`` -- because
+Note: the solve used to raise on every freshly compiled graph --
+``parent 'argN_1' of 'bufM' is not in the solver's buffer set``, because
 ``_build_cd_bound_buffers`` sets ``parents=info["op_inputs"]`` without
-intersecting the solver's buffer set, while ``SaCoOptimizingSolver._precompute_
-topology`` asserts that intersection holds. Capture only needs the buffers, which
-are built before that point, so the solve is allowed to fail and is recorded as
-``solver_error``.
+intersecting the solver's buffer set while ``_precompute_topology`` asserted that
+intersection held. The solver now skips such parents instead, so the solve
+succeeds; ``solver_error`` stays in the output because capture only needs the
+buffers (built before the solve) and must not lose a graph to an unrelated
+failure.
 """
 
 from __future__ import annotations
@@ -338,11 +339,13 @@ def _drop_foreign_parents(buffer_list):
 
     ``_build_cd_bound_buffers`` sets ``parents = info["op_inputs"]`` without
     intersecting the solver's buffer set, so an op's graph inputs appear there
-    even when they are not solver buffers -- which is exactly the assertion
-    ``SaCoOptimizingSolver._precompute_topology`` fails on (the ``solver_error``
-    this script tolerates). The historical corpus carries only in-set parents, so
-    filtering here both matches it and makes the capture solvable. Returns the
-    number of edges dropped, so the caller can report it rather than hide it.
+    even when they are not solver buffers.
+
+    The solver no longer needs this -- ``_precompute_topology`` skips unowned
+    parents rather than asserting on them -- so this is now about the *fixture*
+    rather than about solvability: the historical corpus records only in-set
+    edges, and filtering keeps a fresh capture directly comparable to it. Returns
+    the number of edges dropped, so the caller can report it rather than hide it.
     """
     owned = {b["name"] for b in buffer_list}
     dropped = 0

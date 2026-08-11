@@ -1070,5 +1070,37 @@ class SweepReorderMoveTest(TestCase):
                 cur, _, _ = s._step_reorder_sweep(1000.0, cur)
 
 
+class ForeignParentTest(TestCase):
+    """``parents`` naming buffers the solver does not own.
+
+    ``_build_cd_bound_buffers`` assigns ``parents = info["op_inputs"]`` without
+    intersecting the solver's buffer set, so graph inputs, constants and extern
+    outputs land there on a real compile. This used to assert, which made the
+    joint path unusable on 10 of the 11 corpus graphs.
+    """
+
+    def test_unowned_parent_is_skipped_not_asserted(self):
+        bufs = [
+            _cdbuf("A", [], {}),
+            _cdbuf("B", ["A", "arg0_1"], {"A": [(1, 1)], "arg0_1": [(1, 1)]}),
+        ]
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128, seed=0)
+        solver._precompute_topology()
+        # The owned edge survives; the unowned one leaves no trace behind.
+        self.assertEqual(solver._parents_idx[1], {0})
+        self.assertEqual(solver._children_idx[0], [1])
+        self.assertEqual(set(solver._edge_pairs), {(0, 1)})
+
+    def test_graph_with_only_unowned_parents_still_solves(self):
+        bufs = [
+            _cdbuf("A", ["arg0_1"], {"arg0_1": [(1, 1)]}),
+            _cdbuf("B", ["arg1_1"], {"arg1_1": [(2, 2)]}),
+        ]
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128, seed=0)
+        out = solver.plan_layout_and_core_divisions()
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(b.chosen_division is not None for b in out))
+
+
 if __name__ == "__main__":
     unittest.main()
