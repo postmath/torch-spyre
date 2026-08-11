@@ -50,6 +50,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import os
+import sys
 
 for _v in (
     "OPENBLAS_NUM_THREADS",
@@ -69,7 +70,18 @@ import multiprocessing as mp  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 
-from tests.inductor.cooptimization_capture_loader import load_captures  # noqa: E402
+# Importable both as ``python3 benchmarks/profile_x.py`` (sys.path[0] is
+# benchmarks/) and as ``python3 -m benchmarks.profile_x`` (sys.path[0] is the repo
+# root); the sibling module has to resolve either way.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
+from coopt_corpus import (  # noqa: E402
+    DEFAULT_SPB,
+    FRESH_SEED_BASE,
+    announce,
+    cost_objective_for,
+    foot as _foot,
+    load_graphs,
+)
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
     SaCoOptimizingSolver,
 )
@@ -77,7 +89,6 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
 _BENCH = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_BENCH)
 _RESULTS = os.path.join(_BENCH, "results")
-_LARGE = os.path.join(_REPO, "tests", "inductor", "cooptimization_captures_large.json")
 
 _CAP_DIVISOR_ENV = "COOPT_CAP_DIVISOR"
 # Suffix every artifact when the capacity is not the default, so a tighter-LX run
@@ -104,27 +115,30 @@ BASELINE = "random"
 
 # The incumbent's step-budget grid. It defines the wall-clock targets; every
 # other arm's grid is derived from the calibration so the times line up.
-BASE_SPB_GRID = [160, 640, 2560, 10240]
+# Grid retuned for the cost objective. These sweeps were designed when a step was
+# a packer update and ~20x cheaper; scoring now dominates it, so the old top
+# levels cost minutes per solve. They also buy nothing: the incumbent returns a
+# bit-identical score at every run length on 9 of 11 graphs (see
+# coopt_nested_ab.md), so the informative range is at and just above the default
+# budget, not two orders of magnitude past it. DEFAULT_SPB leads for the same
+# reason it does in the nested A/B -- a knob is decided where it will run.
+BASE_SPB_GRID = [DEFAULT_SPB, 160, 640]
 CALIB_SPB = 640
 # Scratchpad capacity as footprint // CAP_DIVISOR. 2 is what the sibling coopt
 # benchmarks use; a larger divisor tightens LX and keeps the easier captures from
 # saturating (at //2 nine of eleven reach the same score under every arm, which
 # leaves the move-set comparison resting on two graphs).
 CAP_DIVISOR = int(os.environ.get(_CAP_DIVISOR_ENV, "2"))
-SEEDS = [0, 1, 2, 3, 4]
+SEEDS = list(range(FRESH_SEED_BASE, FRESH_SEED_BASE + 5))
 WORKERS = 24
 
 _GRAPHS: dict = {}
 
 
-def _foot(bufs):
-    return sum(math.ceil(b.size / b.core_divisions[0].output_partition) for b in bufs)
-
-
 def _load_graphs():
-    g = {c: gs[0].buffers for c, gs in load_captures().items()}
-    g.update({c: gs[0].buffers for c, gs in load_captures(_LARGE).items()})
-    return g
+    """The corpus, keyed by graph name. Entries carry buffers + features +
+    bundles; see ``coopt_corpus`` for why the objective cannot be left implicit."""
+    return load_graphs()
 
 
 def _init_worker():
@@ -137,21 +151,21 @@ def _init_worker():
 
 def _solve(name, spb, config, seed):
     """One solve -> (best, baseline, seconds, cpu_seconds, steps, sweep counters)."""
-    bufs = _GRAPHS[name]
+    entry = _GRAPHS[name]
+    bufs = copy.deepcopy(entry["buffers"])
     n = len(bufs)
     cap = max(1, _foot(bufs) // CAP_DIVISOR)
     s = SaCoOptimizingSolver(
-        copy.deepcopy(bufs),
+        bufs,
         cap,
         128,
         seed=seed,
+        # Priced into the wall-clock calibration below, not bolted on after it:
+        # the cost objective is most of the per-step cost now, so an arm's
+        # spb grid must be derived with it in place or the arms are compared at
+        # matched *step* budgets while claiming matched time.
+        cost_objective=cost_objective_for(entry, bufs),
         steps_per_buffer=spb,
-        # The shipping ceiling (15_000) binds at spb 640 already for the larger
-        # captures, which would collapse the top grid levels into one identical
-        # run and flatten the right-hand end of the frontier. Lift it here so the
-        # spb grid actually traces distinct time budgets; where the default clamp
-        # sits is called out in the report instead.
-        max_steps=10**9,
         **CONFIGS[config],
     )
     t0, c0 = time.perf_counter(), time.process_time()
@@ -184,8 +198,8 @@ def run_calibration():
     _GRAPHS = _load_graphs()
     os.makedirs(_RESULTS, exist_ok=True)
     out: dict = {}
-    for name in sorted(_GRAPHS, key=lambda k: len(_GRAPHS[k])):
-        n = len(_GRAPHS[name])
+    for name in sorted(_GRAPHS, key=lambda k: len(_GRAPHS[k]["buffers"])):
+        n = len(_GRAPHS[name]["buffers"])
         out[name] = {"n": n, "arms": {}}
         for config in CONFIGS:
             # Two seeds, min-of: timing noise is one-sided, so the minimum is the
@@ -252,6 +266,7 @@ def run_sweep(smoke=False):
     if not os.path.exists(CALIB_JSON):
         raise SystemExit("run --calibrate first")
     calib = json.load(open(CALIB_JSON))
+    announce()
     if smoke:
         calib = {k: v for k, v in calib.items() if k in ("swiglu", "sdpa")}
     seeds = [0] if smoke else SEEDS

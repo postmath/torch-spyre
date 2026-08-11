@@ -42,6 +42,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import os
+import sys
 
 for _v in (
     "OPENBLAS_NUM_THREADS",
@@ -56,13 +57,22 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 import argparse  # noqa: E402
 import copy  # noqa: E402
 import json  # noqa: E402
-import math  # noqa: E402
 import multiprocessing as mp  # noqa: E402
 import random  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 
-from tests.inductor.cooptimization_capture_loader import load_captures  # noqa: E402
+# Importable both as ``python3 benchmarks/profile_x.py`` (sys.path[0] is
+# benchmarks/) and as ``python3 -m benchmarks.profile_x`` (sys.path[0] is the repo
+# root); the sibling module has to resolve either way.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
+from coopt_corpus import (  # noqa: E402
+    FRESH_SEED_BASE,
+    announce,
+    cost_objective_for,
+    foot as _foot,
+    load_graphs,
+)
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
     SaCoOptimizingSolver,
 )
@@ -70,7 +80,6 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
 _BENCH = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_BENCH)
 _RESULTS = os.path.join(_BENCH, "results")
-_LARGE = os.path.join(_REPO, "tests", "inductor", "cooptimization_captures_large.json")
 
 SWEEP_JSON = os.path.join(_RESULTS, "coopt_capacity_crossover.json")
 REPORT_MD = os.path.join(_BENCH, "coopt_capacity_crossover.md")
@@ -81,21 +90,17 @@ PNG = os.path.join(_RESULTS, "coopt_capacity_crossover.png")
 RATIOS = [0.80, 0.60, 0.50, 0.42, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10]
 MOVES = ["sweep_quality", "random"]
 SCHEDULES = ["crude", "reheating"]
-SPB = 640
-SEEDS = list(range(50, 70))
+SPB = 640  # one budget; the capacity axis is what this sweep varies
+SEEDS = list(range(FRESH_SEED_BASE, FRESH_SEED_BASE + 20))
 WORKERS = 24
 
 _GRAPHS: dict = {}
 
 
-def _foot(bufs):
-    return sum(math.ceil(b.size / b.core_divisions[0].output_partition) for b in bufs)
-
-
 def _load_graphs():
-    g = {c: gs[0].buffers for c, gs in load_captures().items()}
-    g.update({c: gs[0].buffers for c, gs in load_captures(_LARGE).items()})
-    return g
+    """The corpus, keyed by graph name. Entries carry buffers + features +
+    bundles; see ``coopt_corpus`` for why the objective cannot be left implicit."""
+    return load_graphs()
 
 
 def _init_worker():
@@ -107,15 +112,16 @@ def _init_worker():
 
 
 def _solve(name, ratio, move, schedule, seed):
-    bufs = _GRAPHS[name]
+    entry = _GRAPHS[name]
+    bufs = copy.deepcopy(entry["buffers"])
     cap = max(1, int(_foot(bufs) * ratio))
     s = SaCoOptimizingSolver(
-        copy.deepcopy(bufs),
+        bufs,
         cap,
         128,
+        cost_objective=cost_objective_for(entry, bufs),
         seed=seed,
         steps_per_buffer=SPB,
-        max_steps=10**9,
         schedule=schedule,
         reorder_move=move,
     )
@@ -130,6 +136,7 @@ def _work(task):
 
 def run_sweep(smoke=False):
     graphs = _load_graphs()
+    announce()
     names = ["sdpa", "flash_attention"] if smoke else list(graphs)
     ratios = [0.5, 0.25] if smoke else RATIOS
     seeds = SEEDS[:2] if smoke else SEEDS
@@ -152,7 +159,9 @@ def run_sweep(smoke=False):
             _work, tasks, chunksize=1
         ):
             cell = (
-                results.setdefault(name, {"n": len(graphs[name]), "cells": {}})["cells"]
+                results.setdefault(
+                    name, {"n": len(graphs[name]["buffers"]), "cells": {}}
+                )["cells"]
                 .setdefault(f"{ratio}|{mv}", {})
                 .setdefault(sch, {"best": [], "spill_frac": []})
             )

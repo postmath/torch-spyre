@@ -34,6 +34,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import os
+import sys
 
 # The SA solver is pure Python and never calls BLAS, but importing torch in each
 # of the many worker processes would otherwise spin up a full OpenBLAS/OMP thread
@@ -57,7 +58,18 @@ import multiprocessing as mp  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 
-from tests.inductor.cooptimization_capture_loader import load_captures  # noqa: E402
+# Importable both as ``python3 benchmarks/profile_x.py`` (sys.path[0] is
+# benchmarks/) and as ``python3 -m benchmarks.profile_x`` (sys.path[0] is the repo
+# root); the sibling module has to resolve either way.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
+from coopt_corpus import (  # noqa: E402
+    DEFAULT_SPB,
+    FRESH_SEED_BASE,
+    announce,
+    cost_objective_for,
+    foot as _foot,
+    load_graphs,
+)
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (  # noqa: E402
     SaCoOptimizingSolver,
 )
@@ -76,7 +88,6 @@ def _plt():
 _BENCH = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_BENCH)
 _RESULTS = os.path.join(_BENCH, "results")
-_LARGE = os.path.join(_REPO, "tests", "inductor", "cooptimization_captures_large.json")
 
 SWEEP_JSON = os.path.join(_RESULTS, "coopt_cycle_sweep.json")
 REPORT_MD = os.path.join(_BENCH, "coopt_cycle_sweep.md")
@@ -84,21 +95,24 @@ HEATMAP_PNG = os.path.join(_RESULTS, "coopt_cycle_heatmap.png")
 LINES_PNG = os.path.join(_RESULTS, "coopt_cycle_lines.png")
 
 CYCLES_GRID = [1, 2, 4, 8, 16]  # 1 = single long cool (no reheat) .. 16 short reheats
-SPB_GRID = [40, 160, 640, 2560, 10240]  # total run length (x n buffers)
-SEEDS = [0, 1, 2, 3, 4]
+# Grid retuned for the cost objective. These sweeps were designed when a step was
+# a packer update and ~20x cheaper; scoring now dominates it, so the old top
+# levels cost minutes per solve. They also buy nothing: the incumbent returns a
+# bit-identical score at every run length on 9 of 11 graphs (see
+# coopt_nested_ab.md), so the informative range is at and just above the default
+# budget, not two orders of magnitude past it. DEFAULT_SPB leads for the same
+# reason it does in the nested A/B -- a knob is decided where it will run.
+SPB_GRID = [DEFAULT_SPB, 160, 640]  # total run length (x n buffers)
+SEEDS = list(range(FRESH_SEED_BASE, FRESH_SEED_BASE + 5))
 WORKERS = 32
 
 _GRAPHS: dict = {}
 
 
-def _foot(bufs):
-    return sum(math.ceil(b.size / b.core_divisions[0].output_partition) for b in bufs)
-
-
 def _load_graphs():
-    g = {c: gs[0].buffers for c, gs in load_captures().items()}
-    g.update({c: gs[0].buffers for c, gs in load_captures(_LARGE).items()})
-    return g
+    """The corpus, keyed by graph name. Entries carry buffers + features +
+    bundles; see ``coopt_corpus`` for why the objective cannot be left implicit."""
+    return load_graphs()
 
 
 def _init_worker():
@@ -117,15 +131,20 @@ def _work(task):
     import copy
 
     name, spb, cycles, seed = task
-    bufs = _GRAPHS[name]
+    entry = _GRAPHS[name]
+    bufs = copy.deepcopy(entry["buffers"])
     cap = max(1, _foot(bufs) // 2)
-    kw = dict(seed=seed, steps_per_buffer=spb)
+    kw = dict(
+        seed=seed,
+        steps_per_buffer=spb,
+        cost_objective=cost_objective_for(entry, bufs),
+    )
     if cycles < 0:
         kw["schedule"] = "crude"
     else:
         kw["schedule"] = "reheating"
         kw["cycles"] = cycles
-    s = SaCoOptimizingSolver(copy.deepcopy(bufs), cap, 128, **kw)
+    s = SaCoOptimizingSolver(bufs, cap, 128, **kw)
     s.plan_layout_and_core_divisions()
     return task, s.best_score, s.baseline_score
 
@@ -141,6 +160,7 @@ def _tasks(graphs, cycles_grid, spb_grid, seeds):
 
 def run_sweep(smoke=False):
     graphs = _load_graphs()
+    announce()
     cyc_grid = [1, 4] if smoke else CYCLES_GRID
     spb_grid = [40, 160] if smoke else SPB_GRID
     seeds = [0] if smoke else SEEDS
@@ -150,7 +170,7 @@ def run_sweep(smoke=False):
     # results[name][spb] = {"n":, "baseline":, "crude":[best...], "cycles":{c:[best...]}}
     results: dict = {}
     for name in names:
-        results[name] = {"n": len(graphs[name]), "levels": {}}
+        results[name] = {"n": len(graphs[name]["buffers"]), "levels": {}}
     os.makedirs(_RESULTS, exist_ok=True)
 
     start = time.time()
@@ -306,37 +326,81 @@ def _plot_lines(cyc_grid, spb_grid, data):
     plt.close(fig)
 
 
-_CYCLE_HEADLINE = """## Headline finding
+def _cycle_headline(cyc_grid, spb_grid, data):
+    """Generate the headline from the results.
 
-**The cycle count only matters on the graphs where the schedule already mattered,
-and there the answer is "fewer cycles, more so at longer runs" -- the default
-`cycles=4` is mildly suboptimal.**
+    This section used to be a hand-written constant. It survived a re-run under a
+    different objective and corpus unchanged, still naming a run length the grid
+    no longer contains and a buffer count the corpus no longer has, while the
+    tables beneath it had moved. Numbers that describe a run belong to the run.
+    """
+    insensitive, sensitive, best_counts = [], [], {}
+    for name, r in data.items():
+        spreads = []
+        for spb in spb_grid:
+            lv = r["levels"].get(str(spb))
+            if not lv:
+                continue
+            per_cyc = {int(k): _mean(v) for k, v in lv["cycles"].items()}
+            if not per_cyc:
+                continue
+            lo, hi = min(per_cyc.values()), max(per_cyc.values())
+            spreads.append(100.0 * (hi - lo) / lo if lo else 0.0)
+            best_counts.setdefault(min(per_cyc, key=lambda k: per_cyc[k]), 0)
+            best_counts[min(per_cyc, key=lambda k: per_cyc[k])] += 1
+        if not spreads:
+            continue
+        (insensitive if max(spreads) < 0.005 else sensitive).append(
+            (name, r["n"], max(spreads))
+        )
 
-- **8 of 11 graphs are cycle-insensitive** (softmax, rms_norm, mlp, simple_attn,
-  sdpa, block_x2/x3/x4): every cycle count 1..16 lands the same score (0% spread).
-  Where both schedules already converge to the same optimum, splitting the budget
-  into more/fewer reheats changes nothing.
-- **flash_attention (n=43): fewer cycles is better, and the ranking sharpens with
-  run length.** At the longest run (spb 10240) it is monotonic: `cycles=1` -8.9%
-  vs crude, 2 -8.2%, 4 -7.0%, 8 -7.4%, 16 -5.7%. At short runs the best cycle
-  count is finicky and higher (2 at spb 40, 8 at spb 160) and `cycles=16` is even
-  *worse* than crude at spb 40 (+2%). So the optimal cycle count **depends on run
-  length** -- the product-space interaction the sweep set out to find.
-- **flash_big (n=79): same shape, noisier** (spreads 1-4%): `cycles=1` is best at
-  the longest run (-3.0%) but the surface is bumpy across seeds.
+    # Does the default (4) ever differ from the best available count?
+    default_gap = []
+    for name, r in data.items():
+        for spb in spb_grid:
+            lv = r["levels"].get(str(spb))
+            if not lv:
+                continue
+            per_cyc = {int(k): _mean(v) for k, v in lv["cycles"].items()}
+            if 4 not in per_cyc or not per_cyc:
+                continue
+            best = min(per_cyc.values())
+            if best and per_cyc[4] > best:
+                default_gap.append((name, spb, 100.0 * (per_cyc[4] - best) / best))
+    default_gap.sort(key=lambda t: -t[2])
 
-**Interpretation.** The reheating *cycling itself* is not where the schedule's win
-over crude comes from -- a single long cool (`cycles=1`, i.e. no reheating) already
-captures the full advantage (flash_attention -8.9% at the longest run). The gain
-is from the schedule's per-move self-calibrating bands + cycle-phase proposal mix;
-extra reheats mildly *disrupt* an otherwise-converging search at long budgets.
-**Actionable:** consider lowering the default `cycles` (4 -> 1-2), at least for
-larger graphs / longer budgets, or making it adaptive; the current 4 leaves ~2%
-on the table on the graphs that matter.
+    total = len(insensitive) + len(sensitive)
+    if not sensitive:
+        verdict = (
+            f"**The cycle count does not matter on this corpus.** All {total} "
+            f"graphs land the same score at every cycle count from "
+            f"{min(cyc_grid)} to {max(cyc_grid)}, at every run length in "
+            f"{spb_grid}. The default `cycles=4` is therefore free -- and so is "
+            f"any other value, which also means this sweep can no longer "
+            f"distinguish them and should not be cited as support for one."
+        )
+    else:
+        worst = ", ".join(
+            f"`{n}` at spb {s} ({d:+.2f}% off the best)" for n, s, d in default_gap[:3]
+        )
+        verdict = (
+            f"**The cycle count matters on {len(sensitive)} of {total} graphs "
+            f"({', '.join('`' + n + '`' for n, _, _ in sensitive)}), and nowhere "
+            f"else.** The default `cycles=4` is off the best available count in "
+            f"{len(default_gap)} (graph, run length) cells -- worst {worst}."
+        )
+    return f"""## Headline finding
 
-_Caveats: capacity = footprint//2; y is the SA fixed-point objective, not
-wall-clock; flash_big is noisy across seeds; cycle count only bites where the
-schedule is not already saturated._
+{verdict}
+
+Cycle-insensitive here means every count in {cyc_grid} lands within 0.005% at
+every run length -- a tie, not a narrow win. {len(insensitive)} of {total} graphs
+are in that state.
+
+_Caveats: capacity = footprint//2; y is the cost model's fixed-point prediction,
+not measured hardware time. A tie means the search reaches the same place by
+every schedule shape, which is a statement about this corpus as much as about the
+schedule._
 """
 
 
@@ -354,7 +418,7 @@ def write_report():
         "reheats. Heatmap cells are reheating-vs-crude % (blue/negative = reheating "
         "better).\n"
     )
-    out.append(_CYCLE_HEADLINE)
+    out.append(_cycle_headline(cyc_grid, spb_grid, data))
     out.append(f"![heatmap](results/{os.path.basename(HEATMAP_PNG)})\n")
     out.append(f"![lines](results/{os.path.basename(LINES_PNG)})\n")
     out.append("## Best cycle count per (graph, run length)\n")

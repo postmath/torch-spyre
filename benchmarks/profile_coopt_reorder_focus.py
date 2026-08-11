@@ -38,6 +38,7 @@ import time
 from benchmarks.profile_coopt_reorder_move import (  # noqa: E402
     CALIB_JSON,
     CONFIGS,
+    SWEEP_JSON as MAIN_JSON,
     _init_worker,
     _solve,
     _RESULTS,
@@ -45,13 +46,40 @@ from benchmarks.profile_coopt_reorder_move import (  # noqa: E402
     CAP_DIVISOR,
 )
 
-# The graphs that actually discriminate between arms. At capacity footprint//2
-# only these two do; tightening to //4 adds sdpa, so the focus set follows the
-# capacity. Everything else ties exactly under every arm at every budget and
-# would only dilute the comparison.
-FOCUS_GRAPHS = ["flash_attention", "flash_big"]
-if CAP_DIVISOR != 2:
-    FOCUS_GRAPHS = ["sdpa"] + FOCUS_GRAPHS
+
+def _focus_graphs():
+    """The graphs that actually discriminate between arms, read off the main A/B.
+
+    This used to be the hardcoded pair ``["flash_attention", "flash_big"]`` (plus
+    ``sdpa`` at tighter capacity), which was correct under the memory-only
+    objective: everything else tied exactly under every arm at every budget, so
+    focusing spent the seed budget where it could matter. Under the cost
+    objective far more graphs respond, and a hardcoded pair would now silently
+    discard most of the evidence -- the high-power check would be high-power over
+    the wrong cells.
+
+    So it is derived: any graph whose arms differ at all in the main sweep is in
+    scope. If that sweep has not been run, every graph is, which is slower and
+    never wrong.
+    """
+    try:
+        with open(MAIN_JSON) as fh:
+            main = json.load(fh)["results"]
+    except (OSError, KeyError, ValueError):
+        return sorted(json.load(open(CALIB_JSON)))
+    focus = []
+    for name, r in main.items():
+        scores = {
+            statistics.mean(cell["best"])
+            for arm in r.get("arms", {}).values()
+            for cell in arm.get("levels", {}).values()
+            if cell.get("best")
+        }
+        if len(scores) > 1:
+            focus.append(name)
+    return focus or sorted(json.load(open(CALIB_JSON)))
+
+
 SEEDS = list(range(20))
 # 24, matching the main A/B. A 48-worker pool stalled on this box without making
 # progress; the extra parallelism is not worth the flakiness for a run this size.
@@ -88,8 +116,9 @@ def _bootstrap_ci(a, b, iters=20000, seed=12345):
 
 def main():
     calib = json.load(open(CALIB_JSON))
+    focus = _focus_graphs()
     tasks = []
-    for name in FOCUS_GRAPHS:
+    for name in focus:
         for config in CONFIGS:
             for spb in calib[name]["arms"][config]["spb_grid"]:
                 for seed in SEEDS:
@@ -127,20 +156,21 @@ def main():
 
     # Report: for each (graph, incumbent level) compare each arm at the matched
     # spb its calibration assigned to that same time target.
-    named = ", ".join(f"`{g}`" for g in FOCUS_GRAPHS)
+    named = ", ".join(f"`{g}`" for g in focus)
     out = ["# Sweep vs random reorder: high-power check on the graphs that move\n"]
     out.append(
         f"{len(SEEDS)} seeds per cell (the main A/B used 5), capacity "
-        f"`footprint//{CAP_DIVISOR}`. Only {named} show any arm-to-arm difference "
-        f"at all; every other capture ties exactly under every arm at every budget, "
-        f"so including them would only dilute the comparison. `delta%` is the arm's "
-        f"mean score minus the incumbent's, as a percent of the incumbent's, with a "
-        f"95% percentile-bootstrap CI. Negative = the sweep is better.\n"
+        f"`footprint//{CAP_DIVISOR}`. Graphs in scope ({len(focus)}): {named} -- "
+        f"derived from the main sweep as the ones whose arms differ at all, not "
+        f"fixed in advance, because which graphs discriminate is a property of the "
+        f"objective and changed when the objective did. `delta%` is the arm's mean "
+        f"score minus the incumbent's, as a percent of the incumbent's, with a 95% "
+        f"percentile-bootstrap CI. Negative = the sweep is better.\n"
     )
     out.append("| graph | level | arm | cpu s | mean score | delta % | 95% CI |")
     out.append("|---|--:|---|--:|--:|--:|---|")
     verdicts = []
-    for name in FOCUS_GRAPHS:
+    for name in focus:
         base_grid = calib[name]["arms"]["random"]["spb_grid"]
         for level, base_spb in enumerate(base_grid):
             base = results[name]["random"][str(base_spb)]
