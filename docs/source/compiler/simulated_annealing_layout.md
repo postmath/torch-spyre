@@ -25,8 +25,11 @@ which contains the following files.
   orders (following a paper by Imanishi & Xu) that drives the permutation solver by composition. It
   is wired in as the opt-in `layout_solver = "simulated_annealing"` config option; the default stays
   `greedy`.
-- **`benchmarks/`** and **`examples/scratchpad/`** — profiling scripts, result docs, and runnable
-  examples.
+
+Runnable examples that drive the solver in isolation — a fixed-ordering layout plot,
+a first-fit vs simulated-annealing quality comparison, and an in-place convergence
+study — live in
+[`docs/source/user_guide/examples/scratchpad/`](../user_guide/examples/index.md).
 
 **Native packer.** The permutation packer the search drives has two
 interchangeable implementations: the canonical Python
