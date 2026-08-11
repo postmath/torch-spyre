@@ -222,8 +222,14 @@ class SolverWiringTest(TestCase):
 
         self.assertEqual(run(), run())
 
-    def test_default_path_ignores_the_objective_machinery(self):
-        # No objective -> the memory-only score, unchanged.
+    def test_opting_out_ignores_the_objective_machinery(self):
+        # ``cost_objective=None`` -> the memory-only score, unchanged. This was
+        # the *default* path until the objective became ``"bundle"``; it is now
+        # the explicit opt-out, and the escape hatch for anyone who needs the
+        # pre-cost-model behaviour back. Off-hardware the default reaches the
+        # same engine by falling back (no ``V.graph``), which is what
+        # ``BundleObjectiveStringTest`` pins -- so this stays an equality
+        # against an explicit ``None`` rather than against the bare default.
         bufs = self._buffers()
         a = SaCoOptimizingSolver(
             copy.deepcopy(bufs), 1 << 14, 128, seed=0, steps_per_buffer=20

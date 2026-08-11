@@ -1102,5 +1102,56 @@ class ForeignParentTest(TestCase):
         self.assertTrue(all(b.chosen_division is not None for b in out))
 
 
+class BundleObjectiveStringTest(TestCase):
+    """``cost_objective="bundle"`` -- the default.
+
+    Off-hardware there is no ``V.graph``, so these cover the *fallback*
+    contract, which is what the whole capture-driven test suite runs on: with the
+    string as the default, every solver built from a serialized capture takes
+    this path, and it has to be the memory-only engine exactly rather than an
+    approximation of it. The built objective is exercised by
+    ``test_cost_objective.py`` against an explicitly constructed instance.
+    """
+
+    def test_default_is_the_bundle_string(self):
+        # Pinned rather than assumed: this is a production behaviour switch, so
+        # a silent revert to memory-only should fail here first.
+        import inspect
+
+        default = (
+            inspect.signature(SaCoOptimizingSolver).parameters["cost_objective"].default
+        )
+        self.assertEqual(default, "bundle")
+
+    def test_bundle_falls_back_without_a_live_graph(self):
+        buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(1, 1)]})]
+        solver = SaCoOptimizingSolver(
+            buffers, 1 << 30, 128, seed=0, cost_objective="bundle"
+        )
+        self.assertIsNone(solver._cost_objective)
+
+    def test_fallback_matches_the_memory_only_solve_exactly(self):
+        # The fallback must be the memory-only engine, not a near-miss of it --
+        # otherwise the default quietly changes every capture-driven result.
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            opted_out = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, cost_objective=None
+            )
+            opted_out.plan_layout_and_core_divisions()
+            fell_back = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, cost_objective="bundle"
+            )
+            fell_back.plan_layout_and_core_divisions()
+            self.assertEqual(
+                opted_out.best_score, fell_back.best_score, f"{case}[{gi}]"
+            )
+
+    def test_unknown_string_is_rejected(self):
+        buffers = [_cdbuf("A", [], {})]
+        with self.assertRaises(ValueError):
+            SaCoOptimizingSolver(buffers, 1 << 30, 128, cost_objective="cost-model")
+
+
 if __name__ == "__main__":
     unittest.main()

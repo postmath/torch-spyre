@@ -69,7 +69,7 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
@@ -97,6 +97,52 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
+
+
+def _bundle_objective(
+    buffers: Sequence["CoreDivisionBuffer"],
+) -> Optional["BundleCostObjective"]:
+    """Build a :class:`BundleCostObjective` from the live Inductor graph.
+
+    The objective needs three things the solver is not handed: per-division
+    ``OpFeatures``, the fused-bundle grouping, and the buffer order. Only the
+    last comes from the arguments; the other two are read off ``V.graph``, which
+    is set while the allocator runs -- this solver *is* an Inductor pass, so the
+    graph is ambient rather than absent.
+
+    Returns ``None`` when there is no live graph. That is the normal case for
+    every test and benchmark that drives the solver from a serialized capture,
+    where no amount of plumbing could produce features. The caller falls back to
+    the memory-only objective and says so in the log, rather than raising (which
+    would make the string unusable off-hardware) or degrading silently (which
+    would let a run believe it used the cost model when it did not).
+    """
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._inductor.fusion import estimate_bundles
+    from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
+    from torch_spyre._inductor.scratchpad.op_features import features_for_menu
+
+    # Unset, ``V.graph`` is a ``NullHandler`` rather than ``None`` or a raise, so
+    # detect the live graph by the two things this needs from it instead of by
+    # identity -- that also covers any future stand-in handler.
+    graph: Any = getattr(V, "graph", None)
+    if graph is None:
+        return None
+    if not hasattr(graph, "operations") or not hasattr(graph, "get_buffer"):
+        return None
+
+    features: dict[str, list] = {}
+    for buf in buffers:
+        try:
+            op = graph.get_buffer(buf.name)
+        except Exception:  # noqa: BLE001 - not every solver buffer is a graph buffer
+            continue
+        features[buf.name] = features_for_menu(op, buf.core_divisions)
+    bundles = [
+        [op.get_name() for op in group] for group in estimate_bundles(graph.operations)
+    ]
+    return BundleCostObjective([b.name for b in buffers], features, bundles)
 
 
 # The packer is either the pure-Python solver or the native C++ solver; both
@@ -186,6 +232,38 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             the available evidence and a float knob would be false precision. It
             stays at the hardware-fitted ``_PSUM_PER_CORE_ELEM_US``; add a scale
             only if a K-split calibration ever makes one identifiable.
+        cost_objective: which objective the search minimizes -- the cost model's
+            per-bundle prediction (:class:`BundleCostObjective`) or the
+            memory-only spill traffic that preceded it.
+
+            * ``"bundle"`` (default) -- build the cost objective here, off the
+              live Inductor graph. The features and the fused-bundle grouping
+              come from ``V.graph``, which is ambient while the allocator runs,
+              so this form needs nothing from the caller. That is what lets it be
+              the default at all: the allocator constructs solvers through a
+              ``CoreDivisionSolverFactory`` that passes only
+              ``(buffers, size, alignment)``, so an instance could never arrive
+              that way. With no live graph -- any run driven from a serialized
+              capture -- it logs and falls back to memory-only.
+            * ``None`` -- the memory-only objective, explicitly.
+            * an instance -- used as given; how the benchmarks drive captures.
+
+            Default on the evidence in ``benchmarks/coopt_cost_objective.md``:
+            the cost objective's plans are 18-57% cheaper by the cost model's own
+            reckoning, winning on 9 of 11 corpus graphs at every capacity and
+            losing on none, with the gap widest where LX is roomy and the
+            memory-only objective has no signal at all (it leaves the division
+            vector untouched wherever the seed already fits).
+
+            Two caveats travel with that default, deliberately recorded here
+            rather than in a commit message. The comparison is the model grading
+            its own plans -- **no device time has been measured** -- so this is a
+            preliminary outcome, not a validated speedup. And the memory
+            objective's ``best <= baseline`` guarantee on spill traffic does not
+            carry over: this objective trades residency away for divisions (23 of
+            26 buffers resident vs 25 on ``block_x2``), so a miscalibrated
+            traffic term would regress traffic with nothing here to catch it.
+            Pass ``None`` to get the old behaviour back.
         reorder_move: how a ``reorder`` proposal picks its reinsertion position.
 
             * ``"sweep_quality"`` (default) -- the layout-only annealer's
@@ -255,7 +333,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         recolor_weight: float = 0.2,
         burst_fraction: float = 0.5,
         node_term: bool = False,
-        cost_objective: Optional["BundleCostObjective"] = None,
+        cost_objective: Union[str, "BundleCostObjective", None] = "bundle",
         reorder_move: str = "sweep_quality",
         reorder_neighborhood_scale: float = 1.0,
         sweep_biased_i: bool = True,
@@ -302,6 +380,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._recolor_weight = recolor_weight
         self._burst_fraction = burst_fraction
         self._node_term = node_term
+        # ``"bundle"`` is the self-sufficient form, and therefore the default:
+        # the engine builds the cost objective itself off the live graph, so a
+        # caller that cannot reach Inductor's IR (the allocator hands this class
+        # nothing but buffers) still gets it. An instance is still accepted, and
+        # is what the benchmarks pass when driving serialized captures.
+        if isinstance(cost_objective, str):
+            if cost_objective != "bundle":
+                raise ValueError(f"unknown cost_objective {cost_objective!r}")
+            cost_objective = _bundle_objective(self._bufs)
+            if cost_objective is None:
+                logger.info(
+                    "cost_objective='bundle' requested with no live Inductor "
+                    "graph; falling back to the memory-only objective"
+                )
         self._cost_objective = cost_objective
         # Set in _precompute_node_costs, which _precompute_topology calls.
         self._node_costs: Optional[list[list[int]]] = None
