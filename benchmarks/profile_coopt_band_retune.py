@@ -179,10 +179,16 @@ def _solve(name, spb, config, seed):
     bufs = _GRAPHS[name]
     cap = max(1, _foot(bufs) // CAP_DIVISOR)
     s = SaCoOptimizingSolver(
-        cap, 128, seed=seed, steps_per_buffer=spb, max_steps=10**9, **CONFIGS[config]
+        copy.deepcopy(bufs),
+        cap,
+        128,
+        seed=seed,
+        steps_per_buffer=spb,
+        max_steps=10**9,
+        **CONFIGS[config],
     )
     c0 = time.process_time()
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s.plan_layout_and_core_divisions()
     return {"best": s.best_score, "cpu": time.process_time() - c0}
 
 

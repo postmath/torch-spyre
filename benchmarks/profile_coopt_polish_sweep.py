@@ -120,8 +120,10 @@ def _work(task):
     else:
         kw = dict(polish_frac=float(kind), **NEST_BASE)
     t0 = time.time()
-    s = SaCoOptimizingSolver(cap, 128, seed=seed, steps_per_buffer=spb, **kw)
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s = SaCoOptimizingSolver(
+        copy.deepcopy(bufs), cap, 128, seed=seed, steps_per_buffer=spb, **kw
+    )
+    s.plan_layout_and_core_divisions()
     return task, s.best_score, s.baseline_score, time.time() - t0
 
 

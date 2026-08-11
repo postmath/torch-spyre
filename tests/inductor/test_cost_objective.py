@@ -189,9 +189,14 @@ class SolverWiringTest(TestCase):
         bufs = self._buffers()
         stub = self._StubObjective()
         solver = SaCoOptimizingSolver(
-            1 << 14, 128, seed=0, steps_per_buffer=20, cost_objective=stub
+            copy.deepcopy(bufs),
+            1 << 14,
+            128,
+            seed=0,
+            steps_per_buffer=20,
+            cost_objective=stub,
         )
-        solver.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+        solver.plan_layout_and_core_divisions()
         self.assertGreater(stub.calls, 0, "solver never consulted the objective")
         self.assertGreater(
             stub.invalidations, 0, "solver never told the objective state rolled back"
@@ -202,13 +207,14 @@ class SolverWiringTest(TestCase):
 
         def run():
             solver = SaCoOptimizingSolver(
+                copy.deepcopy(bufs),
                 1 << 14,
                 128,
                 seed=0,
                 steps_per_buffer=20,
                 cost_objective=self._StubObjective(),
             )
-            out = solver.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+            out = solver.plan_layout_and_core_divisions()
             return [b.chosen_division for b in out], solver.best_score
 
         self.assertEqual(run(), run())
@@ -216,12 +222,19 @@ class SolverWiringTest(TestCase):
     def test_default_path_ignores_the_objective_machinery(self):
         # No objective -> the memory-only score, unchanged.
         bufs = self._buffers()
-        a = SaCoOptimizingSolver(1 << 14, 128, seed=0, steps_per_buffer=20)
-        a.plan_layout_and_core_divisions(copy.deepcopy(bufs))
-        b = SaCoOptimizingSolver(
-            1 << 14, 128, seed=0, steps_per_buffer=20, cost_objective=None
+        a = SaCoOptimizingSolver(
+            copy.deepcopy(bufs), 1 << 14, 128, seed=0, steps_per_buffer=20
         )
-        b.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+        a.plan_layout_and_core_divisions()
+        b = SaCoOptimizingSolver(
+            copy.deepcopy(bufs),
+            1 << 14,
+            128,
+            seed=0,
+            steps_per_buffer=20,
+            cost_objective=None,
+        )
+        b.plan_layout_and_core_divisions()
         self.assertEqual(a.best_score, b.best_score)
 
 

@@ -125,8 +125,8 @@ def _work(task):
     else:
         kw["schedule"] = "reheating"
         kw["cycles"] = cycles
-    s = SaCoOptimizingSolver(cap, 128, **kw)
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s = SaCoOptimizingSolver(copy.deepcopy(bufs), cap, 128, **kw)
+    s.plan_layout_and_core_divisions()
     return task, s.best_score, s.baseline_score
 
 

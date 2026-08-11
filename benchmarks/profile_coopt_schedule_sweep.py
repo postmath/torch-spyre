@@ -80,8 +80,10 @@ def _load_graphs():
 
 
 def _solve(bufs, cap, spb, seed, sched):
-    s = SaCoOptimizingSolver(cap, 128, seed=seed, steps_per_buffer=spb, schedule=sched)
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s = SaCoOptimizingSolver(
+        copy.deepcopy(bufs), cap, 128, seed=seed, steps_per_buffer=spb, schedule=sched
+    )
+    s.plan_layout_and_core_divisions()
     return s.best_score, s.baseline_score
 
 

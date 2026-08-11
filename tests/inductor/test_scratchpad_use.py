@@ -1434,7 +1434,7 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             a = select_allocator()
             self.assertIsInstance(a, CoOptimizingAllocator)
-            self.assertIsInstance(a.layout_planning, SaCoOptimizingSolver)
+            self.assertEqual(a.layout_planning, SaCoOptimizingSolver)
 
         # Without co-optimization the same config value selects the layout-only
         # annealer, placement-only -- deliberately NOT StrategyB-wrapped, since
@@ -1444,8 +1444,8 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIsInstance(a.layout_planning, SimulatedAnnealingLayoutSolver)
-            self.assertNotIsInstance(a.layout_planning, SaCoOptimizingSolver)
+            self.assertEqual(a.layout_planning, SimulatedAnnealingLayoutSolver)
+            self.assertNotEqual(a.layout_planning, SaCoOptimizingSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False

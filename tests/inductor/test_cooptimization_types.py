@@ -61,15 +61,15 @@ def _all_captures():
 class _NoOpSolver(CoreDivisionLayoutSolver):
     """Minimal concrete engine: seeds every buffer, spills everything."""
 
-    def plan_layout(self, buffers, log_lx_usage=False):
-        return list(buffers)
+    def plan_layout(self, log_lx_usage=False):
+        return list(self.buffers)
 
-    def plan_layout_and_core_divisions(self, buffers):
-        for b in buffers:
+    def plan_layout_and_core_divisions(self):
+        for b in self.buffers:
             b.chosen_division = SEED_DIVISION_INDEX
             b.address = None  # spilled
             self.spill_reasons[b.name] = "no-op solver spills everything"
-        return list(buffers)
+        return list(self.buffers)
 
 
 class CaptureRehydrationTest(TestCase):
@@ -247,8 +247,10 @@ class EngineBindingTest(TestCase):
         """
         _, graph = next(_all_captures())
         footprint = sum(max(0, b.size) for b in graph.buffers)
-        solver = SaCoOptimizingSolver(max(1024, footprint // 2), 128, seed=0)
-        out = solver.plan_layout_and_core_divisions(graph.buffers)
+        solver = SaCoOptimizingSolver(
+            graph.buffers, max(1024, footprint // 2), 128, seed=0
+        )
+        out = solver.plan_layout_and_core_divisions()
         self.assertEqual(len(out), len(graph.buffers))
         for b in out:
             self.assertIsInstance(b, CoreDivisionBuffer)
@@ -259,9 +261,9 @@ class EngineBindingTest(TestCase):
 
     def test_placement_only_path_is_refused(self):
         """Joint-only engine: ``plan_layout`` is a loud stub, not a silent no-op."""
-        solver = SaCoOptimizingSolver(1 << 20, 128)
+        solver = SaCoOptimizingSolver([], 1 << 20, 128)
         with self.assertRaises(NotImplementedError):
-            solver.plan_layout([])
+            solver.plan_layout()
 
     def test_pinned_buffers_are_never_resident(self):
         """The fixed pin gate, asserted on the returned layout.
@@ -274,8 +276,10 @@ class EngineBindingTest(TestCase):
             if not pinned:
                 continue
             footprint = sum(max(0, b.size) for b in g.buffers)
-            solver = SaCoOptimizingSolver(max(1024, footprint // 2), 128, seed=0)
-            out = solver.plan_layout_and_core_divisions(g.buffers)
+            solver = SaCoOptimizingSolver(
+                g.buffers, max(1024, footprint // 2), 128, seed=0
+            )
+            out = solver.plan_layout_and_core_divisions()
             by_name = {b.name: b for b in out}
             for name in pinned:
                 self.assertIsNone(
@@ -293,12 +297,12 @@ class NoOpSolverABCTest(TestCase):
 
     def test_concrete_subclass_solves_and_writes_outputs(self):
         _, graph = next(_all_captures())
-        solver = _NoOpSolver(size=4096, alignment=128)
+        solver = _NoOpSolver(graph.buffers, size=4096, alignment=128)
         self.assertEqual(solver.limit, 4096)
         self.assertEqual(solver.alignment, 128)
         self.assertEqual(solver.spill_reasons, {})
 
-        out = solver.plan_layout_and_core_divisions(graph.buffers)
+        out = solver.plan_layout_and_core_divisions()
         self.assertEqual(len(out), len(graph.buffers))
         for b in out:
             self.assertEqual(b.chosen_division, SEED_DIVISION_INDEX)

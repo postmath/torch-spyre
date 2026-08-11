@@ -109,6 +109,7 @@ def _solve(name, cap_div, move, schedule, spb, seed):
     bufs = _GRAPHS[name]
     cap = max(1, _foot(bufs) // cap_div)
     s = SaCoOptimizingSolver(
+        copy.deepcopy(bufs),
         cap,
         128,
         seed=seed,
@@ -118,7 +119,7 @@ def _solve(name, cap_div, move, schedule, spb, seed):
         reorder_move=move,
     )
     c0 = time.process_time()
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s.plan_layout_and_core_divisions()
     return {"best": s.best_score, "cpu": time.process_time() - c0}
 
 

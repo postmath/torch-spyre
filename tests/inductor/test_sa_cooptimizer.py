@@ -126,8 +126,8 @@ class OutputContractTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             for cap in _capacities(buffers):
                 bufs = copy.deepcopy(buffers)
-                solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                out = solver.plan_layout_and_core_divisions(bufs)
+                solver = SaCoOptimizingSolver(bufs, cap, 128, seed=0)
+                out = solver.plan_layout_and_core_divisions()
                 tag = f"{case}[{gi}] cap={cap}"
                 self.assertEqual(len(out), len(bufs), tag)
                 for b in out:
@@ -141,8 +141,8 @@ class OutputContractTest(TestCase):
                         self.assertNotIn(b.name, solver.spill_reasons, tag)
 
     def test_empty_graph(self):
-        solver = SaCoOptimizingSolver(1024, 128, seed=0)
-        self.assertEqual(solver.plan_layout_and_core_divisions([]), [])
+        solver = SaCoOptimizingSolver([], 1024, 128, seed=0)
+        self.assertEqual(solver.plan_layout_and_core_divisions(), [])
 
 
 class BaselineGuaranteeTest(TestCase):
@@ -152,8 +152,8 @@ class BaselineGuaranteeTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             for cap in _capacities(buffers):
                 bufs = copy.deepcopy(buffers)
-                solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                solver.plan_layout_and_core_divisions(bufs)
+                solver = SaCoOptimizingSolver(bufs, cap, 128, seed=0)
+                solver.plan_layout_and_core_divisions()
                 tag = f"{case}[{gi}] cap={cap}"
                 self.assertLessEqual(solver.best_score, solver.baseline_score, tag)
 
@@ -168,9 +168,8 @@ class SeedPermutationTest(TestCase):
 
     @staticmethod
     def _seed(buffers, cap):
-        solver = SaCoOptimizingSolver(cap, 128, seed=0)
+        solver = SaCoOptimizingSolver(buffers, cap, 128, seed=0)
         solver.spill_reasons = {}
-        solver._bufs = buffers
         solver._rng = rnd.Random(0)
         solver._precompute_topology()
         solver.chosen = [0] * len(buffers)
@@ -233,8 +232,8 @@ class DeterminismTest(TestCase):
 
     def _run(self, buffers, cap, seed):
         bufs = copy.deepcopy(buffers)
-        solver = SaCoOptimizingSolver(cap, 128, seed=seed)
-        out = solver.plan_layout_and_core_divisions(bufs)
+        solver = SaCoOptimizingSolver(bufs, cap, 128, seed=seed)
+        out = solver.plan_layout_and_core_divisions()
         return (
             [b.chosen_division for b in out],
             [b.address for b in out],
@@ -256,8 +255,8 @@ class DeterminismTest(TestCase):
             cap = _seed_footprint(buffers)
             for seed in (1, 7):
                 bufs = copy.deepcopy(buffers)
-                solver = SaCoOptimizingSolver(cap, 128, seed=seed)
-                solver.plan_layout_and_core_divisions(bufs)
+                solver = SaCoOptimizingSolver(bufs, cap, 128, seed=seed)
+                solver.plan_layout_and_core_divisions()
                 self.assertLessEqual(
                     solver.best_score, solver.baseline_score, f"{case} seed={seed}"
                 )
@@ -275,8 +274,8 @@ class ImprovementSmokeTest(TestCase):
             tot = _seed_footprint(buffers)
             for cap in (max(1, tot // 2), max(1, tot // 4)):
                 bufs = copy.deepcopy(buffers)
-                solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                solver.plan_layout_and_core_divisions(bufs)
+                solver = SaCoOptimizingSolver(bufs, cap, 128, seed=0)
+                solver.plan_layout_and_core_divisions()
                 if solver.best_score < solver.baseline_score:
                     improved = True
         self.assertTrue(improved, "SA never improved on the seed on any graph")
@@ -311,8 +310,7 @@ def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
 
 def _flood(buffers, anchor_name, tiling):
     """Run ``_flood_region`` on a hand-built graph; return name -> chosen index."""
-    solver = SaCoOptimizingSolver(1 << 30, 128, seed=0)
-    solver._bufs = buffers
+    solver = SaCoOptimizingSolver(buffers, 1 << 30, 128, seed=0)
     solver._precompute_topology()
     result = solver._flood_region(solver._name_to_idx[anchor_name], tiling)
     return {buffers[i].name: d for i, d in result.items()}
@@ -379,8 +377,10 @@ class RegionRecolorTest(TestCase):
         max_region_overall = 0
         for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
-            solver = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
-            solver.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            solver = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), max(1, tot // 2), 128, seed=0
+            )
+            solver.plan_layout_and_core_divisions()
             if solver._anchor_candidates:  # graph has at least one splittable op
                 self.assertGreater(solver.moves_proposed["recolor"], 0, case)
                 self.assertTrue(solver.recolor_region_sizes, case)
@@ -396,8 +396,8 @@ class RegionRecolorTest(TestCase):
         for case, gi, buffers in _all_cases():
             tot = _seed_footprint(buffers)
             for cap in (max(1, tot // 2), max(1, tot // 4)):
-                solver = SaCoOptimizingSolver(cap, 128, seed=0)
-                solver.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                solver = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
+                solver.plan_layout_and_core_divisions()
                 total_improved += solver.recolor_improved
         self.assertGreater(total_improved, 0, "recolor never improved on any graph")
 
@@ -406,8 +406,10 @@ class RegionRecolorTest(TestCase):
             tot = _seed_footprint(buffers)
 
             def run():
-                s = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
-                s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                s = SaCoOptimizingSolver(
+                    copy.deepcopy(buffers), max(1, tot // 2), 128, seed=0
+                )
+                s.plan_layout_and_core_divisions()
                 return (
                     s.moves_proposed,
                     s.moves_accepted,
@@ -429,8 +431,10 @@ class RegionRecolorTest(TestCase):
 
         for case, gi, buffers in _all_cases_incl_synthetic():
             tot = _seed_footprint(buffers)
-            solver = SaCoOptimizingSolver(max(1, tot // 2), 128, seed=0)
-            solver.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            solver = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), max(1, tot // 2), 128, seed=0
+            )
+            solver.plan_layout_and_core_divisions()
             proposed = solver.recolor_anchor_partitions
             accepted = solver.recolor_accepted_partitions
             tag = f"{case}[{gi}]"
@@ -465,8 +469,7 @@ def _seeded(buffers, capacity, **kwargs):
     """A solver primed to the seed state (index-0 divisions, FirstFit ``pi``) on
     hand-built buffers: the prefix of ``plan_layout_and_core_divisions`` up to the
     anneal, so a unit test can drive the move / snapshot machinery directly."""
-    solver = SaCoOptimizingSolver(capacity, 128, seed=0, **kwargs)
-    solver._bufs = buffers
+    solver = SaCoOptimizingSolver(buffers, capacity, 128, seed=0, **kwargs)
     solver._rng = rnd.Random(0)
     solver._precompute_topology()
     solver.chosen = [0] * len(buffers)
@@ -578,15 +581,15 @@ class StepBudgetTest(TestCase):
         )
 
     def test_rate_applies_between_the_floor_and_the_ceiling(self):
-        s = SaCoOptimizingSolver(1 << 20, 128)
+        s = SaCoOptimizingSolver([], 1 << 20, 128)
         self.assertEqual(self._budget(s, 100), s._steps_per_buffer * 100)
 
     def test_floor_applies_to_tiny_graphs(self):
-        s = SaCoOptimizingSolver(1 << 20, 128)
+        s = SaCoOptimizingSolver([], 1 << 20, 128)
         self.assertEqual(self._budget(s, 1), s._min_steps)
 
     def test_ceiling_caps_large_graphs(self):
-        s = SaCoOptimizingSolver(1 << 20, 128)
+        s = SaCoOptimizingSolver([], 1 << 20, 128)
         binds_at = s._max_steps // s._steps_per_buffer
         self.assertEqual(self._budget(s, binds_at * 4), s._max_steps)
         # Inert across the validated corpus: the largest captured graph is n=79,
@@ -603,7 +606,9 @@ class StepBudgetTest(TestCase):
         )
 
         layout_only = SelfCalibratingReheatingSchedule().max_steps
-        self.assertGreater(SaCoOptimizingSolver(1 << 20, 128)._max_steps, layout_only)
+        self.assertGreater(
+            SaCoOptimizingSolver([], 1 << 20, 128)._max_steps, layout_only
+        )
 
 
 class ScheduleTest(TestCase):
@@ -636,13 +641,23 @@ class ScheduleTest(TestCase):
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
             r = SaCoOptimizingSolver(
-                cap, 128, seed=0, schedule="reheating", reorder_move="random"
+                copy.deepcopy(buffers),
+                cap,
+                128,
+                seed=0,
+                schedule="reheating",
+                reorder_move="random",
             )
-            r.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            r.plan_layout_and_core_divisions()
             c = SaCoOptimizingSolver(
-                cap, 128, seed=0, schedule="crude", reorder_move="random"
+                copy.deepcopy(buffers),
+                cap,
+                128,
+                seed=0,
+                schedule="crude",
+                reorder_move="random",
             )
-            c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            c.plan_layout_and_core_divisions()
             total_reheat += r.best_score
             total_crude += c.best_score
             strictly_better = strictly_better or r.best_score < c.best_score
@@ -670,10 +685,14 @@ class ScheduleTest(TestCase):
         total_reheat = total_crude = 0
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
-            r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
-            r.plan_layout_and_core_divisions(copy.deepcopy(buffers))
-            c = SaCoOptimizingSolver(cap, 128, seed=0, schedule="crude")
-            c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            r = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, schedule="reheating"
+            )
+            r.plan_layout_and_core_divisions()
+            c = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, schedule="crude"
+            )
+            c.plan_layout_and_core_divisions()
             total_reheat += r.best_score
             total_crude += c.best_score
         self.assertLess(total_crude, total_reheat)
@@ -695,8 +714,10 @@ class ScheduleTest(TestCase):
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
             for move in ("random", "sweep_quality"):
-                s = SaCoOptimizingSolver(cap, 128, seed=0, reorder_move=move)
-                s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                s = SaCoOptimizingSolver(
+                    copy.deepcopy(buffers), cap, 128, seed=0, reorder_move=move
+                )
+                s.plan_layout_and_core_divisions()
                 rate = s.moves_accepted["reorder"] / s.moves_proposed["reorder"]
                 self.assertGreater(rate, accept_hi, f"{case} {move} rate={rate}")
 
@@ -705,8 +726,8 @@ class ScheduleTest(TestCase):
         # subset -- the §8.3 per-move-type acceptance traces.
         for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
-            s = SaCoOptimizingSolver(cap, 128, seed=0)
-            s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            s = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
+            s.plan_layout_and_core_divisions()
             for m in ("reorder", "flip", "recolor"):
                 self.assertGreater(s.moves_proposed[m], 0, f"{case} {m}")
                 self.assertLessEqual(
@@ -718,8 +739,8 @@ class ScheduleTest(TestCase):
         # (drives the deferred variance-bucketing decision).
         for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
-            s = SaCoOptimizingSolver(cap, 128, seed=0)
-            s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            s = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
+            s.plan_layout_and_core_divisions()
             cv = s.move_scale_cv()
             self.assertEqual(set(cv), {"reorder", "flip", "recolor", "none"})
             for m, v in cv.items():
@@ -731,8 +752,10 @@ class ScheduleTest(TestCase):
             cap = max(1, _seed_footprint(buffers) // 2)
 
             def run():
-                s = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
-                out = s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                s = SaCoOptimizingSolver(
+                    copy.deepcopy(buffers), cap, 128, seed=0, schedule="reheating"
+                )
+                out = s.plan_layout_and_core_divisions()
                 return (
                     [b.chosen_division for b in out],
                     [b.address for b in out],
@@ -747,13 +770,15 @@ class ScheduleTest(TestCase):
         for case, gi, buffers in _all_cases_incl_synthetic():
             for sched in ("reheating", "crude"):
                 cap = max(1, _seed_footprint(buffers) // 2)
-                s = SaCoOptimizingSolver(cap, 128, seed=0, schedule=sched)
-                s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                s = SaCoOptimizingSolver(
+                    copy.deepcopy(buffers), cap, 128, seed=0, schedule=sched
+                )
+                s.plan_layout_and_core_divisions()
                 self.assertLessEqual(s.best_score, s.baseline_score, f"{case} {sched}")
 
     def test_rejects_bad_schedule(self):
         with self.assertRaises(ValueError):
-            SaCoOptimizingSolver(1024, 128, schedule="nope")
+            SaCoOptimizingSolver([], 1024, 128, schedule="nope")
 
 
 # Snippet run in a subprocess to solve one graph (captured *or* synthetic, chosen
@@ -768,8 +793,8 @@ src = load_captures() if case in load_captures() else synthetic_graphs()
 g = src[case][0]
 cap = max(1, sum(math.ceil(b.size / b.core_divisions[0].output_partition)
                  for b in g.buffers) // 2)
-s = SaCoOptimizingSolver(cap, 128, seed=0)
-out = s.plan_layout_and_core_divisions(copy.deepcopy(g.buffers))
+s = SaCoOptimizingSolver(copy.deepcopy(g.buffers), cap, 128, seed=0)
+out = s.plan_layout_and_core_divisions()
 print("RESULT " + json.dumps({{
     "chosen": [b.chosen_division for b in out],
     "addr": [b.address for b in out],
@@ -830,8 +855,8 @@ class LargeCaptureExperimentTest(TestCase):
             cap = max(1, _seed_footprint(buffers) // 2)
 
             def run():
-                s = SaCoOptimizingSolver(cap, 128, seed=0)
-                out = s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                s = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
+                out = s.plan_layout_and_core_divisions()
                 return (
                     [b.chosen_division for b in out],
                     [b.address for b in out],
@@ -840,8 +865,8 @@ class LargeCaptureExperimentTest(TestCase):
 
             a, b = run(), run()
             self.assertEqual(a, b, f"{case}[{gi}] nondeterministic")
-            s = SaCoOptimizingSolver(cap, 128, seed=0)
-            s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            s = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
+            s.plan_layout_and_core_divisions()
             self.assertLessEqual(s.best_score, s.baseline_score, f"{case}[{gi}]")
 
     def test_report_reheating_vs_crude_by_size(self):
@@ -851,10 +876,14 @@ class LargeCaptureExperimentTest(TestCase):
         print("\n  case               n   reheat        crude         delta")
         for case, gi, buffers in list(_all_cases()) + list(_large_cases()):
             cap = max(1, _seed_footprint(buffers) // 2)
-            r = SaCoOptimizingSolver(cap, 128, seed=0, schedule="reheating")
-            r.plan_layout_and_core_divisions(copy.deepcopy(buffers))
-            c = SaCoOptimizingSolver(cap, 128, seed=0, schedule="crude")
-            c.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+            r = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, schedule="reheating"
+            )
+            r.plan_layout_and_core_divisions()
+            c = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, schedule="crude"
+            )
+            c.plan_layout_and_core_divisions()
             d = r.best_score - c.best_score
             tag = "better" if d < 0 else ("worse" if d > 0 else "tie")
             print(
@@ -875,7 +904,7 @@ def _armed(buffers, cap, seed=0, **kwargs):
     """A solver stopped just short of annealing: topology precomputed, seed state
     built, per-step bookkeeping initialized. Lets a test drive one move directly.
     """
-    s = SaCoOptimizingSolver(cap, 128, seed=seed, **kwargs)
+    s = SaCoOptimizingSolver(buffers, cap, 128, seed=seed, **kwargs)
     s.spill_reasons = {}
     zeros = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
     s.moves_proposed = dict(zeros)
@@ -884,7 +913,6 @@ def _armed(buffers, cap, seed=0, **kwargs):
     s._ms_sum = {k: 0.0 for k in zeros}
     s._ms_sqsum = {k: 0.0 for k in zeros}
     s.sweep_probes = s.sweep_evals = s.sweep_steps = 0
-    s._bufs = buffers
     s._rng = rnd.Random(seed)
     s._precompute_topology()
     s.chosen = [0] * len(buffers)
@@ -910,7 +938,7 @@ class SweepReorderMoveTest(TestCase):
 
     def test_rejects_unknown_reorder_move(self):
         with self.assertRaises(ValueError):
-            SaCoOptimizingSolver(1024, 128, reorder_move="best_first")
+            SaCoOptimizingSolver([], 1024, 128, reorder_move="best_first")
 
     def test_sweep_arms_hold_the_shape_invariants(self):
         # The same contract every arm owes: a division and a spill reason or an
@@ -921,8 +949,10 @@ class SweepReorderMoveTest(TestCase):
                     tag = f"{case}[{gi}] cap={cap} {arm}"
                     runs = []
                     for _ in range(2):
-                        s = SaCoOptimizingSolver(cap, 128, seed=0, **arm)
-                        out = s.plan_layout_and_core_divisions(copy.deepcopy(buffers))
+                        s = SaCoOptimizingSolver(
+                            copy.deepcopy(buffers), cap, 128, seed=0, **arm
+                        )
+                        out = s.plan_layout_and_core_divisions()
                         self.assertLessEqual(s.best_score, s.baseline_score, tag)
                         for b in out:
                             self.assertIsNotNone(b.chosen_division, f"{tag} {b.name}")

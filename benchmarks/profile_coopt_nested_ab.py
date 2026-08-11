@@ -134,9 +134,14 @@ def _work(task):
     cap = max(1, _foot(bufs) // 2)
     t0 = time.time()
     s = SaCoOptimizingSolver(
-        cap, 128, seed=seed, steps_per_buffer=spb, **CONFIGS[config]
+        copy.deepcopy(bufs),
+        cap,
+        128,
+        seed=seed,
+        steps_per_buffer=spb,
+        **CONFIGS[config],
     )
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s.plan_layout_and_core_divisions()
     return task, s.best_score, s.baseline_score, time.time() - t0
 
 

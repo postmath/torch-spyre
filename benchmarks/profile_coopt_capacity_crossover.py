@@ -110,6 +110,7 @@ def _solve(name, ratio, move, schedule, seed):
     bufs = _GRAPHS[name]
     cap = max(1, int(_foot(bufs) * ratio))
     s = SaCoOptimizingSolver(
+        copy.deepcopy(bufs),
         cap,
         128,
         seed=seed,
@@ -118,7 +119,7 @@ def _solve(name, ratio, move, schedule, seed):
         schedule=schedule,
         reorder_move=move,
     )
-    out = s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    out = s.plan_layout_and_core_divisions()
     spilled = sum(1 for b in out if b.address is None)
     return {"best": s.best_score, "spill_frac": spilled / len(out)}
 

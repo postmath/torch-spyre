@@ -63,12 +63,13 @@ integer fixed-point score make a run bit-for-bit reproducible.
 
 from __future__ import annotations
 
+import copy
 import heapq
 import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, cast
 
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
@@ -235,6 +236,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def __init__(
         self,
+        buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
         *,
@@ -266,7 +268,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         polish_frac: float = 0.2,
         abandon_k: float = 30.0,
     ) -> None:
-        super().__init__(size, alignment)
+        super().__init__(buffers, size, alignment)
+        # Declared over ``LifetimeBoundBuffer`` so the class itself satisfies
+        # ``CoreDivisionSolverFactory`` (``Callable`` parameters are
+        # contravariant, so a narrower parameter would not), then narrowed here:
+        # the joint engine needs the ``core_divisions`` menus every buffer it is
+        # actually given carries. Same objects as the base's ``self.buffers``, so
+        # write-back through either name is visible in both.
+        self._bufs: Sequence[CoreDivisionBuffer] = cast(
+            "list[CoreDivisionBuffer]", list(buffers)
+        )
         if schedule not in ("reheating", "crude"):
             raise ValueError("schedule must be 'reheating' or 'crude'")
         if inner_curve not in ("constant", "linear", "convex", "adaptive"):
@@ -323,9 +334,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- public interface ----------------------------------------------------
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Not supported: this engine is joint-only.
 
         :class:`MemoryPlanSolver` declares this abstract, but the placement-only
@@ -341,13 +350,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             "SimulatedAnnealingLayoutSolver for placement-only annealing."
         )
 
-    def plan_layout_and_core_divisions(
-        self,
-        buffers: Sequence[CoreDivisionBuffer],
-    ) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
-        same buffers (the one-shot interface satisfied by an internal solve)."""
+        solver's own buffers (the one-shot interface satisfied by an internal
+        solve) -- a solver is single-use, so construct a fresh one per set."""
         self.spill_reasons = {}
         # Tier-0 move instrumentation (Plan §4.3 / §8.3): per-type proposal and
         # accept counts, recolor improvement count, the flooded region sizes, and
@@ -377,11 +384,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.sweep_probes = 0
         self.sweep_evals = 0
         self.sweep_steps = 0
-        n = len(buffers)
+        n = len(self._bufs)
         if n == 0:
-            return list(buffers)
+            return list(self._bufs)
 
-        self._bufs = buffers
         self._rng = rnd.Random(self._seed)
         self._precompute_topology()
 
@@ -391,7 +397,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         self._anneal()
         self._write_back()
-        return list(buffers)
+        return list(self._bufs)
 
     # -- static topology (division-invariant) --------------------------------
 
@@ -610,8 +616,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # predates this and is unchanged), and eligibility that comes and goes
         # with ``W`` must keep its slot so it can re-enter coherently.
         ff_bufs = self._lifetime_buffers(sizes)
+        # Deep-copied so FirstFit lays out its own objects: SolverToPermutation
+        # only reads addresses back by name, and the buffers it is handed must
+        # not be the ones the solver mutates.
         pi = SolverToPermutation(
-            FirstFitLayoutSolver(self.limit, self.alignment)
+            FirstFitLayoutSolver(copy.deepcopy(ff_bufs), self.limit, self.alignment)
         ).permutation(ff_bufs)
 
         return make_permutation_packer(

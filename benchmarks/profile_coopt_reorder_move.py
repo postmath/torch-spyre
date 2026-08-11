@@ -141,6 +141,7 @@ def _solve(name, spb, config, seed):
     n = len(bufs)
     cap = max(1, _foot(bufs) // CAP_DIVISOR)
     s = SaCoOptimizingSolver(
+        copy.deepcopy(bufs),
         cap,
         128,
         seed=seed,
@@ -154,7 +155,7 @@ def _solve(name, spb, config, seed):
         **CONFIGS[config],
     )
     t0, c0 = time.perf_counter(), time.process_time()
-    s.plan_layout_and_core_divisions(copy.deepcopy(bufs))
+    s.plan_layout_and_core_divisions()
     secs = time.perf_counter() - t0
     cpu = time.process_time() - c0
     # Mirrors the engine's own budget, so cost-per-step is priced against the

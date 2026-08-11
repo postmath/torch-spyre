@@ -64,6 +64,7 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
@@ -2389,12 +2390,7 @@ def select_allocator() -> ScratchpadAllocator:
         config.layout_solver == "simulated_annealing"
         and config.co_optimizing_lx_planning
     ):
-        # No optional dependency, so unlike cpsat there is no degradation path.
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
-            SaCoOptimizingSolver,
-        )
-
-        return CoOptimizingAllocator(layout_planning=SaCoOptimizingSolver(size))
+        return CoOptimizingAllocator(layout_planning=SaCoOptimizingSolver, size=size)
 
     if config.layout_solver == "cpsat":
         # Both cpsat paths share the same ortools-missing degradation: build the
