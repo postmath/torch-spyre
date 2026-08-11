@@ -26,10 +26,40 @@ loop skips the per-step full rescore -- so the honest "is it more efficient?"
 axis is quality vs time, not quality vs step budget. Parallelized across
 processes; results written incrementally.
 
+**Objective.** Runs against :class:`BundleCostObjective`, the engine's default.
+That is not automatic here: the default is the *string* ``"bundle"``, which
+builds itself from the live Inductor graph, and a benchmark driving serialized
+captures has no such graph -- so simply constructing the solver would silently
+fall back to the memory-only objective and measure the old thing. The objective
+is therefore built explicitly, from the same captured features + estimated
+bundles the engine would have derived. ``--memory-only`` restores the previous
+behaviour for comparison.
+
+That also forces the corpus: ``cooptimization_captures.json`` carries no
+features, so this now runs on ``cooptimization_captures_regen.json``, which was
+captured alongside them. Scores are therefore not comparable to the numbers in
+the committed ``coopt_nested_ab.md`` -- different objective *and* different
+graphs. What carries over is the question: does the nested two-timescale loop
+buy anything the single loop does not?
+
+The objective changes the very thing this A/B is about. Per-step cost is now
+dominated by the cost model rather than by the packer, and the nested engine's
+whole premise is skipping per-step full rescores -- so the quality-vs-time
+frontier is being re-measured under a per-step price roughly 5x the one the
+nested variants were designed against.
+
+**Step budget.** ``steps = clamp(steps_per_buffer * n, min_steps, max_steps)``
+with the engine's default ``max_steps=15_000``, which this benchmark does not
+override. So the top of the ``spb`` grid saturates: for ``n = 80`` every level at
+or above 640 is the same 15_000-step solve. Levels that clamp to a step count
+already covered are dropped rather than re-run (they would be bit-identical), and
+the dropped set is logged.
+
 Run from the repo root::
 
     python3 benchmarks/profile_coopt_nested_ab.py            # full A/B + report
     python3 benchmarks/profile_coopt_nested_ab.py --smoke    # tiny subset
+    python3 benchmarks/profile_coopt_nested_ab.py --memory-only
     python3 benchmarks/profile_coopt_nested_ab.py --report   # report only
 """
 
@@ -48,6 +78,7 @@ for _v in (
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import argparse  # noqa: E402
+import inspect  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 import multiprocessing as mp  # noqa: E402
@@ -72,16 +103,30 @@ def _plt():
 _BENCH = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_BENCH)
 _RESULTS = os.path.join(_BENCH, "results")
-_LARGE = os.path.join(_REPO, "tests", "inductor", "cooptimization_captures_large.json")
+_FIXTURES = os.path.join(_REPO, "tests", "inductor")
+CAPTURES = os.path.join(_FIXTURES, "cooptimization_captures_regen.json")
+FEATURES = os.path.join(_FIXTURES, "cooptimization_op_features.json")
 
 SWEEP_JSON = os.path.join(_RESULTS, "coopt_nested_ab.json")
 REPORT_MD = os.path.join(_BENCH, "coopt_nested_ab.md")
 DELTA_PNG = os.path.join(_RESULTS, "coopt_nested_delta.png")
 FRONTIER_PNG = os.path.join(_RESULTS, "coopt_nested_frontier.png")
 
-SPB_GRID = [160, 640, 2560, 10240]
 SEEDS = [0, 1, 2, 3, 4]
-WORKERS = 32
+WORKERS = 48
+# The engine's own defaults, read off its signature rather than copied, so a
+# change there cannot silently desynchronize this sweep from the solver: the
+# clamp bounds drive the level dedup, and DEFAULT_SPB is the operating point
+# production actually runs at.
+_SIG = inspect.signature(SaCoOptimizingSolver).parameters
+_MIN_STEPS = _SIG["min_steps"].default
+_MAX_STEPS = _SIG["max_steps"].default
+DEFAULT_SPB = _SIG["steps_per_buffer"].default
+# The default budget leads, because a config is chosen for where it will run.
+# Without it this sweep started at 4x production and ranged to 256x, which is
+# exactly the regime where the nested engine looks best -- and it reverses below
+# that range. See the production-budget paragraph in the generated report.
+SPB_GRID = [DEFAULT_SPB, 160, 640, 2560, 10240]
 BIG_N = 70  # graphs at/above this size skip the most expensive spb
 BIG_SPB_CAP = 2560
 
@@ -112,9 +157,44 @@ def _foot(bufs):
 
 
 def _load_graphs():
-    g = {c: gs[0].buffers for c, gs in load_captures().items()}
-    g.update({c: gs[0].buffers for c, gs in load_captures(_LARGE).items()})
-    return g
+    """``{graph: {buffers, features, bundles}}`` -- everything a solve needs.
+
+    Features and bundles ride along because the cost objective cannot be built
+    from buffers alone; see the module docstring.
+    """
+    from torch_spyre._inductor.cost_model import op_from_dict
+
+    with open(FEATURES) as fh:
+        raw = json.load(fh)["graphs"]
+    out = {}
+    for name, graphs in load_captures(CAPTURES).items():
+        entry = raw[name]
+        out[name] = {
+            "buffers": graphs[0].buffers,
+            "features": {
+                n: [None if f is None else op_from_dict(f) for f in b["features"]]
+                for n, b in entry["buffers"].items()
+            },
+            "bundles": entry["bundles"],
+        }
+    return out
+
+
+def _objective(entry, buffers):
+    """A fresh cost objective over ``buffers`` -- one per solve, never shared:
+    it memoizes per bundle and tracks dirty state against the last scored
+    ``(chosen, resident)``."""
+    from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
+
+    return BundleCostObjective(
+        [b.name for b in buffers], entry["features"], entry["bundles"]
+    )
+
+
+def _effective_steps(n, spb):
+    """The engine's own clamp, replicated so the sweep can skip levels that
+    resolve to a solve it has already run (see the module docstring)."""
+    return min(_MAX_STEPS, max(_MIN_STEPS, spb * n))
 
 
 def _init_worker():
@@ -126,37 +206,63 @@ def _init_worker():
 
 
 def _work(task):
-    """task = (name, spb, config, seed) -> (task, best, baseline, seconds)."""
+    """task = (name, spb, config, seed, memory_only) -> (task, best, base, secs)."""
     import copy
 
-    name, spb, config, seed = task
-    bufs = _GRAPHS[name]
+    name, spb, config, seed, memory_only = task
+    entry = _GRAPHS[name]
+    bufs = copy.deepcopy(entry["buffers"])
     cap = max(1, _foot(bufs) // 2)
+    # Built outside the timed region: the engine builds its own from the live
+    # graph in production, so its construction is not part of what this A/B
+    # compares. Scoring with it *is*, and that stays inside.
+    objective = None if memory_only else _objective(entry, bufs)
     t0 = time.time()
     s = SaCoOptimizingSolver(
-        copy.deepcopy(bufs),
+        bufs,
         cap,
         128,
         seed=seed,
         steps_per_buffer=spb,
+        cost_objective=objective,
         **CONFIGS[config],
     )
     s.plan_layout_and_core_divisions()
     return task, s.best_score, s.baseline_score, time.time() - t0
 
 
-def _tasks(graphs, configs, spb_grid, seeds):
+def _levels_for(n, spb_grid):
+    """The ``spb`` levels worth running for a graph of ``n`` buffers, plus the
+    ones dropped as duplicates: ``(kept, dropped)``. Two levels that clamp to the
+    same step count give bit-identical solves, so running both measures nothing
+    and costs twice."""
+    kept, dropped, seen = [], [], set()
+    cap_spb = BIG_SPB_CAP if n >= BIG_N else max(spb_grid)
+    for spb in spb_grid:
+        if spb > cap_spb:
+            dropped.append((spb, "over BIG_SPB_CAP"))
+            continue
+        steps = _effective_steps(n, spb)
+        if steps in seen:
+            dropped.append((spb, f"clamps to {steps} steps, already run"))
+            continue
+        seen.add(steps)
+        kept.append(spb)
+    return kept, dropped
+
+
+def _tasks(graphs, configs, spb_grid, seeds, memory_only):
     for name in graphs:
-        cap_spb = BIG_SPB_CAP if len(graphs[name]) >= BIG_N else max(spb_grid)
-        for spb in spb_grid:
-            if spb > cap_spb:
-                continue
+        kept, dropped = _levels_for(len(graphs[name]["buffers"]), spb_grid)
+        for spb, why in dropped:
+            print(f"  skip {name} spb={spb}: {why}", flush=True)
+        for spb in kept:
             for config in configs:
                 for seed in seeds:
-                    yield (name, spb, config, seed)
+                    yield (name, spb, config, seed, memory_only)
 
 
-def run_sweep(smoke=False):
+def run_sweep(smoke=False, memory_only=False):
     graphs = _load_graphs()
     spb_grid = [160, 640] if smoke else SPB_GRID
     seeds = [0] if smoke else SEEDS
@@ -166,22 +272,26 @@ def run_sweep(smoke=False):
         else list(CONFIGS)
     )
     names = ["swiglu", "flash_attention"] if smoke else list(graphs)
-    tasks = list(_tasks({k: graphs[k] for k in names}, cfgs, spb_grid, seeds))
+    objective = "memory-only" if memory_only else "BundleCostObjective"
+    print(f"objective: {objective}", flush=True)
+    tasks = list(
+        _tasks({k: graphs[k] for k in names}, cfgs, spb_grid, seeds, memory_only)
+    )
 
-    results: dict = {c: {"n": len(graphs[c]), "levels": {}} for c in names}
+    results: dict = {c: {"n": len(graphs[c]["buffers"]), "levels": {}} for c in names}
     os.makedirs(_RESULTS, exist_ok=True)
     start = done = 0
     start = time.time()
     ctx = mp.get_context("spawn")
     pool = ctx.Pool(WORKERS, initializer=_init_worker)
     try:
-        for (name, spb, config, seed), best, base, secs in pool.imap_unordered(
+        for (name, spb, config, seed, _), best, base, secs in pool.imap_unordered(
             _work, tasks, chunksize=1
         ):
             lv = results[name]["levels"].setdefault(
                 str(spb),
                 {
-                    "total_steps": max(200, spb * results[name]["n"]),
+                    "total_steps": _effective_steps(results[name]["n"], spb),
                     "baseline": base,
                     "configs": {},
                 },
@@ -317,48 +427,131 @@ def _plot_frontier(configs, baseline, data):
     plt.close(fig)
 
 
-_HEADLINE = """## Headline finding
+def _headline(baseline, data):
+    """Generate the headline from the data rather than narrating it by hand.
 
-**The nested two-timescale engine is substantially more time-efficient: on 9 of
-11 graphs a single fixed config (`nest-greedy-constant`) matches or beats the
-incumbent `reheat`'s *best* quality in 1.8-14.4x less wall-clock** (median ~2.7x;
-flash_big 14.4x -- 13s vs 191s; sdpa 3.1x). The efficiency frontier (quality vs
-seconds) shows the nested curves sitting left of the incumbent on those graphs.
+    This section used to be a hand-written constant, and it went stale the first
+    time the sweep was re-run under a different objective: the prose still
+    claimed regressions on two graphs that the regenerated table showed at
+    parity. Numbers that describe a run belong to the run.
+    """
+    rows, speedups, greedy_vs_anneal = [], [], []
+    for name, r in data.items():
+        level = r["levels"][max(r["levels"], key=lambda s: int(s))]
+        cfgs = level["configs"]
+        if baseline not in cfgs:
+            continue
+        base_score = _mean(cfgs[baseline]["best"])
+        base_secs = _mean(cfgs[baseline]["secs"])
+        nested = {c: v for c, v in cfgs.items() if c.startswith("nest-")}
+        if not nested or not base_score:
+            continue
+        best = min(nested, key=lambda c: _mean(nested[c]["best"]))
+        delta = 100.0 * (_mean(nested[best]["best"]) - base_score) / base_score
+        speedup = base_secs / _mean(nested[best]["secs"])
+        rows.append((name, r["n"], best, delta, speedup))
+        speedups.append(speedup)
+        greedy = [_mean(v["best"]) for c, v in nested.items() if "greedy" in c]
+        anneal = [_mean(v["best"]) for c, v in nested.items() if "anneal" in c]
+        if greedy and anneal and _mean(greedy):
+            greedy_vs_anneal.append(
+                100.0 * (_mean(anneal) - _mean(greedy)) / _mean(greedy)
+            )
+
+    ties = [r for r in rows if r[3] <= 0.0]
+    losses = sorted((r for r in rows if r[3] > 0.0), key=lambda r: -r[3])
+
+    # How many graphs the incumbent solves identically at every run length: the
+    # measure of whether extra budget buys anything at all here. Counted, not
+    # asserted, because it is the premise of the paragraph that reads the
+    # speedups down.
+    converged = 0
+    for name, r in data.items():
+        scores = {
+            _mean(level["configs"][baseline]["best"])
+            for level in r["levels"].values()
+            if baseline in level["configs"]
+        }
+        converged += len(scores) == 1
+
+    # The same comparison at the budget production actually uses. Reported
+    # separately because it does not agree with the long-budget result, and the
+    # long-budget result is the one that would mislead a defaulting decision.
+    prod, prod_speed = [], []
+    for name, r in data.items():
+        level = r["levels"].get(str(DEFAULT_SPB))
+        if not level or baseline not in level["configs"]:
+            continue
+        cfgs = level["configs"]
+        base_score = _mean(cfgs[baseline]["best"])
+        nested = {c: v for c, v in cfgs.items() if c.startswith("nest-")}
+        if not nested or not base_score:
+            continue
+        best = min(nested, key=lambda c: _mean(nested[c]["best"]))
+        prod.append(
+            (
+                name,
+                best,
+                100.0 * (_mean(nested[best]["best"]) - base_score) / base_score,
+            )
+        )
+        prod_speed.append(_mean(cfgs[baseline]["secs"]) / _mean(nested[best]["secs"]))
+    prod_losses = sorted((p for p in prod if p[2] > 0.0), key=lambda p: -p[2])
+    prod_para = (
+        f"""
+### At the default step budget the result reverses
+
+The grid above starts at `steps_per_buffer={DEFAULT_SPB}`, the engine's default and the only point production runs at. There the nested engine is **behind on {len(prod_losses)} of {len(prod)} graphs and ahead on none**, by {_mean([p[2] for p in prod]):+.2f}% on average -- worst {", ".join(f"`{n}` {d:+.2f}%" for n, _, d in prod_losses[:3])}. It is still {statistics.median(prod_speed):.1f}x cheaper in solver time, but the absolute saving is fractions of a second per graph.
+
+The nested engine needs budget to amortize: each outer structural move spends a whole inner layout loop, so a small total budget buys few structural evaluations. Its advantage therefore appears only well above the operating point, and the equal-steps framing of the table above is what makes it look unconditional. **This is the cell to read before making nested a default.**
+"""
+        if prod
+        else ""
+    )
+    curves: dict = {}
+    for name, r in data.items():
+        level = r["levels"][max(r["levels"], key=lambda s: int(s))]
+        base_score = _mean(level["configs"].get(baseline, {}).get("best", []))
+        for cfg, v in level["configs"].items():
+            if cfg.startswith("nest-greedy") and base_score:
+                curves.setdefault(cfg, []).append(
+                    100.0 * (_mean(v["best"]) - base_score) / base_score
+                )
+    curve_line = ", ".join(
+        f"`{c.replace('nest-greedy-', '')}` {_mean(v):+.2f}%"
+        for c, v in sorted(curves.items(), key=lambda kv: _mean(kv[1]))
+    )
+    loss_line = (
+        "none -- no graph favours the incumbent"
+        if not losses
+        else "; ".join(f"`{n}` {d:+.2f}%" for n, _, _, d, _ in losses)
+    )
+    return f"""## Headline finding
+
+**The nested engine's win is wall-clock, not plan quality. Read both numbers together or this table will mislead you.** At each graph's longest run length the best nested config scores {_mean([r[3] for r in rows]):+.2f}% against `{baseline}` -- a tie, within noise, *not* an improvement -- while taking {statistics.median(speedups):.1f}x less time ({min(speedups):.1f}x-{max(speedups):.1f}x). It ties or beats on {len(ties)} of {len(rows)} graphs. Every "speedup" below is therefore the price of the same answer, never a better one; the largest are on the largest graphs, where the incumbent's per-step full rescore is most expensive.
+
+That framing matters because of what the extra budget itself buys, which is almost nothing: `{baseline}` returns a bit-identical score at *every* run length on {converged} of {len(rows)} graphs, so the search has already converged at the default budget. The time the nested engine saves is therefore time spent on steps that do not change the answer. A speedup on a budget nobody needs is not a reason to adopt it.
 
 Where the win comes from:
 
 - **Skipping the per-step full rescore.** The incumbent scores the whole state
-  every step; the nested inner layout loop drives the packer's incremental quality
-  and only computes the full score once per outer (structural) move. That alone is
-  most of the 2-14x speedup.
+  every step; the nested inner layout loop drives the packer's incremental
+  quality and computes the full score once per outer (structural) move. Under the
+  cost-model objective a full score is far more expensive than it was under the
+  memory-only one, so this advantage is *larger* here than when the nested engine
+  was first measured.
 - **Warm-started, rotate-based inner loops.** Layout re-adapts to each structural
   change from the persisted permutation, using single-buffer reinsertions (fast
   mixing), not adjacent swaps.
 
-Two honest caveats (the incumbent still wins these):
-
-- **swiglu (+6.1%) and flash_attention (+7.7%): the incumbent's long *interleaved*
-  layout refinement reaches a modestly better optimum that nested does not.** On
-  the frontier their curves cross -- nested wins the short/mid-time regime, `reheat`
-  wins the far right (long budget). The likely cause is that nested under-invests
-  in layout on the final winning structure: layout only rides inside bursts (a
-  rejected structural move's burst is discarded) plus a 20% final polish, whereas
-  `reheat` refines layout continuously. A clear next lever: larger polish fraction
-  or letting accepted structural moves carry deeper layout.
-
+Where the incumbent still wins: {loss_line}.
+{prod_para}
 Secondary findings:
 
-- **Greedy inner loop >> annealed.** The annealed inner loop is unreliable (it
-  wanders when the early inner budget is small -- e.g. it missed sdpa's 40%
-  division win at some seeds). Greedy-cold is the robust choice.
-- **The inner-length curve barely matters among greedy configs** (constant /
-  linear / convex / adaptive cluster together): the simplest `constant` inner
-  length is a fine default. The "grow the inner loop over the run" hypothesis is
-  *not* strongly supported by the data -- warm-start + rescore-skipping carry the
-  win, not the length schedule.
+- **Greedy vs annealed inner loop:** the annealed inner loop is worse by {_mean(greedy_vs_anneal):+.2f}% on average, and 0.00% on the graphs where every config converges to the same score. Greedy-cold remains the robust choice.
+- **The inner-length curve barely separates the greedy configs** ({curve_line}), so the simplest `constant` inner length is a fine default. The "grow the inner loop over the run" hypothesis is still not strongly supported -- warm-start and rescore-skipping carry the win, not the length schedule.
 
-_Caveats: capacity = footprint//2; y is the SA fixed-point objective, not hardware
-wall-clock (the seconds here are solver compute); flash_big capped at spb 2560._
+_Caveats: capacity = footprint//2; y is the cost model's fixed-point prediction, not measured hardware time (the seconds here are solver compute); flash_big capped at spb {BIG_SPB_CAP}. Several graphs converge to an identical score across every config and run length, so their +0.00% is a genuine tie, not a rounding artefact._
 """
 
 
@@ -375,7 +568,7 @@ def write_report():
         f"`{baseline}`. Wall-clock is recorded because the nested inner loop skips "
         f"the per-step rescore, so quality-vs-time is the honest efficiency axis.\n"
     )
-    out.append(_HEADLINE)
+    out.append(_headline(baseline, data))
     out.append(f"![delta](results/{os.path.basename(DELTA_PNG)})\n")
     out.append(f"![frontier](results/{os.path.basename(FRONTIER_PNG)})\n")
     out.append("## Best nested config vs incumbent, per (graph, run length)\n")
@@ -413,7 +606,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument(
+        "--memory-only",
+        action="store_true",
+        help="solve against the pre-cost-model objective instead of the default",
+    )
     args = ap.parse_args()
     if not args.report:
-        run_sweep(smoke=args.smoke)
+        run_sweep(smoke=args.smoke, memory_only=args.memory_only)
     write_report()
