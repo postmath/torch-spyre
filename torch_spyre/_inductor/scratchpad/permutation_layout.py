@@ -233,7 +233,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         on -- the incremental result then diverges from a from-scratch place.
         Zero is allowed: the allocator clamps unsized entries to 0.
         """
-        assert new_size >= 0, "resize size must be non-negative"
+        if new_size < 0:
+            raise ValueError("resize size must be non-negative")
         old_total = self.total_quality
         old_q = self._qualities[idx]
         self._sizes[idx] = new_size
@@ -1507,7 +1508,7 @@ def make_permutation_packer(
     capacity: int,
     alignment: int = 128,
     eligible: Optional[list[bool]] = None,
-):
+) -> PermutationBasedLayoutSolver | NativePermutationLayoutSolver:
     """Construct a permutation packer, using the C++ accelerator by default.
 
     Returns the C++ :class:`NativePermutationLayoutSolver` when
