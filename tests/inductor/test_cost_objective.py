@@ -130,10 +130,13 @@ class StructureTest(TestCase):
         # the dirty map.
         #
         # Note the filter keys on membership, NOT on an ``arg`` prefix: a
-        # clone-eligible graph input really is one of the solver's buffers (this
-        # fixture owns ``arg1_1``), so prefix-matching would wrongly discard it.
-        names, features = _graph()
-        self.assertIn("arg1_1", names, "fixture no longer exercises the arg case")
+        # clone-eligible graph input really is one of the solver's buffers, so
+        # prefix-matching would wrongly discard it. Which graph owns one is a
+        # property of the capture, not of this code -- ``rms_norm`` is the one
+        # that does in the current fixture (``simple_attn``, the default
+        # elsewhere here, no longer has a clone-eligible input).
+        names, features = _graph("rms_norm")
+        self.assertIn("arg0_1", names, "fixture no longer exercises the arg case")
         obj = _objective(
             names, features, bundles=[["not_a_buffer", "also_absent"], names]
         )
