@@ -170,6 +170,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine (see module docstring).
 
     Args:
+        buffers: the buffers to plan, in the allocator's order. Declared as
+            ``Sequence[LifetimeBoundBuffer]`` so the class itself satisfies
+            ``CoreDivisionSolverFactory`` (``Callable`` parameters are
+            contravariant, so a narrower annotation would not), but every buffer
+            actually passed must be a :class:`CoreDivisionBuffer` -- the joint
+            engine reads the ``core_divisions`` menu and the
+            ``cd_parent_matches`` compatibility relation off each one.
+
+            **Mutated in place, and their order is an index.** The returned list
+            is these same objects with ``chosen_division`` and ``address``
+            written back, so a caller that needs the input preserved must copy
+            first (the benchmarks all ``deepcopy``). Position ``i`` here is the
+            index used by ``chosen``, by the packer's permutation, and by the
+            cost objective, so the three stay aligned only as long as this order
+            does. Solvers are single-use: construct a fresh one per buffer set.
         size: scratchpad capacity in bytes.
         alignment: placement alignment (128 = one Spyre stick).
         seed: RNG seed; fixes the (deterministic) search trajectory.
@@ -186,7 +201,41 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             reheating schedule + cycle-phase proposal mix) or ``"crude"`` (the
             Phase-3/4 single geometric cool + fixed proposal weights, retained as
             the A/B baseline the reheating schedule must beat).
+
+            **Reheating stays the default because it converges faster, not
+            because it ends up better.** At the shipping budget the two tie:
+            re-measured under the cost objective
+            (``benchmarks/coopt_schedule_default.md``, 20 fresh seeds) every
+            capacity x move cell lands within noise of zero, 25 of 33 exactly
+            tied, and the capacity sweep finds no crossover anywhere from 0.80
+            down to 0.10 of the footprint.
+
+            That tie is an artifact of measuring after both have arrived. On this
+            corpus 8 of 11 graphs reach their final score by
+            ``steps_per_buffer`` 20, against a default of 40, so a sweep at or
+            above the default compares two converged searches. Measured *before*
+            convergence, crude is worse by +23.6% at ``spb=2``, +4.7% at 5, +2.8%
+            at 10, +0.7% at 20, and +0.16% at 40 -- a clean decay to the tie. The
+            schedule is doing real work; the corpus is just too easy at the
+            budget we ship to show it.
+
+            Two consequences. Do not read the tie as licence to drop reheating:
+            on a harder graph, or at a tighter budget, the gap is large. And do
+            not lower ``steps_per_buffer`` to save time without re-checking this
+            -- most of the headroom between 20 and 40 is exactly what makes the
+            schedule choice free.
         cycles / horizons_per_cycle: reheating-schedule knobs (Plan §5.1).
+            ``cycles`` was measured as "mildly suboptimal at 4, worth ~2% on the
+            graphs that matter" under the memory-only objective. Re-run under the
+            cost objective (``benchmarks/coopt_cycle_sweep.md``), the cycle count
+            changes the result on 3 of 11 graphs and the default is at most 0.35%
+            off the best count anywhere.
+
+            Unlike ``schedule``, that is not a convergence artifact: checked
+            before the search converges (``spb`` 2-20, where the schedule choice
+            is still worth up to 23%), the spread across counts 1..16 is at most
+            3.4% and the best count is inconsistent between budgets (8, 16, 4, 8,
+            16) -- noise, not a ranking. Not worth changing.
         weight_floor: the ``w_floor`` in the cycle-phase proposal mix (Plan §5.4),
             so no applicable move type is ever fully starved.
         move_bands: per-move-type ``(accept_hi, accept_lo)`` acceptance bands for
@@ -275,14 +324,33 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             * ``"random"`` -- the original single random ``(i, j)`` rotation,
               retained as the A/B baseline.
 
-            The sweep is the default on benchmark evidence
-            (``benchmarks/coopt_reorder_move.md``): at matched *wall-clock* it is
-            better on every capture that discriminates between the two and worse
-            on none, by ~3% mean at capacity ``footprint//4`` (11 of 12
-            graph x budget cells, sign-test p = 0.003). It is affordable because
-            a sweep step costs only ~1.1x a random one -- per-step cost is
-            dominated by the O(n) state snapshot, while the n probes are
-            incremental packer swaps plus an O(1) quality read.
+            The sweep became the default on benchmark evidence that **no longer
+            holds**. Under the memory-only objective, at matched wall-clock, it
+            was better on every capture that discriminated and worse on none, by
+            ~3% mean at capacity ``footprint//4`` (11 of 12 graph x budget cells,
+            sign-test p = 0.003). Re-run under the cost objective
+            (``benchmarks/coopt_reorder_move.md``, 20 seeds), it is
+            indistinguishable from ``random``: 0 of 33 cells significantly
+            better, 0 significantly worse, mean +0.01%.
+
+            The reversal is explicable rather than mysterious, and the paragraph
+            below predicted it: the sweep's advantage came from ranking
+            score-identical positions by a continuous proxy under an objective
+            that was a coarse step function. The cost objective is not a step
+            function, so there are far fewer ties to break.
+
+            Nor is that tie a convergence artifact, which is the obvious
+            objection given that most of this corpus has converged by the default
+            budget: measured before convergence too, at ``spb`` 2 through 20, the
+            two stay within -0.21% to +0.18% of each other. The sweep buys
+            nothing at any budget, where the ``schedule`` choice at the same
+            budgets is worth up to 23%.
+
+            It stays the default because the re-run found no *cost* either -- a
+            sweep step is ~1.0-1.1x a random one now that scoring dominates
+            per-step time -- so this is a knob with no measured consequence in
+            either direction, not a knob with a live justification. Prefer
+            ``"random"`` if simplicity is worth anything to you.
 
             Ranking by ``quality()`` rather than the objective is deliberate. The
             objective counts only *spilled* buffers, so it is a coarse step
@@ -311,6 +379,61 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             rotation, sorting adjacent non-overlapping buffers into address
             order. Off by default: it is O(n) swaps per accepted move with
             quadratic worst-case backtracking, and it showed no benefit.
+        nested: run the two-timescale loop (:meth:`_anneal_nested`) instead of
+            the single loop. The outer anneal proposes only *structural* moves
+            (flip/recolor); each proposal is followed by an inner layout loop
+            that re-adapts ``pi`` to the new footprints, and the whole proposal
+            is then judged once on the full objective. Layout warm-starts across
+            structural moves -- ``pi`` persists rather than being rebuilt.
+
+            The economics: the single loop pays a full rescore every step, while
+            this pays one per *structural* move and drives the inner loop on the
+            packer's incremental ``quality()`` instead. Under the cost-model
+            objective a full rescore is expensive, so that is a large saving.
+
+            **Off by default, and the benchmark that looks like it argues
+            otherwise does not.** At matched steps it ties or beats the incumbent
+            on 9 of 11 graphs at a ~6x median wall-clock speedup -- but every
+            level of that sweep is 4x to 256x the default ``steps_per_buffer``.
+            At the default itself it is behind on 4 of 11 graphs and ahead on
+            none (worst ``flash_big`` +6.5%, ``flash_attention`` +3.7%), because
+            each outer move spends an entire inner loop, so a small budget buys
+            few structural evaluations. It is still several times cheaper in
+            solver time there, but that saving is fractions of a second per
+            graph -- not a trade worth a few percent of plan quality. Turn this
+            on together with a raised ``steps_per_buffer``, or not at all. See
+            ``benchmarks/coopt_nested_ab.md``.
+        inner_curve: how the inner layout loop's length grows over the outer run,
+            from ``inner_len_base * n`` to ``inner_len_max * n`` steps:
+            ``"constant"`` (never grows), ``"linear"`` / ``"convex"`` in outer
+            progress, or ``"adaptive"`` in the structural *reject* rate -- invest
+            more in layout as structure stops moving. Nested mode only.
+
+            ``"convex"`` is the constructor default but ``"constant"`` is the
+            better one on measurement (mean +0.02% vs +0.23% against the
+            incumbent, and convex degrades badly at the default budget: +10.3% on
+            ``flash_attention``). The default is unchanged only because nested
+            mode is itself off; fix this before turning nested on.
+        inner_annealed: run the inner layout loop as a Metropolis anneal on the
+            packer-quality delta (at a calibrated constant ``qtemp``) rather than
+            greedy-cold. Off, and it should stay off: annealed is worse than
+            greedy on every graph that discriminates, because with a small early
+            inner budget it wanders instead of converging.
+        inner_len_base / inner_len_max: the inner loop's length envelope, as
+            multiples of the buffer count ``n``. ``inner_curve`` interpolates
+            between them; ``"constant"`` pins the length at ``inner_len_base * n``
+            and ignores ``inner_len_max``.
+        early_abandon: run only a quarter of the inner loop, peek at the full
+            score, and skip the remainder when the proposal is already worse than
+            ``abandon_k * temperature``. Saves the tail of hopeless proposals.
+        abandon_k: the multiple of the current temperature above which
+            ``early_abandon`` gives up on a proposal. Larger = more patient.
+        polish_frac: fraction of the nested budget held back for a final
+            pure-layout anneal on the *best* structure found, after the outer
+            loop ends. Exists because the outer loop only ever refines layout
+            inside a proposal's inner loop, and a rejected proposal's layout work
+            is discarded with it -- so without a polish the winning structure can
+            be left under-refined.
     """
 
     def __init__(
