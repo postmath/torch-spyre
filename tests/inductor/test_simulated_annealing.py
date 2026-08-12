@@ -254,6 +254,41 @@ class CoolingScheduleTests(TestCase):
         with self.assertRaises(ValueError):
             s.reset()  # set_buffers() never called
 
+    def test_reheating_set_buffers_reseeds_over_an_explicit_seed_center(self):
+        # An explicit total_steps survives set_buffers (above), but an explicit
+        # seed_center deliberately does not: set_buffers is only called by this
+        # byte-scaled layout annealer, so the peak-load seed is the one on the
+        # right scale. Asserted so the asymmetry is a decision, not a surprise.
+        s = SelfCalibratingReheatingSchedule(total_steps=100, seed_center=1.0)
+        self.assertAlmostEqual(s._seed_center[_SINGLE_MOVE], 1.0)
+        s.set_buffers(_peak600_buffers())  # peak load 600 -> seed 2.0 at band top
+        self.assertEqual(s.total_steps, 100)
+        self.assertAlmostEqual(
+            s._seed_center[_SINGLE_MOVE], 2.0 / s._delta[_SINGLE_MOVE]
+        )
+
+    def test_single_move_driver_rejects_a_multi_move_schedule(self):
+        # A multi-move schedule's reset() returns None because it has no single
+        # starting temperature -- which the single-move protocol reads as "no
+        # steps". The annealer must refuse it at construction rather than run a
+        # silent zero-step anneal and return the un-annealed initial layout.
+        multi = SelfCalibratingReheatingSchedule(
+            bands={"reorder": (0.6, 0.02), "flip": (0.3, 0.005)},
+            total_steps=100,
+            seed_center=1.0,
+        )
+        self.assertFalse(multi.drives_single_move)
+        with self.assertRaises(ValueError):
+            SimulatedAnnealingLayoutSolver(_peak600_buffers(), 400, 128, schedule=multi)
+        # A single-band schedule of the same class is still accepted and anneals.
+        single = SelfCalibratingReheatingSchedule(total_steps=100, seed_center=1.0)
+        self.assertTrue(single.drives_single_move)
+        solver = SimulatedAnnealingLayoutSolver(
+            _peak600_buffers(), 400, 128, schedule=single
+        )
+        solver.solve()
+        self.assertEqual(len(solver.temperature_logs[0]), 100)
+
     def test_default_schedule_is_auto_feasible_and_deterministic(self):
         # The solver's default schedule is the self-calibrating reheating one;
         # with the default (seeded) RNG, two runs of the same instance must agree.

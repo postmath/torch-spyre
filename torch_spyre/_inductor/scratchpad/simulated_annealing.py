@@ -178,6 +178,19 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
                 )
         else:
             self.schedule = schedule
+        # This annealer has exactly one move type, so it drives the schedule
+        # through reset()/update() and reads their ``None`` as "stop". A schedule
+        # holding a temperature per move type returns ``None`` from reset() for an
+        # unrelated reason -- no single starting temperature exists -- which would
+        # silently anneal for zero steps and hand back the initial layout. Refuse
+        # it here, at construction, rather than let that pass as a result.
+        if not self.schedule.drives_single_move:
+            raise ValueError(
+                f"{type(self.schedule).__name__} maintains a temperature per move "
+                "type and cannot be driven by this single-move annealer; pass a "
+                "single-band schedule, or use the co-optimizer for the multi-move "
+                "case."
+            )
         # Let the schedule derive any buffer-dependent parameters (e.g. t0).
         self.schedule.set_buffers(self.buffers)
 

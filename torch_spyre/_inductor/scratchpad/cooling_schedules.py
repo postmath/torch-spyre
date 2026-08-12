@@ -72,9 +72,23 @@ class CoolingSchedule(ABC):
         annealing, so a schedule may derive parameters (e.g. an initial
         temperature from the peak load). Default: no-op."""
 
+    @property
+    def drives_single_move(self) -> bool:
+        """True if :meth:`reset` / :meth:`update` alone can drive a whole anneal.
+
+        A schedule holding one temperature per move type cannot: it has no single
+        starting temperature to return from :meth:`reset`, and ``None`` there
+        already means "no steps". Such a schedule reports False so a single-move
+        driver (:class:`SimulatedAnnealingLayoutSolver`) rejects it up front
+        instead of reading that ``None`` as a zero-step anneal; its own caller
+        drives it through ``temperature(move_type)`` instead. Default: True.
+        """
+        return True
+
     @abstractmethod
     def reset(self) -> Optional[float]:
-        """Reinitialize and return the first temperature (None for no steps)."""
+        """Reinitialize and return the first temperature (None for no steps --
+        only ever a genuinely empty anneal; see :attr:`drives_single_move`)."""
 
     @abstractmethod
     def update(self, accepted: bool, move_scale: float) -> Optional[float]:
@@ -168,7 +182,9 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
     absorbing any remainder) on a single shared carrier; each cools geometrically
     from band top to band bottom, ``center_m`` recomputed from ``d_hat_m`` every
     step so bands drift with the landscape continuously. The EMA horizon is
-    ``cycle_len / horizons_per_cycle``.
+    ``cycle_len / horizons_per_cycle``. The carrier saturates at the band bottom,
+    so the last cycle's remainder steps hold there rather than cooling below the
+    ``accept_lo`` the band was built from (see :meth:`_carrier`).
 
     Budget/band knobs:
         total_steps: annealing budget (temperatures emitted). ``None`` ->
@@ -179,7 +195,8 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         bands: ``{move_type: (accept_hi, accept_lo)}`` for the multi-move case.
         seed_center: explicit pre-snap center (co-optimizer). With ``total_steps``
             also given, the schedule is fully sized in the ctor and needs no
-            :meth:`set_buffers` call.
+            :meth:`set_buffers` call -- and is superseded by the peak-load seed if
+            :meth:`set_buffers` is called anyway.
     """
 
     def __init__(
@@ -219,7 +236,6 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
             b = -math.log(lo)
             self._delta[name] = math.sqrt(b / a)
             self._rt_ab[name] = math.sqrt(a * b)
-        self._explicit_seed = seed_center
         # ``_cycle_len == 0`` marks "not yet sized" so reset() refuses to run
         # uncalibrated. Sized here iff both the budget and an explicit seed are
         # given (co-optimizer path, no buffers); otherwise in set_buffers.
@@ -251,9 +267,22 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         else:
             self.total_steps = max(1, self._total_steps)
         self._size()
-        # Seed each band so the peak-load estimate lands at its top.
+        # Seed each band so the peak-load estimate lands at its top. Unlike
+        # ``total_steps`` above, an explicit ctor ``seed_center`` does NOT survive
+        # this: set_buffers is only ever called by the layout annealer, whose
+        # quality is in buffer bytes, so the peak-derived seed is the one on the
+        # right scale there. (A seed for some other scorer would be worse than
+        # useless, and only the pre-snap steps use either.)
         peak = default_initial_temperature(buffers)
         self._seed_center = {n: peak / self._delta[n] for n in self._bands}
+
+    @property
+    @override
+    def drives_single_move(self) -> bool:
+        # One band is the layout annealer's case: reset()/update() carry the whole
+        # anneal. Two or more means per-move temperatures, which that API cannot
+        # express -- see reset().
+        return len(self._bands) == 1
 
     @override
     def reset(self) -> Optional[float]:
@@ -261,7 +290,7 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
             raise ValueError(
                 "SelfCalibratingReheatingSchedule must be sized before use: give "
                 "total_steps + seed_center, run it through "
-                "SimulatedAnnealingSolverWithBuffers, or call set_buffers() first."
+                "SimulatedAnnealingLayoutSolver, or call set_buffers() first."
             )
         self._i = 0
         self._s = 0
@@ -273,7 +302,10 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         # A single-move schedule has one unambiguous starting temperature (the
         # layout annealer uses it); a multi-move schedule does not -- its caller
         # queries temperature(move_type) per type, so there is nothing to return.
-        if len(self._bands) == 1:
+        # This ``None`` collides with the ABC's "no steps", which is why
+        # drives_single_move is False above: a single-move driver refuses the
+        # schedule rather than mistaking it for an empty anneal.
+        if self.drives_single_move:
             return self.temperature(next(iter(self._bands)))
         return None
 
@@ -283,19 +315,40 @@ class SelfCalibratingReheatingSchedule(CoolingSchedule):
         responsive :meth:`update` also signals it by returning ``None``)."""
         return self._i >= self.total_steps
 
+    def _carrier(self) -> int:
+        """Carrier position for the current step, clamped to one cycle length.
+
+        ``cycle_len`` floors, so the last cycle absorbs the remainder
+        (``total_steps % cycles`` steps beyond ``cycle_len``) and the raw step
+        counter ``_s`` can run past a full cycle there. Clamping holds those steps
+        at the cycle's cold end instead, which keeps both readers honest: the band
+        bottom stays the coldest temperature the schedule will emit -- the whole
+        point of building the band from ``accept_lo`` -- and the phase stays inside
+        ``[0, 1]``.
+        """
+        return min(self._s, self._cycle_len)
+
     def cycle_phase(self) -> float:
-        """Scale-invariant carrier phase ``s / cycle_len`` in ``[0, 1)`` -- 0 at a
-        cycle's hot top, approaching 1 at its cold bottom -- shared across move
-        types (drives the co-optimizer's cycle-phase proposal mix)."""
-        return self._s / self._cycle_len
+        """Scale-invariant carrier phase ``s / cycle_len`` in ``[0, 1]`` -- 0 at a
+        cycle's hot top, 1 at its cold bottom -- shared across move types (drives
+        the co-optimizer's cycle-phase proposal mix).
+
+        Closed at 1, not half-open: the last cycle's remainder steps saturate
+        there (see :meth:`_carrier`). Every earlier cycle stops at
+        ``1 - 1 / cycle_len``.
+        """
+        return self._carrier() / self._cycle_len
 
     def temperature(self, move_type: str = _SINGLE_MOVE) -> float:
         """Temperature for ``move_type`` at the current carrier position ``s``:
-        ``center_m * delta_m * alpha_m ** s`` (band top at ``s == 0``)."""
+        ``center_m * delta_m * alpha_m ** s`` -- band top at ``s == 0``, band
+        bottom ``center_m / delta_m`` at ``s == cycle_len``, and never below that
+        bottom because the carrier saturates there (see :meth:`_carrier`). The
+        band itself still moves with ``center_m``."""
         return (
             self._center[move_type]
             * self._delta[move_type]
-            * (self._alpha[move_type] ** self._s)
+            * (self._alpha[move_type] ** self._carrier())
         )
 
     @override
