@@ -1,0 +1,1289 @@
+{
+ "mlp": {
+  "n": 3,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 29.101264583332917,
+    "mix": {
+     "reorder": 0.5145833333333333,
+     "flip": 0.29375,
+     "recolor": 0.19166666666666668,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 17.872762500000434,
+    "mix": {
+     "reorder": 0.8354166666666667,
+     "flip": 0.08125,
+     "recolor": 0.08333333333333333,
+     "none": 0.0
+    },
+    "cost_ratio": 0.6141575892284986,
+    "spb_grid": [
+     65,
+     261
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 11.676756249999938,
+    "mix": {
+     "reorder": 0.9479166666666666,
+     "flip": 0.027083333333333334,
+     "recolor": 0.025,
+     "none": 0.0
+    },
+    "cost_ratio": 0.40124566465360867,
+    "spb_grid": [
+     100,
+     399
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 34.22117291666619,
+    "mix": {
+     "reorder": 0.33958333333333335,
+     "flip": 0.33958333333333335,
+     "recolor": 0.32083333333333336,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1759342216442918,
+    "spb_grid": [
+     34,
+     136
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 33.96003749999987,
+    "mix": {
+     "reorder": 0.225,
+     "flip": 0.5729166666666666,
+     "recolor": 0.20208333333333334,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1669608859351668,
+    "spb_grid": [
+     34,
+     137
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 34.73025208333332,
+    "mix": {
+     "reorder": 0.24375,
+     "flip": 0.17916666666666667,
+     "recolor": 0.5770833333333333,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1934275908829157,
+    "spb_grid": [
+     34,
+     134
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 38.64020416666688,
+    "mix": {
+     "reorder": 0.09583333333333334,
+     "flip": 0.45416666666666666,
+     "recolor": 0.45,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3277843667590024,
+    "spb_grid": [
+     30,
+     121
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 37.92574999999983,
+    "mix": {
+     "reorder": 0.075,
+     "flip": 0.5041666666666667,
+     "recolor": 0.42083333333333334,
+     "none": 0.0
+    },
+    "cost_ratio": 1.303233744066261,
+    "spb_grid": [
+     31,
+     123
+    ]
+   }
+  }
+ },
+ "swiglu": {
+  "n": 4,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 31.541775000000495,
+    "mix": {
+     "reorder": 0.471875,
+     "flip": 0.3203125,
+     "recolor": 0.2078125,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 19.65139687499992,
+    "mix": {
+     "reorder": 0.803125,
+     "flip": 0.09375,
+     "recolor": 0.103125,
+     "none": 0.0
+    },
+    "cost_ratio": 0.6230276157571859,
+    "spb_grid": [
+     64,
+     257
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 12.505867187499742,
+    "mix": {
+     "reorder": 0.9421875,
+     "flip": 0.0296875,
+     "recolor": 0.028125,
+     "none": 0.0
+    },
+    "cost_ratio": 0.3964858409997391,
+    "spb_grid": [
+     101,
+     404
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 36.859707812500474,
+    "mix": {
+     "reorder": 0.3140625,
+     "flip": 0.325,
+     "recolor": 0.3609375,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1685996686140807,
+    "spb_grid": [
+     34,
+     137
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 41.02707499999969,
+    "mix": {
+     "reorder": 0.1703125,
+     "flip": 0.659375,
+     "recolor": 0.1703125,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3007218205062665,
+    "spb_grid": [
+     31,
+     123
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 41.28971406250001,
+    "mix": {
+     "reorder": 0.18125,
+     "flip": 0.2109375,
+     "recolor": 0.6078125,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3090485257249904,
+    "spb_grid": [
+     31,
+     122
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 43.5751765624999,
+    "mix": {
+     "reorder": 0.075,
+     "flip": 0.478125,
+     "recolor": 0.446875,
+     "none": 0.0
+    },
+    "cost_ratio": 1.381506797334621,
+    "spb_grid": [
+     29,
+     116
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 44.48633125000018,
+    "mix": {
+     "reorder": 0.040625,
+     "flip": 0.4890625,
+     "recolor": 0.4703125,
+     "none": 0.0
+    },
+    "cost_ratio": 1.4103940329927367,
+    "spb_grid": [
+     28,
+     113
+    ]
+   }
+  }
+ },
+ "softmax": {
+  "n": 6,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 29.729098958333292,
+    "mix": {
+     "reorder": 0.5114583333333333,
+     "flip": 0.2791666666666667,
+     "recolor": 0.209375,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 21.71155104166665,
+    "mix": {
+     "reorder": 0.8041666666666667,
+     "flip": 0.090625,
+     "recolor": 0.10520833333333333,
+     "none": 0.0
+    },
+    "cost_ratio": 0.7303131208953353,
+    "spb_grid": [
+     55,
+     219
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 15.712672916666966,
+    "mix": {
+     "reorder": 0.946875,
+     "flip": 0.027083333333333334,
+     "recolor": 0.026041666666666668,
+     "none": 0.0
+    },
+    "cost_ratio": 0.528528393635105,
+    "spb_grid": [
+     76,
+     303
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 33.50778125000009,
+    "mix": {
+     "reorder": 0.3541666666666667,
+     "flip": 0.3229166666666667,
+     "recolor": 0.3229166666666667,
+     "none": 0.0
+    },
+    "cost_ratio": 1.127103828372424,
+    "spb_grid": [
+     35,
+     142
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 35.91667604166682,
+    "mix": {
+     "reorder": 0.184375,
+     "flip": 0.6208333333333333,
+     "recolor": 0.19479166666666667,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2081320087099074,
+    "spb_grid": [
+     33,
+     132
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 32.50113020833352,
+    "mix": {
+     "reorder": 0.18854166666666666,
+     "flip": 0.18645833333333334,
+     "recolor": 0.625,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0932430294603062,
+    "spb_grid": [
+     37,
+     146
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 36.804858333333115,
+    "mix": {
+     "reorder": 0.10104166666666667,
+     "flip": 0.43645833333333334,
+     "recolor": 0.4625,
+     "none": 0.0
+    },
+    "cost_ratio": 1.238007865119519,
+    "spb_grid": [
+     32,
+     129
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 35.61234270833315,
+    "mix": {
+     "reorder": 0.05,
+     "flip": 0.4708333333333333,
+     "recolor": 0.4791666666666667,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1978951248487382,
+    "spb_grid": [
+     33,
+     134
+    ]
+   }
+  }
+ },
+ "rms_norm": {
+  "n": 7,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 29.62385357142867,
+    "mix": {
+     "reorder": 0.5267857142857143,
+     "flip": 0.2741071428571429,
+     "recolor": 0.19910714285714284,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 20.219558035714357,
+    "mix": {
+     "reorder": 0.79375,
+     "flip": 0.10178571428571428,
+     "recolor": 0.10446428571428572,
+     "none": 0.0
+    },
+    "cost_ratio": 0.6825431400057798,
+    "spb_grid": [
+     59,
+     234
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 16.315408035714423,
+    "mix": {
+     "reorder": 0.95,
+     "flip": 0.026785714285714284,
+     "recolor": 0.023214285714285715,
+     "none": 0.0
+    },
+    "cost_ratio": 0.5507523859573136,
+    "spb_grid": [
+     73,
+     291
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 33.072494642857095,
+    "mix": {
+     "reorder": 0.3392857142857143,
+     "flip": 0.33303571428571427,
+     "recolor": 0.32767857142857143,
+     "none": 0.0
+    },
+    "cost_ratio": 1.116414330198909,
+    "spb_grid": [
+     36,
+     143
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 33.55452857142861,
+    "mix": {
+     "reorder": 0.19017857142857142,
+     "flip": 0.6142857142857143,
+     "recolor": 0.19553571428571428,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1326861473481953,
+    "spb_grid": [
+     35,
+     141
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 33.060818749999775,
+    "mix": {
+     "reorder": 0.2044642857142857,
+     "flip": 0.20535714285714285,
+     "recolor": 0.5901785714285714,
+     "none": 0.0
+    },
+    "cost_ratio": 1.116020191980896,
+    "spb_grid": [
+     36,
+     143
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 34.88383928571457,
+    "mix": {
+     "reorder": 0.10357142857142858,
+     "flip": 0.4669642857142857,
+     "recolor": 0.4294642857142857,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1775591315830363,
+    "spb_grid": [
+     34,
+     136
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 35.401484821429015,
+    "mix": {
+     "reorder": 0.060714285714285714,
+     "flip": 0.4973214285714286,
+     "recolor": 0.4419642857142857,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1950330748182167,
+    "spb_grid": [
+     33,
+     134
+    ]
+   }
+  }
+ },
+ "sdpa": {
+  "n": 9,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 44.88401944444479,
+    "mix": {
+     "reorder": 0.525,
+     "flip": 0.2791666666666667,
+     "recolor": 0.19583333333333333,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 30.353759722222417,
+    "mix": {
+     "reorder": 0.8138888888888889,
+     "flip": 0.09583333333333334,
+     "recolor": 0.09027777777777778,
+     "none": 0.0
+    },
+    "cost_ratio": 0.6762709779099172,
+    "spb_grid": [
+     59,
+     237
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 19.954189583333406,
+    "mix": {
+     "reorder": 0.9444444444444444,
+     "flip": 0.027083333333333334,
+     "recolor": 0.02847222222222222,
+     "none": 0.0
+    },
+    "cost_ratio": 0.44457225155674196,
+    "spb_grid": [
+     90,
+     360
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 54.24984861111105,
+    "mix": {
+     "reorder": 0.34791666666666665,
+     "flip": 0.35,
+     "recolor": 0.3020833333333333,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2086673449167986,
+    "spb_grid": [
+     33,
+     132
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 60.63336041666633,
+    "mix": {
+     "reorder": 0.20972222222222223,
+     "flip": 0.6027777777777777,
+     "recolor": 0.1875,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3508897190394298,
+    "spb_grid": [
+     30,
+     118
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 54.5323513888887,
+    "mix": {
+     "reorder": 0.19930555555555557,
+     "flip": 0.19791666666666666,
+     "recolor": 0.6027777777777777,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2149614063951233,
+    "spb_grid": [
+     33,
+     132
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 63.14289305555541,
+    "mix": {
+     "reorder": 0.11319444444444444,
+     "flip": 0.4375,
+     "recolor": 0.44930555555555557,
+     "none": 0.0
+    },
+    "cost_ratio": 1.40680121426537,
+    "spb_grid": [
+     28,
+     114
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 63.84591319444478,
+    "mix": {
+     "reorder": 0.05347222222222222,
+     "flip": 0.50625,
+     "recolor": 0.44027777777777777,
+     "none": 0.0
+    },
+    "cost_ratio": 1.4224642530838862,
+    "spb_grid": [
+     28,
+     112
+    ]
+   }
+  }
+ },
+ "simple_attn": {
+  "n": 9,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 45.9732618055554,
+    "mix": {
+     "reorder": 0.4888888888888889,
+     "flip": 0.3055555555555556,
+     "recolor": 0.20555555555555555,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 29.571033333333464,
+    "mix": {
+     "reorder": 0.79375,
+     "flip": 0.10069444444444445,
+     "recolor": 0.10555555555555556,
+     "none": 0.0
+    },
+    "cost_ratio": 0.6432224334745833,
+    "spb_grid": [
+     62,
+     249
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 20.355631250000098,
+    "mix": {
+     "reorder": 0.9416666666666667,
+     "flip": 0.029166666666666667,
+     "recolor": 0.029166666666666667,
+     "none": 0.0
+    },
+    "cost_ratio": 0.4427710902066193,
+    "spb_grid": [
+     90,
+     361
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 52.95188472222188,
+    "mix": {
+     "reorder": 0.3263888888888889,
+     "flip": 0.33055555555555555,
+     "recolor": 0.34305555555555556,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1517974283874541,
+    "spb_grid": [
+     35,
+     139
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 58.047101388889224,
+    "mix": {
+     "reorder": 0.19027777777777777,
+     "flip": 0.6166666666666667,
+     "recolor": 0.19305555555555556,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2626274297090405,
+    "spb_grid": [
+     32,
+     127
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 51.42043125000008,
+    "mix": {
+     "reorder": 0.19027777777777777,
+     "flip": 0.20694444444444443,
+     "recolor": 0.6027777777777777,
+     "none": 0.0
+    },
+    "cost_ratio": 1.1184855985960613,
+    "spb_grid": [
+     36,
+     143
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 57.1400673611111,
+    "mix": {
+     "reorder": 0.08958333333333333,
+     "flip": 0.46458333333333335,
+     "recolor": 0.44583333333333336,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2428978305430203,
+    "spb_grid": [
+     32,
+     129
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 57.72240902777787,
+    "mix": {
+     "reorder": 0.044444444444444446,
+     "flip": 0.5090277777777777,
+     "recolor": 0.4465277777777778,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2555647948565334,
+    "spb_grid": [
+     32,
+     127
+    ]
+   }
+  }
+ },
+ "block_x2": {
+  "n": 26,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 108.51626754807702,
+    "mix": {
+     "reorder": 0.4872596153846154,
+     "flip": 0.3074519230769231,
+     "recolor": 0.20528846153846153,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 64.77978245192298,
+    "mix": {
+     "reorder": 0.7978365384615385,
+     "flip": 0.10841346153846154,
+     "recolor": 0.09375,
+     "none": 0.0
+    },
+    "cost_ratio": 0.5969591833152846,
+    "spb_grid": [
+     67,
+     268
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 38.90472620192324,
+    "mix": {
+     "reorder": 0.9444711538461539,
+     "flip": 0.026682692307692307,
+     "recolor": 0.028846153846153848,
+     "none": 0.0
+    },
+    "cost_ratio": 0.35851515243727766,
+    "spb_grid": [
+     112,
+     446
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 132.43763846153854,
+    "mix": {
+     "reorder": 0.32740384615384616,
+     "flip": 0.32596153846153847,
+     "recolor": 0.3466346153846154,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2204404137182787,
+    "spb_grid": [
+     33,
+     131
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 150.6732673076921,
+    "mix": {
+     "reorder": 0.2016826923076923,
+     "flip": 0.603125,
+     "recolor": 0.1951923076923077,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3884855304384465,
+    "spb_grid": [
+     29,
+     115
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 139.8536451923073,
+    "mix": {
+     "reorder": 0.1920673076923077,
+     "flip": 0.2064903846153846,
+     "recolor": 0.6014423076923077,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2887804598545245,
+    "spb_grid": [
+     31,
+     124
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 160.518343028846,
+    "mix": {
+     "reorder": 0.09735576923076923,
+     "flip": 0.4600961538461538,
+     "recolor": 0.4425480769230769,
+     "none": 0.0
+    },
+    "cost_ratio": 1.4792099530858818,
+    "spb_grid": [
+     27,
+     108
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 169.18505937500012,
+    "mix": {
+     "reorder": 0.05,
+     "flip": 0.4891826923076923,
+     "recolor": 0.46081730769230766,
+     "none": 0.0
+    },
+    "cost_ratio": 1.5590755487424446,
+    "spb_grid": [
+     26,
+     103
+    ]
+   }
+  }
+ },
+ "block_x3": {
+  "n": 39,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 157.33922836538466,
+    "mix": {
+     "reorder": 0.49246794871794874,
+     "flip": 0.29583333333333334,
+     "recolor": 0.21169871794871795,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 87.6543076923075,
+    "mix": {
+     "reorder": 0.8035256410256411,
+     "flip": 0.09727564102564103,
+     "recolor": 0.09919871794871794,
+     "none": 0.0
+    },
+    "cost_ratio": 0.5571039632198415,
+    "spb_grid": [
+     72,
+     287
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 54.15875144230768,
+    "mix": {
+     "reorder": 0.9407051282051282,
+     "flip": 0.028685897435897435,
+     "recolor": 0.030608974358974358,
+     "none": 0.0
+    },
+    "cost_ratio": 0.34421645513944094,
+    "spb_grid": [
+     116,
+     465
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 193.2138177884615,
+    "mix": {
+     "reorder": 0.32724358974358975,
+     "flip": 0.3451923076923077,
+     "recolor": 0.32756410256410257,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2280079151002714,
+    "spb_grid": [
+     33,
+     130
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 225.91156762820512,
+    "mix": {
+     "reorder": 0.20576923076923076,
+     "flip": 0.5926282051282051,
+     "recolor": 0.2016025641025641,
+     "none": 0.0
+    },
+    "cost_ratio": 1.4358248097135493,
+    "spb_grid": [
+     28,
+     111
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 206.44758221153816,
+    "mix": {
+     "reorder": 0.2126602564102564,
+     "flip": 0.19166666666666668,
+     "recolor": 0.5956730769230769,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3121176731088988,
+    "spb_grid": [
+     30,
+     122
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 243.2175309294871,
+    "mix": {
+     "reorder": 0.10304487179487179,
+     "flip": 0.45208333333333334,
+     "recolor": 0.44487179487179485,
+     "none": 0.0
+    },
+    "cost_ratio": 1.5458162179661235,
+    "spb_grid": [
+     26,
+     104
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 255.3571756410256,
+    "mix": {
+     "reorder": 0.05032051282051282,
+     "flip": 0.4966346153846154,
+     "recolor": 0.4530448717948718,
+     "none": 0.0
+    },
+    "cost_ratio": 1.622972085817127,
+    "spb_grid": [
+     25,
+     99
+    ]
+   }
+  }
+ },
+ "flash_attention": {
+  "n": 44,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 177.61266306818192,
+    "mix": {
+     "reorder": 0.5075284090909091,
+     "flip": 0.29517045454545454,
+     "recolor": 0.19730113636363636,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 102.12283295454517,
+    "mix": {
+     "reorder": 0.7963068181818181,
+     "flip": 0.0981534090909091,
+     "recolor": 0.10553977272727273,
+     "none": 0.0
+    },
+    "cost_ratio": 0.5749749549971124,
+    "spb_grid": [
+     70,
+     278
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 62.500940056818926,
+    "mix": {
+     "reorder": 0.9409090909090909,
+     "flip": 0.028551136363636365,
+     "recolor": 0.030539772727272728,
+     "none": 0.0
+    },
+    "cost_ratio": 0.3518946170680751,
+    "spb_grid": [
+     114,
+     455
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 219.48573295454563,
+    "mix": {
+     "reorder": 0.34076704545454545,
+     "flip": 0.325,
+     "recolor": 0.33423295454545454,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2357549803207977,
+    "spb_grid": [
+     32,
+     129
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 243.63654502840888,
+    "mix": {
+     "reorder": 0.1978693181818182,
+     "flip": 0.6082386363636364,
+     "recolor": 0.19389204545454544,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3717295874049347,
+    "spb_grid": [
+     29,
+     117
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 254.525665482955,
+    "mix": {
+     "reorder": 0.2018465909090909,
+     "flip": 0.20880681818181818,
+     "recolor": 0.5893465909090909,
+     "none": 0.0
+    },
+    "cost_ratio": 1.4330378312341825,
+    "spb_grid": [
+     28,
+     112
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 274.0192309659091,
+    "mix": {
+     "reorder": 0.10213068181818181,
+     "flip": 0.44375,
+     "recolor": 0.45411931818181817,
+     "none": 0.0
+    },
+    "cost_ratio": 1.5427910726203045,
+    "spb_grid": [
+     26,
+     104
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 284.3629750000006,
+    "mix": {
+     "reorder": 0.04943181818181818,
+     "flip": 0.4943181818181818,
+     "recolor": 0.45625,
+     "none": 0.0
+    },
+    "cost_ratio": 1.6010287222079396,
+    "spb_grid": [
+     25,
+     100
+    ]
+   }
+  }
+ },
+ "block_x4": {
+  "n": 52,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 208.43150468749985,
+    "mix": {
+     "reorder": 0.5028846153846154,
+     "flip": 0.3030048076923077,
+     "recolor": 0.19411057692307693,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 116.73293497596134,
+    "mix": {
+     "reorder": 0.8006009615384615,
+     "flip": 0.10408653846153847,
+     "recolor": 0.0953125,
+     "none": 0.0
+    },
+    "cost_ratio": 0.5600541777548378,
+    "spb_grid": [
+     71,
+     286
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 66.27677379807704,
+    "mix": {
+     "reorder": 0.9412259615384615,
+     "flip": 0.027884615384615386,
+     "recolor": 0.030889423076923078,
+     "none": 0.0
+    },
+    "cost_ratio": 0.3179786755243428,
+    "spb_grid": [
+     126,
+     503
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 256.364440745192,
+    "mix": {
+     "reorder": 0.3405048076923077,
+     "flip": 0.3361778846153846,
+     "recolor": 0.3233173076923077,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2299697261676334,
+    "spb_grid": [
+     33,
+     130
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 304.626401322115,
+    "mix": {
+     "reorder": 0.1987980769230769,
+     "flip": 0.6049278846153846,
+     "recolor": 0.19627403846153846,
+     "none": 0.0
+    },
+    "cost_ratio": 1.461518026168067,
+    "spb_grid": [
+     27,
+     109
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 283.3017806490385,
+    "mix": {
+     "reorder": 0.19459134615384616,
+     "flip": 0.19831730769230768,
+     "recolor": 0.6070913461538462,
+     "none": 0.0
+    },
+    "cost_ratio": 1.3592080576964178,
+    "spb_grid": [
+     29,
+     118
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 326.99261021634527,
+    "mix": {
+     "reorder": 0.09927884615384615,
+     "flip": 0.4533653846153846,
+     "recolor": 0.44735576923076925,
+     "none": 0.0
+    },
+    "cost_ratio": 1.5688252632758344,
+    "spb_grid": [
+     25,
+     102
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 336.974365384615,
+    "mix": {
+     "reorder": 0.04927884615384615,
+     "flip": 0.49206730769230766,
+     "recolor": 0.45865384615384613,
+     "none": 0.0
+    },
+    "cost_ratio": 1.616715121304904,
+    "spb_grid": [
+     25,
+     99
+    ]
+   }
+  }
+ },
+ "flash_big": {
+  "n": 80,
+  "arms": {
+   "incumbent": {
+    "cpu_per_step_us": 329.56473312500066,
+    "mix": {
+     "reorder": 0.5046875,
+     "flip": 0.29609375,
+     "recolor": 0.19921875,
+     "none": 0.0
+    },
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "reorder-heavy": {
+    "cpu_per_step_us": 184.2488897656247,
+    "mix": {
+     "reorder": 0.802578125,
+     "flip": 0.100234375,
+     "recolor": 0.0971875,
+     "none": 0.0
+    },
+    "cost_ratio": 0.5590673735582652,
+    "spb_grid": [
+     72,
+     286
+    ]
+   },
+   "reorder-only-ish": {
+    "cpu_per_step_us": 113.9912182812497,
+    "mix": {
+     "reorder": 0.939765625,
+     "flip": 0.029296875,
+     "recolor": 0.0309375,
+     "none": 0.0
+    },
+    "cost_ratio": 0.3458841521068152,
+    "spb_grid": [
+     116,
+     463
+    ]
+   },
+   "balanced": {
+    "cpu_per_step_us": 419.5177178124998,
+    "mix": {
+     "reorder": 0.333671875,
+     "flip": 0.335234375,
+     "recolor": 0.33109375,
+     "none": 0.0
+    },
+    "cost_ratio": 1.2729448137079062,
+    "spb_grid": [
+     31,
+     126
+    ]
+   },
+   "flip-heavy": {
+    "cpu_per_step_us": 453.94109062500075,
+    "mix": {
+     "reorder": 0.204765625,
+     "flip": 0.596640625,
+     "recolor": 0.19859375,
+     "none": 0.0
+    },
+    "cost_ratio": 1.377395834562266,
+    "spb_grid": [
+     29,
+     116
+    ]
+   },
+   "recolor-heavy": {
+    "cpu_per_step_us": 505.78312429687463,
+    "mix": {
+     "reorder": 0.203046875,
+     "flip": 0.19171875,
+     "recolor": 0.605234375,
+     "none": 0.0
+    },
+    "cost_ratio": 1.5347003895135711,
+    "spb_grid": [
+     26,
+     104
+    ]
+   },
+   "structure-heavy": {
+    "cpu_per_step_us": 531.0943998437501,
+    "mix": {
+     "reorder": 0.102265625,
+     "flip": 0.448671875,
+     "recolor": 0.4490625,
+     "none": 0.0
+    },
+    "cost_ratio": 1.6115025257945645,
+    "spb_grid": [
+     25,
+     99
+    ]
+   },
+   "as-reheating": {
+    "cpu_per_step_us": 549.7681478124994,
+    "mix": {
+     "reorder": 0.051484375,
+     "flip": 0.4884375,
+     "recolor": 0.460078125,
+     "none": 0.0
+    },
+    "cost_ratio": 1.6681643772969412,
+    "spb_grid": [
+     24,
+     96
+    ]
+   }
+  }
+ }
+}

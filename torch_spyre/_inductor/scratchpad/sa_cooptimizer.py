@@ -197,13 +197,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             higher: this engine searches divisions as well as layout, so it
             wants a larger budget at the same buffer count. Note this bounds
             *steps*, not wall-clock -- per-step cost also grows with ``n``.
-        schedule: ``"reheating"`` (Plan §5 -- the multi-move self-calibrating
-            reheating schedule + cycle-phase proposal mix) or ``"crude"`` (the
-            Phase-3/4 single geometric cool + fixed proposal weights, retained as
-            the A/B baseline the reheating schedule must beat).
+        schedule: ``"crude"`` (default -- a single geometric cool with fixed
+            proposal weights) or ``"reheating"`` (Plan §5 -- the multi-move
+            self-calibrating reheating schedule + cycle-phase proposal mix).
 
-            **Reheating stays the default because it converges faster, not
-            because it ends up better.** At the shipping budget the two tie:
+            Crude is the default on the score/CPU frontier, not on score.
+
+            The two are statistically tied on score, and crude is cheaper, so
+            reheating sits off the frontier. At the shipping budget the tie is
+            flat:
             re-measured under the cost objective
             (``benchmarks/coopt_schedule_default.md``, 20 fresh seeds) every
             capacity x move cell lands within noise of zero, 25 of 33 exactly
@@ -218,6 +220,48 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             at 10, +0.7% at 20, and +0.16% at 40 -- a clean decay to the tie. The
             schedule is doing real work; the corpus is just too easy at the
             budget we ship to show it.
+
+            Traced directly (``benchmarks/coopt_convergence.md``) the same fact
+            reads off the curve: median 40 steps for reheating to come within 1%
+            of the best score any arm reaches, against 82 for crude, and crude is
+            slower on every graph that converges at all -- 616 steps vs 224 on
+            ``flash_attention``, 205 vs 41 on ``block_x4``.
+
+            **Those are steps, and a step is no longer a fixed price.** The two
+            schedules propose different move *types* -- crude ~50% reorder,
+            reheating ~5% reorder against ~46% recolor -- and under the cost
+            objective a recolor rewrites a region's divisions and dirties many
+            bundles where a reorder only moves residency. Measured, reheating
+            costs ~1.7x per step (``flash_big`` 1.87s vs 1.10s at ``spb=40``).
+            The sweeps in this series assume the opposite ("schedule choice does
+            not change per-step work"), which held under the memory-only
+            objective and does not hold now.
+
+            Re-run with per-arm wall-clock calibration, the step-count advantage
+            does not survive being priced: at matched CPU the two are still a tie,
+            now with a slight tilt the *other* way (mean -0.02% to -0.05% in
+            crude's favour, all four capacity x move cells' CIs spanning zero,
+            25-26 of 33 cells exactly tied). Crude wins 6-7 cells to reheating's
+            1, and the residual mismatch runs against crude -- it received ~13%
+            less CPU than its calibration intended -- so if anything the tilt is
+            understated.
+
+            Pooled over the matched-CPU run, crude scores -0.008% against
+            reheating for 0.73x the CPU, and 9 of 11 graphs tie exactly. Crude
+            converges in more *steps* -- a median 82 against 40 to come within 1%
+            of the best any arm reaches -- but its steps cost 0.59-0.76x, because
+            it proposes ~50% reorders where reheating proposes ~46% recolors and a
+            recolor dirties far more bundles under the cost objective. The two
+            effects cancel on score and do not cancel on time.
+
+            **What this promotes.** The reheating-only knobs (``cycles``,
+            ``move_bands``, ``horizons_per_cycle``, ``weight_floor``,
+            ``reorder_neighborhood_scale``) are now dormant, and the crude-only
+            ones -- ``reorder_weight``, ``flip_weight``, ``recolor_weight`` --
+            are now on the live path. Those three have never been swept: they are
+            the guessed weights this schedule shipped with as an A/B baseline,
+            and nothing in ``benchmarks/`` has ever varied them. That is the
+            largest unmeasured surface in this engine.
 
             Two consequences. Do not read the tie as licence to drop reheating:
             on a harder graph, or at a tighter budget, the gap is large. And do
@@ -241,7 +285,27 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         move_bands: per-move-type ``(accept_hi, accept_lo)`` acceptance bands for
             the reheating schedule; defaults to :data:`_DEFAULT_MOVE_BANDS`.
         reorder_weight / flip_weight / recolor_weight: fixed proposal weights for
-            the ``"crude"`` schedule only.
+            the ``"crude"`` schedule -- which, since crude became the default, is
+            the live path.
+
+            Guessed when crude existed only as the A/B baseline reheating had to
+            beat, and now measured for the first time
+            (``benchmarks/coopt_move_weights.md``, matched wall-clock, 10 fresh
+            seeds). **They survive.** Nothing swept is both significantly better
+            on score and no more expensive; the defaults land on the score/CPU
+            frontier, between the arms that buy score with CPU
+            (``recolor-heavy`` -0.124% at 1.04x) and those that buy CPU with
+            score (``reorder-heavy`` +0.079%, not significant, at 0.92x). Pushing
+            all the way to reorder-only is the one clear mistake: +0.523%
+            (significant) for 0.86x.
+
+            Two things worth knowing before retuning them. The whole spread is
+            ~0.1% of score against a cost model no one has checked on hardware.
+            And they are not independent of ``schedule``: giving crude the
+            reheating schedule's *observed* mix reproduces reheating's shape
+            against crude -- a small score gain bought with CPU -- so the
+            schedule knob is largely a mix knob, and moving these weights
+            re-opens that decision.
         burst_fraction: layout-burst length as a fraction of the buffer count
             (Plan §4.4; the burst warms ``pi`` to the new footprints before the
             compound move is judged).
@@ -403,17 +467,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             graph -- not a trade worth a few percent of plan quality. Turn this
             on together with a raised ``steps_per_buffer``, or not at all. See
             ``benchmarks/coopt_nested_ab.md``.
+
+            The convergence trace puts the same conclusion more starkly: at the
+            default budget nested never comes within 1% of the best score any arm
+            reaches on 5 of 11 graphs, and needs a median 196 steps where the
+            incumbent needs 40 (``benchmarks/coopt_convergence.md``).
         inner_curve: how the inner layout loop's length grows over the outer run,
             from ``inner_len_base * n`` to ``inner_len_max * n`` steps:
             ``"constant"`` (never grows), ``"linear"`` / ``"convex"`` in outer
             progress, or ``"adaptive"`` in the structural *reject* rate -- invest
             more in layout as structure stops moving. Nested mode only.
 
-            ``"convex"`` is the constructor default but ``"constant"`` is the
-            better one on measurement (mean +0.02% vs +0.23% against the
-            incumbent, and convex degrades badly at the default budget: +10.3% on
-            ``flash_attention``). The default is unchanged only because nested
-            mode is itself off; fix this before turning nested on.
+            ``"constant"`` is the default on measurement: mean +0.02% against
+            the incumbent where ``convex`` gives +0.23%, and convex degrades
+            badly at the shipping budget (+10.3% on ``flash_attention``, +15.8%
+            on ``flash_big``). Effect sizes, not CI-tested -- the sweep behind
+            them ran 5 seeds.
         inner_annealed: run the inner layout loop as a Metropolis anneal on the
             packer-quality delta (at a calibrated constant ``qtemp``) rather than
             greedy-cold. Off, and it should stay off: annealed is worse than
@@ -428,12 +497,39 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             ``abandon_k * temperature``. Saves the tail of hopeless proposals.
         abandon_k: the multiple of the current temperature above which
             ``early_abandon`` gives up on a proposal. Larger = more patient.
+        trace_every: sample the best-seen score every N steps into ``trace``, a
+            list of ``(steps_taken, best_score)``. ``0`` (default) disables it.
+
+            Exists because this series' benchmarks compare *endpoints*, and an
+            endpoint goes blind the moment every arm converges -- which on the
+            current corpus happens by ``steps_per_buffer`` 20, below the default
+            of 40. That blindness is not hypothetical: the ``schedule`` choice
+            reads as a dead tie at the shipping budget and is worth 23% at
+            ``spb=2``, because reheating converges faster rather than better. A
+            trace shows that directly instead of requiring someone to suspect it
+            and go looking.
+
+            The sampling touches no RNG and no search state, so a traced solve
+            follows the identical trajectory to an untraced one -- asserted in
+            the tests rather than assumed, since the engine's determinism
+            guarantee would otherwise mask a perturbation as just another valid
+            search. ``steps_taken`` counts a nested outer move as ``1 + inner``,
+            so schedules that spend their budget differently share an x-axis.
         polish_frac: fraction of the nested budget held back for a final
             pure-layout anneal on the *best* structure found, after the outer
             loop ends. Exists because the outer loop only ever refines layout
             inside a proposal's inner loop, and a rejected proposal's layout work
             is discarded with it -- so without a polish the winning structure can
             be left under-refined.
+
+            Defaults to ``0.0``: the hypothesis did not survive its sweep
+            (``benchmarks/coopt_polish_sweep.md``). 8 of 11 graphs were
+            polish-insensitive and on ``flash_attention`` more polish steadily
+            hurt -- 0.0 landed within +1.0% of the incumbent where 0.2 gave
+            +12.3% -- because the polish steals budget from the outer structural
+            loop and freezes structure on the best-so-far too early. Measured
+            under the memory-only objective, so re-check it if nested is ever
+            turned on.
     """
 
     def __init__(
@@ -446,7 +542,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         steps_per_buffer: int = 40,
         min_steps: int = 200,
         max_steps: int = 15_000,
-        schedule: str = "reheating",
+        schedule: str = "crude",
         cycles: int = 4,
         horizons_per_cycle: float = 2.0,
         weight_floor: float = 0.05,
@@ -462,13 +558,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         sweep_biased_i: bool = True,
         sweep_cleanup: bool = False,
         nested: bool = False,
-        inner_curve: str = "convex",
+        inner_curve: str = "constant",
         inner_annealed: bool = False,
         inner_len_base: float = 0.25,
         inner_len_max: float = 3.0,
         early_abandon: bool = True,
-        polish_frac: float = 0.2,
+        polish_frac: float = 0.0,
         abandon_k: float = 30.0,
+        trace_every: int = 0,
     ) -> None:
         super().__init__(buffers, size, alignment)
         # Declared over ``LifetimeBoundBuffer`` so the class itself satisfies
@@ -540,6 +637,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._inner_annealed = inner_annealed
         self._inner_len_base = inner_len_base
         self._inner_len_max = inner_len_max
+        # Convergence trace (off by default). ``trace`` is [(steps_taken,
+        # best_score_so_far)], sampled every ``trace_every`` steps -- the
+        # instrument for "which option gets there sooner", which an endpoint
+        # comparison cannot answer once every option has converged.
+        self._trace_every = max(0, int(trace_every))
+        self._steps_taken = 0
+        self._last_trace = 0
+        self.trace: list[tuple[int, int]] = []
         self._early_abandon = early_abandon
         self._polish_frac = polish_frac
         self._abandon_k = abandon_k
@@ -600,6 +705,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.sweep_probes = 0
         self.sweep_evals = 0
         self.sweep_steps = 0
+        self._steps_taken = 0
+        self._last_trace = 0
+        self.trace = []
         n = len(self._bufs)
         if n == 0:
             return list(self._bufs)
@@ -1375,12 +1483,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 k += 1
         return self._score()
 
+    def _tick_trace(self, steps: int = 1) -> None:
+        """Advance the step counter and sample the convergence trace.
+
+        Off unless ``trace_every`` is set, and a no-op beyond one integer
+        compare when it is. Deliberately touches neither the RNG nor any search
+        state: a trace that perturbs the trajectory measures a different search
+        than the one it claims to describe, and this engine's determinism
+        guarantee would hide that rather than surface it.
+
+        ``steps`` is the work the caller just consumed -- 1 for a judged move,
+        ``1 + inner`` for a nested outer move -- so the x-axis means the same
+        thing across schedules that spend their budget differently.
+        """
+        self._steps_taken += steps
+        if not self._trace_every:
+            return
+        if self._steps_taken - self._last_trace >= self._trace_every:
+            self._last_trace = self._steps_taken
+            self.trace.append((self._steps_taken, self._best_score))
+
     def _step(self, name: str, temperature: float, cur: int) -> tuple[int, bool, float]:
         """Execute one judged move: propose ``name``, apply the Metropolis test
         against ``temperature``, and update best-seen + instrumentation. Returns
         ``(new_cur, accepted, |dE|)``."""
         if name == "reorder" and self._reorder_move != "random":
-            return self._step_reorder_sweep(temperature, cur)
+            out = self._step_reorder_sweep(temperature, cur)
+            self._tick_trace()
+            return out
         snap = self._snapshot()
         self._execute_move(name)
         self.moves_proposed[name] += 1
@@ -1401,6 +1531,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         else:
             self._adopt(snap)  # this step's snapshot is dead either way
         self._record_recolor(name, accepted)
+        self._tick_trace()
         return cur, accepted, scale
 
     def _anneal(self) -> None:
@@ -1442,6 +1573,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.baseline_score = cur
         self._best_score = cur
         self._best_snap = self._snapshot()
+        if self._trace_every:
+            self.trace.append((0, cur))
 
         if self._applicable_moves():
             if self._nested:
@@ -1452,6 +1585,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 self._anneal_reheating(steps, cur)
 
         self.best_score = self._best_score
+        if self._trace_every:
+            # The endpoint always lands in the trace, whatever the sampling
+            # interval divides into, so a curve's last point is the reported
+            # score rather than the last multiple of trace_every before it.
+            self.trace.append((self._steps_taken, self._best_score))
         # Copy, not adopt: ``_best_snap`` stays the record of the published
         # ``best_score``, so the live state _write_back walks must not alias it.
         self._restore_copy(self._best_snap)
@@ -1645,6 +1783,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             else:
                 self._adopt(snap)  # outer snapshot is per-iteration, dead here
             self._record_recolor(name, accepted)
+            self._tick_trace(1 + used)
             spent += 1 + used
 
         # Final polish: a long pure-layout anneal on the best structure found.
