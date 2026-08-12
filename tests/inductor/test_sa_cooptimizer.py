@@ -1153,5 +1153,52 @@ class BundleObjectiveStringTest(TestCase):
             SaCoOptimizingSolver(buffers, 1 << 30, 128, cost_objective="cost-model")
 
 
+class ConvergenceTraceTest(TestCase):
+    """``trace_every`` records the search's progress without altering it."""
+
+    def test_tracing_does_not_change_the_search(self):
+        # The whole value of the instrument rests on this: a trace that perturbs
+        # the trajectory describes a different search than the one it claims to.
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            plain = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
+            plain_out = plain.plan_layout_and_core_divisions()
+            traced = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, trace_every=1
+            )
+            traced_out = traced.plan_layout_and_core_divisions()
+            self.assertEqual(plain.best_score, traced.best_score, f"{case}[{gi}]")
+            self.assertEqual(
+                [(b.chosen_division, b.address) for b in plain_out],
+                [(b.chosen_division, b.address) for b in traced_out],
+                f"{case}[{gi}] traced solve diverged",
+            )
+
+    def test_trace_is_monotone_and_ends_at_the_reported_score(self):
+        for case, gi, buffers in _all_cases():
+            cap = max(1, _seed_footprint(buffers) // 2)
+            solver = SaCoOptimizingSolver(
+                copy.deepcopy(buffers), cap, 128, seed=0, trace_every=25
+            )
+            solver.plan_layout_and_core_divisions()
+            trace = solver.trace
+            self.assertTrue(trace, f"{case}[{gi}] empty trace")
+            steps = [t[0] for t in trace]
+            scores = [t[1] for t in trace]
+            self.assertEqual(steps, sorted(steps), f"{case}[{gi}] steps went backwards")
+            # best-seen only ever improves, so the curve is non-increasing
+            self.assertEqual(
+                scores, sorted(scores, reverse=True), f"{case}[{gi}] best-seen rose"
+            )
+            self.assertEqual(trace[0], (0, solver.baseline_score), f"{case}[{gi}]")
+            self.assertEqual(trace[-1][1], solver.best_score, f"{case}[{gi}]")
+
+    def test_off_by_default(self):
+        buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(1, 1)]})]
+        solver = SaCoOptimizingSolver(buffers, 1 << 30, 128, seed=0)
+        solver.plan_layout_and_core_divisions()
+        self.assertEqual(solver.trace, [])
+
+
 if __name__ == "__main__":
     unittest.main()
