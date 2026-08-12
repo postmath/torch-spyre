@@ -85,4 +85,3 @@ Tied at unbounded capacity: `softmax`, `rms_norm`. These graphs score identicall
 ## Verdict: COST MODEL WINS -- largest at loose LX
 
 The gap is widest where LX is roomy and narrowest where it is tight: under pressure the memory objective is *forced* into splits for residency reasons and stumbles onto much of the same answer, while at loose capacity it has no signal at all. So the cost model earns its keep exactly where the incumbent is inert, which is the regime a default affects most.
-

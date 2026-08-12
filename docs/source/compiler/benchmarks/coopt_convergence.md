@@ -32,4 +32,3 @@ Steps until an arm's best-seen score is within a tolerance of the best score *an
 ## Reading this
 
 A tie in `final gap` with a difference in `steps to within 1%` is an arm that reaches the same place faster -- invisible to every endpoint sweep in this series, and the state `schedule` turned out to be in. A tie in both is a genuine non-difference. `never` means the arm did not reach the bar inside the default budget on some graph, which is the case a mean over the arrivals would quietly drop.
-

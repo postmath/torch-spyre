@@ -80,4 +80,3 @@ The co-optimizer's `reorder` move rotates a random buffer to a random position; 
 | sweep-q-unbi | 44 | -0.47 | +0.00 | 7 | 4 | 33 |
 
 _Negative % = the sweep arm reaches a better (lower) score than the incumbent at the same CPU time. Capacity = footprint//4; scores are the SA fixed-point objective. Cells where an arm's measured time range does not cover the target are left blank rather than extrapolated._
-

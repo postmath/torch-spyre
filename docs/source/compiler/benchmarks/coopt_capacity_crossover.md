@@ -4,7 +4,6 @@
 
 ![crossover](../../_static/images/coopt/coopt_capacity_crossover.png)
 
-
 ## reorder_move = `sweep_quality`
 
 | capacity / footprint | spill fraction | non-tied cells | delta % | 95% CI |
@@ -22,7 +21,6 @@
 
 No sign change over the swept range.
 
-
 ## reorder_move = `random`
 
 | capacity / footprint | spill fraction | non-tied cells | delta % | 95% CI |
@@ -39,4 +37,3 @@ No sign change over the swept range.
 | 0.10 | 0.34 | 1 | -0.15 **sig** | [-0.20, -0.12] |
 
 No sign change over the swept range.
-

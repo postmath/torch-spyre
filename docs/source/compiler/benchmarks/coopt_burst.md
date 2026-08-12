@@ -35,4 +35,3 @@
 **The burst is inert here, not merely unhelpful.** Across every arm -- from no burst at all to 3n -- flip acceptance moves by 1.5% and recolor acceptance by 1.5%. If the burst were adapting the layout enough to change how Metropolis judges a structural move, acceptance is where it would show, and it does not. The greedy pass is finding nothing that changes the verdict.
 
 That leaves the burst without a demonstrated job on this corpus, under either primitive and at every length from zero to the point where it costs 30% of the budget. The remaining explanations are that the layout simply does not need re-adapting after a division change here -- which the warm-start transfer experiment found to be true at small and medium changes -- or that this corpus converges too early for it to matter, as it does for most knobs measured in this series. Both are claims about the corpus rather than about the mechanism.
-

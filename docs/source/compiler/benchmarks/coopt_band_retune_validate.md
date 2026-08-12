@@ -18,7 +18,6 @@ Baseline is the shipped `reheat b(.6,.02) c4`; `crude` is the schedule that curr
 
 **Best arm: `crude` (-3.30% vs shipped).**
 
-
 ## Per graph and budget
 
 | graph | n | spb | crude | reheat x16 c4 | reheat x8 c2 | reheat x2 c4 | reheat b(.6,.02) c4 |
@@ -34,4 +33,3 @@ Baseline is the shipped `reheat b(.6,.02) c4`; `crude` is the schedule that curr
 | flash_big | 79 | 2560 | 182,244,000 | 183,576,000 | 183,184,000 | 185,394,000 | 182,146,000 |
 
 _Scores are the SA fixed-point objective, mean over seeds. Graphs whose score is identical under every arm at every budget are omitted._
-

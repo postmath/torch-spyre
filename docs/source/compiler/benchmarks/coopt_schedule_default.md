@@ -17,7 +17,6 @@ Cells where both schedules reach the same score under every seed are counted as 
 
 **Match quality.** Achieved crude/reheating CPU ratio across cells: mean 0.87 (min 0.53, max 1.07); 1.00 is a perfect match. 2 of 132 cells sit on the engine's `min_steps=200` floor, where both arms run the same steps whatever spb was assigned, so the cheaper arm just uses less time. Those cells are unmatched by construction and tilt the aggregate toward crude.
 
-
 ## Per graph (non-tied cells only)
 
 | graph | n | capacity | move | spb rh/cr | cpu s rh/cr | reheating | crude | delta % |
@@ -56,4 +55,3 @@ Cells where both schedules reach the same score under every seed are counted as 
 ## Verdict: MIXED -- see per-cell table
 
 A global default flip is justified only if crude wins (CI strictly below zero) in **every** capacity x move combination. If it wins under the sweep but not under `random`, the honest change is a conditional default.
-

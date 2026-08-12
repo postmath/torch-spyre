@@ -4,7 +4,7 @@ Capacity `footprint//4`, 10 seeds, `reorder_move` at its default (`sweep_quality
 
 Baseline is the shipped `reheat b(.6,.02) c4`; `crude` is the schedule that currently beats it. Negative delta = better than the shipped default. Only graphs where some arm moves are shown: sdpa, flash_attention, flash_big.
 
-![lines](../../_static/images/coopt/coopt_band_retune.png)
+![lines](../../_static/images/coopt/coopt_band_retune_band.png)
 
 ## Aggregate over discriminating graphs
 
@@ -26,7 +26,6 @@ Baseline is the shipped `reheat b(.6,.02) c4`; `crude` is the schedule that curr
 
 **Best arm: `crude` (-3.93% vs shipped).**
 
-
 ## Per graph and budget
 
 | graph | n | spb | crude | reheat b(.6,.02) c1 | reheat b(.6,.02) c2 | reheat b(.6,.02) c4 | reheat b(.6,1e-3) c1 | reheat b(.6,1e-3) c2 | reheat b(.6,1e-3) c4 | reheat b(.6,1e-6) c1 | reheat b(.6,1e-6) c2 | reheat b(.6,1e-6) c4 | reheat b(.3,1e-6) c1 | reheat b(.3,1e-6) c2 | reheat b(.3,1e-6) c4 |
@@ -42,4 +41,3 @@ Baseline is the shipped `reheat b(.6,.02) c4`; `crude` is the schedule that curr
 | flash_big | 79 | 2560 | 180,880,000 | 181,432,000 | 180,280,000 | 182,820,000 | 181,232,000 | 183,420,000 | 182,300,000 | 180,268,000 | 180,156,000 | 182,604,000 | 179,248,000 | 180,996,000 | 183,584,000 |
 
 _Scores are the SA fixed-point objective, mean over seeds. Graphs whose score is identical under every arm at every budget are omitted._
-

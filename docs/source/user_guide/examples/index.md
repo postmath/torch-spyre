@@ -56,6 +56,7 @@ artifact from auditing `SimpleMLP`.
 
 provenance/README
 provenance/provenance_audit
+scratchpad/README
 ```
 
 ## Running an Example
