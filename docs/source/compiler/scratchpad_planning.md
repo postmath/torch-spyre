@@ -644,7 +644,6 @@ be added without disturbing the rest of the planner.
 Two non-greedy solver families are being prototyped on top of the same
 `MemoryPlanSolver` interface:
 
-- **Simulated Annealing** (Imanishi-Xu) uses a first-fit or best-fit
 - **Simulated Annealing** uses a first-fit or best-fit
   allocation as the initial guess, then perturbs the order to escape
   local minima.
