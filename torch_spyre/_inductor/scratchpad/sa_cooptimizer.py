@@ -725,6 +725,37 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- static topology (division-invariant) --------------------------------
 
+    def _assert_unsized_buffers_are_pinned(self) -> None:
+        """Assert every unsized buffer carries a ``residency_reason``.
+
+        An unsized buffer is one whose ``mem_usage`` is the ``-1`` sentinel
+        ``mem_usage_by_buf`` emits (``utils.py``) when it cannot size a buffer.
+        :meth:`_per_core_size` clamps that to ``0``, and a zero footprint passes
+        the capacity gate in :meth:`_eligible` -- so an unsized buffer that
+        reached the search would be placed occupying no space, and the buffer
+        stacked above it would align to the same address. A wrong layout, not a
+        crash.
+
+        The reason that cannot happen is a coupling across three files:
+        ``mem_usage_by_buf`` emits ``-1`` on exactly the three conditions
+        ``_op_output_good_for_lx_reuse`` (``allocator.py``) refuses -- not a
+        ``ComputedBuffer``, a ``MutationLayoutSHOULDREMOVE`` layout, not a
+        ``FixedTiledLayout`` -- so the allocator hands every such buffer an "op
+        not allowed" ``residency_reason``, and :meth:`_eligible`'s pin gate
+        rejects it before the clamped footprint is ever consulted.
+
+        Nothing in the search re-derives that, so state it here rather than
+        depend on the three staying in lockstep. One pass over the buffers per
+        solve, against a search that is O(steps x n).
+        """
+        for b in self._bufs:
+            assert b.size >= 0 or b.residency_reason is not None, (
+                f"buffer {b.name} is unsized (size={b.size}) but carries no "
+                "residency_reason, so nothing gates it out of LX residency; its "
+                "per-core footprint would clamp to 0 and the buffer placed above "
+                "it would land on the same address"
+            )
+
     def _precompute_topology(self) -> None:
         """Precompute the division-invariant graph structure used every step:
         the name->index map, each buffer's parent indices, and -- keyed by parent
@@ -738,6 +769,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         ``test_read_count_matches_consumer_count``), and ``_children`` remains
         available for the Phase-6 cohort multiplicity.
         """
+        self._assert_unsized_buffers_are_pinned()
         bufs = self._bufs
         self._name_to_idx = {b.name: i for i, b in enumerate(bufs)}
         n = len(bufs)
@@ -877,7 +909,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         so its footprint is never actually used -- clamp it so a nonsense size can
         never look placeable, and so the packer never receives a negative size.
         Mirrors the ``max(0, ...)`` clamp at the other packer-feeding sites in
-        ``allocator.py``."""
+        ``allocator.py``. What makes "never actually used" true is asserted in
+        :meth:`_assert_unsized_buffers_are_pinned`, because the clamp on its own
+        would turn an unsized buffer into a zero-footprint *placeable* one."""
         part = self._bufs[idx].core_divisions[div_idx].output_partition
         return max(0, ceil_div(self._bufs[idx].size, part))
 

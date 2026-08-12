@@ -362,6 +362,63 @@ class SeedPermutationTest(TestCase):
                         )
 
 
+class UnsizedBufferTest(TestCase):
+    """An unsized buffer (the ``mem_usage`` ``-1`` sentinel) is always a fixed pin.
+
+    ``_per_core_size`` clamps ``-1`` to a ``0`` footprint, which passes the
+    capacity gate -- so an unsized buffer that ever reached the search would be
+    placed occupying no space and the buffer above it would land on the same
+    address. What prevents that is a coupling across ``utils.mem_usage_by_buf``,
+    ``allocator._op_output_good_for_lx_reuse`` and ``_eligible``'s pin gate,
+    which no single file states. ``_assert_unsized_buffers_are_pinned`` states
+    it; these pin that it holds on the corpus and that it actually bites.
+    """
+
+    @staticmethod
+    def _graph(residency_reason):
+        """A sized buffer alongside an unsized one, co-live, with the pin state
+        under test carried by the unsized buffer."""
+
+        def buf(name, size, reason):
+            return CoreDivisionBuffer(
+                name=name,
+                size=size,
+                uses=[0, 1],
+                first_use_is_read=False,
+                residency_reason=reason,
+                core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+                boundary=BufferType.Intermediate,
+            )
+
+        return [buf("sized", 256, None), buf("unsized", -1, residency_reason)]
+
+    def test_corpus_holds_the_invariant(self):
+        unsized = 0
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for b in buffers:
+                if b.size < 0:
+                    unsized += 1
+                    self.assertIsNotNone(
+                        b.residency_reason, f"{case}[{gi}] {b.name}: unsized, unpinned"
+                    )
+        # The corpus has to actually carry the sentinel, or this proves nothing.
+        self.assertGreater(unsized, 0, "no unsized buffer in the corpus")
+
+    def test_unsized_and_unpinned_is_rejected(self):
+        solver = SaCoOptimizingSolver(self._graph(None), 1024, 128, seed=0)
+        with self.assertRaisesRegex(AssertionError, "unsized"):
+            solver.plan_layout_and_core_divisions()
+
+    def test_unsized_but_pinned_solves_and_spills(self):
+        solver = SaCoOptimizingSolver(self._graph("op not allowed"), 1024, 128, seed=0)
+        out = {b.name: b for b in solver.plan_layout_and_core_divisions()}
+        # The pin is spilled under its own reason, and never occupies a slot the
+        # sized buffer would then be stacked on top of.
+        self.assertIsNone(out["unsized"].address)
+        self.assertEqual(solver.spill_reasons["unsized"], "op not allowed")
+        self.assertEqual(out["sized"].address, 0)
+
+
 class DeterminismTest(TestCase):
     """Two runs on identical input are bit-for-bit identical (Plan §6.5/§7.5)."""
 
