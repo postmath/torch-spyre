@@ -87,6 +87,23 @@ def _default_spb() -> int:
 DEFAULT_SPB = _default_spb()
 
 
+def _min_steps() -> int:
+    """The engine's ``min_steps`` floor, read off its signature.
+
+    Matters to any sweep that varies ``steps_per_buffer``: below the floor every
+    arm runs the same number of steps regardless, so a grid derived per arm stops
+    being a grid.
+    """
+    import inspect
+
+    from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
+
+    return inspect.signature(SaCoOptimizingSolver).parameters["min_steps"].default
+
+
+MIN_STEPS = _min_steps()
+
+
 def load_graphs() -> dict[str, dict]:
     """``{graph_name: {"buffers", "features", "bundles"}}`` for the whole corpus.
 

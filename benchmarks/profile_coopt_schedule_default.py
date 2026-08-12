@@ -70,6 +70,7 @@ import time  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 from coopt_corpus import (  # noqa: E402
     DEFAULT_SPB,
+    MIN_STEPS as _MIN_STEPS,
     FRESH_SEED_BASE,
     announce,
     cost_objective_for,
@@ -138,7 +139,68 @@ def _solve(name, cap_div, move, schedule, spb, seed):
 
 
 def _work(task):
-    return task, _solve(*task)
+    """The trailing level index rides along so the result can be filed against
+    the wall-clock target rather than the (now arm-specific) spb."""
+    *solve_args, level = task
+    return task, _solve(*solve_args)
+
+
+CALIB_JSON = os.path.join(_RESULTS, "coopt_schedule_default_calib.json")
+CALIB_SPB = 160
+INCUMBENT = "reheating"
+
+
+def calibrate():
+    """Per-step CPU for every (graph, capacity, move, schedule), and the per-arm
+    ``spb`` grid that puts each schedule on the incumbent's wall-clock targets.
+
+    Needed because this sweep used to assume the schedules cost the same per
+    step, which was true under the memory-only objective and is not true now: the
+    two propose different move *types* (crude ~50% reorder, reheating ~46%
+    recolor), and under the cost objective a recolor dirties far more bundles
+    than a reorder. Measured, reheating costs ~1.7x per step -- so comparing at
+    equal steps hands crude 1.7x less machine, and calls the result a schedule
+    difference.
+    """
+    global _GRAPHS
+    _GRAPHS = _load_graphs()
+    announce()
+    os.makedirs(_RESULTS, exist_ok=True)
+    out: dict = {}
+    for name in sorted(_GRAPHS, key=lambda k: len(_GRAPHS[k]["buffers"])):
+        n = len(_GRAPHS[name]["buffers"])
+        out[name] = {"n": n, "arms": {}}
+        for cd in CAPS:
+            for mv in MOVES:
+                for sch in SCHEDULES:
+                    # min-of-2: timing noise is one-sided, so the minimum is the
+                    # better estimate of the true cost.
+                    runs = [_solve(name, cd, mv, sch, CALIB_SPB, sd) for sd in (0, 1)]
+                    cpu = min(r["cpu"] for r in runs)
+                    steps = max(200, CALIB_SPB * n)
+                    out[name]["arms"][f"cap{cd}|{mv}|{sch}"] = {
+                        "cpu_per_step_us": cpu / steps * 1e6,
+                        "cpu": cpu,
+                    }
+        for cd in CAPS:
+            for mv in MOVES:
+                base = out[name]["arms"][f"cap{cd}|{mv}|{INCUMBENT}"]["cpu_per_step_us"]
+                for sch in SCHEDULES:
+                    arm = out[name]["arms"][f"cap{cd}|{mv}|{sch}"]
+                    arm["cost_ratio"] = arm["cpu_per_step_us"] / base
+                    # Same wall-clock as the incumbent at each level: a cheaper
+                    # step buys proportionally more of them.
+                    arm["spb_grid"] = [
+                        max(1, int(round(spb / arm["cost_ratio"]))) for spb in SPB_GRID
+                    ]
+        ratios = " ".join(
+            f"{sch}:x{out[name]['arms'][f'cap2|sweep_quality|{sch}']['cost_ratio']:.2f}"
+            for sch in SCHEDULES
+        )
+        print(f"{name:16} n={n:3} (cap2/sweep_quality) {ratios}", flush=True)
+    with open(CALIB_JSON, "w") as f:
+        json.dump(out, f, indent=1)
+    print("wrote", CALIB_JSON)
 
 
 def run_sweep(smoke=False):
@@ -147,13 +209,25 @@ def run_sweep(smoke=False):
     names = ["sdpa", "flash_attention"] if smoke else list(graphs)
     spbs = [160] if smoke else SPB_GRID
     seeds = SEEDS[:2] if smoke else SEEDS
+    if not os.path.exists(CALIB_JSON):
+        raise SystemExit("run --calibrate first")
+    calib = json.load(open(CALIB_JSON))
+    levels = range(len(spbs))
     tasks = [
-        (n, cd, mv, sch, spb, sd)
+        (
+            n,
+            cd,
+            mv,
+            sch,
+            calib[n]["arms"][f"cap{cd}|{mv}|{sch}"]["spb_grid"][lv],
+            sd,
+            lv,
+        )
         for n in names
         for cd in CAPS
         for mv in MOVES
         for sch in SCHEDULES
-        for spb in spbs
+        for lv in levels
         for sd in seeds
     ]
     results: dict = {}
@@ -163,19 +237,20 @@ def run_sweep(smoke=False):
     ctx = mp.get_context("spawn")
     pool = ctx.Pool(WORKERS, initializer=_init_worker)
     try:
-        for (name, cd, mv, sch, spb, sd), r in pool.imap_unordered(
+        for (name, cd, mv, sch, spb, sd, lv), r in pool.imap_unordered(
             _work, tasks, chunksize=1
         ):
-            key = f"cap{cd}|{mv}|{spb}"
+            key = f"cap{cd}|{mv}|L{lv}"
             cell = (
                 results.setdefault(
                     name, {"n": len(graphs[name]["buffers"]), "cells": {}}
                 )["cells"]
                 .setdefault(key, {})
-                .setdefault(sch, {"best": [], "cpu": []})
+                .setdefault(sch, {"best": [], "cpu": [], "spb": None})
             )
             cell["best"].append(r["best"])
             cell["cpu"].append(r["cpu"])
+            cell["spb"] = spb
             done += 1
             if done % 300 == 0 or done == len(tasks):
                 with open(SWEEP_JSON, "w") as f:
@@ -221,9 +296,18 @@ def write_report():
     out.append(
         f"`crude` minus `reheating`, as a percent of `reheating`. **Negative means "
         f"crude is better.** Seeds {SEEDS[0]}-{SEEDS[-1]} (out-of-sample with "
-        f"respect to every earlier sweep in this series), steps-per-buffer "
-        f"{SPB_GRID}. Schedule choice does not change per-step work, so equal steps "
-        f"are equal time.\n\nCells where both schedules reach the same score under "
+        f"respect to every earlier sweep in this series).\n\n**Compared at "
+        f"matched wall-clock, not matched steps.** This sweep used to assume the "
+        f"schedules cost the same per step, which held under the memory-only "
+        f"objective. It does not hold under the cost objective: the two propose "
+        f"different move types -- crude ~50% reorder, reheating ~46% recolor -- and "
+        f"a recolor rewrites a region's divisions and dirties far more bundles "
+        f"than a reorder does. Reheating costs ~1.7x per step, so equal steps "
+        f"handed crude 1.7x less machine and called the difference a schedule "
+        f"effect. Each arm's spb is now derived from a calibration pass so both "
+        f"land on the same wall-clock targets, which the per-cell cpu column lets "
+        f"you check. Incumbent targets: steps-per-buffer {SPB_GRID} for "
+        f"`{INCUMBENT}`.\n\nCells where both schedules reach the same score under "
         f"every seed are counted as ties, not wins.\n"
     )
 
@@ -238,8 +322,8 @@ def write_report():
         for mv in MOVES:
             deltas, pool_r, pool_c, tied = [], [], [], 0
             for name, r in data.items():
-                for spb in SPB_GRID:
-                    key = f"cap{cd}|{mv}|{spb}"
+                for lv in range(len(SPB_GRID)):
+                    key = f"cap{cd}|{mv}|L{lv}"
                     cell = r["cells"].get(key)
                     if not cell or "crude" not in cell or "reheating" not in cell:
                         continue
@@ -261,14 +345,46 @@ def write_report():
                 f"[{lo:+.2f}, {hi:+.2f}] |"
             )
 
+    # Where the engine's min_steps floor binds, both arms run the same number of
+    # steps whatever spb the calibration assigned, so the cheaper arm simply uses
+    # less time and the cells are not matched. Counted rather than hidden: they
+    # are exactly the cells that tilt the aggregate toward crude.
+    floored = sum(
+        1
+        for name, r in data.items()
+        for cd in CAPS
+        for mv in MOVES
+        for lv in range(len(SPB_GRID))
+        if (cell := r["cells"].get(f"cap{cd}|{mv}|L{lv}"))
+        and cell.get("crude", {}).get("spb")
+        and max(_MIN_STEPS, cell["crude"]["spb"] * r["n"]) == _MIN_STEPS
+    )
+    achieved = [
+        _mean(cell["crude"]["cpu"]) / _mean(cell["reheating"]["cpu"])
+        for r in data.values()
+        for cell in r["cells"].values()
+        if cell.get("crude", {}).get("cpu") and cell.get("reheating", {}).get("cpu")
+    ]
+    out.append(
+        f"\n**Match quality.** Achieved crude/reheating CPU ratio across cells: "
+        f"mean {_mean(achieved):.2f} (min {min(achieved):.2f}, max "
+        f"{max(achieved):.2f}); 1.00 is a perfect match. {floored} of "
+        f"{len(achieved)} cells sit on the engine's `min_steps={_MIN_STEPS}` "
+        f"floor, where both arms run the same steps whatever spb was assigned, so "
+        f"the cheaper arm just uses less time. Those cells are unmatched by "
+        f"construction and tilt the aggregate toward crude.\n"
+    )
     out.append("\n## Per graph (non-tied cells only)\n")
-    out.append("| graph | n | capacity | move | spb | reheating | crude | delta % |")
-    out.append("|---|--:|---|---|--:|--:|--:|--:|")
+    out.append(
+        "| graph | n | capacity | move | spb rh/cr | cpu s rh/cr | reheating | "
+        "crude | delta % |"
+    )
+    out.append("|---|--:|---|---|--:|--:|--:|--:|--:|")
     for name, r in sorted(data.items(), key=lambda kv: kv[1]["n"]):
         for cd in CAPS:
             for mv in MOVES:
-                for spb in SPB_GRID:
-                    cell = r["cells"].get(f"cap{cd}|{mv}|{spb}")
+                for lv in range(len(SPB_GRID)):
+                    cell = r["cells"].get(f"cap{cd}|{mv}|L{lv}")
                     if not cell or "crude" not in cell:
                         continue
                     rh, cr = (
@@ -277,9 +393,14 @@ def write_report():
                     )
                     if rh == cr:
                         continue
+                    rh_spb = cell["reheating"].get("spb")
+                    cr_spb = cell["crude"].get("spb")
+                    rh_cpu = _mean(cell["reheating"]["cpu"])
+                    cr_cpu = _mean(cell["crude"]["cpu"])
                     out.append(
-                        f"| {name} | {r['n']} | //{cd} | {mv} | {spb} | {rh:,.0f} | "
-                        f"{cr:,.0f} | {100.0 * (cr - rh) / rh:+.2f} |"
+                        f"| {name} | {r['n']} | //{cd} | {mv} | "
+                        f"{rh_spb}/{cr_spb} | {rh_cpu:.2f}/{cr_cpu:.2f} | "
+                        f"{rh:,.0f} | {cr:,.0f} | {100.0 * (cr - rh) / rh:+.2f} |"
                     )
 
     verdict = (
@@ -304,8 +425,16 @@ def write_report():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="measure per-step cost and derive each arm's matched-time spb grid",
+    )
     ap.add_argument("--report", action="store_true")
     args = ap.parse_args()
-    if not args.report:
+    if args.calibrate:
+        calibrate()
+    elif not args.report:
         run_sweep(smoke=args.smoke)
-    write_report()
+    if not args.calibrate:
+        write_report()
