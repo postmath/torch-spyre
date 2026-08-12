@@ -1,14 +1,15 @@
 # Scratchpad and co-optimizer benchmarks
 
-Measurements behind the scratchpad planner's and co-optimizer's design decisions. Each page is
-generated from a sweep's raw results by the harness that produced it, so a page and its data
-cannot drift apart: re-running `--report` rebuilds the prose and tables from `data/`.
+Measurements behind the scratchpad planner's and co-optimizer's design decisions. With one
+exception, each page is generated from a sweep's raw results by the harness that produced it, so
+a page and its data cannot drift apart: re-running `--report` rebuilds the prose and tables from
+`data/`.
 
 The harnesses live in
 [docs/source/user_guide/examples/scratchpad/](../../user_guide/examples/scratchpad/README.md),
 which documents how to run them and what they need. Raw results are in `data/` next to these
-pages — sweep JSON, plus console transcripts for the one experiment whose results were never
-written up (`scratchpad_wst_*.out`). Plots are in `_static/images/coopt/`.
+pages — sweep JSON, plus the console transcripts (`scratchpad_wst_*.out`) behind the one
+exception. Plots are in `_static/images/coopt/`.
 
 ## Reading these
 
@@ -26,6 +27,9 @@ Three conventions matter for interpreting any page here:
   headline prose, which went stale the first time the underlying sweep was re-run — naming
   graphs at parity as regressions, and run lengths the grid no longer contained. If a page's
   headline is a constant rather than generated, distrust it.
+  [`warm_start_transfer`](warm_start_transfer.md) is the exception: it was written from console
+  transcripts, so its figures are quoted rather than re-derived and it cannot be rebuilt with
+  `--report`. Its own note says so.
 
 ## The objective and the corpus
 
@@ -40,6 +44,7 @@ Three conventions matter for interpreting any page here:
 | [`coopt_schedule_default`](coopt_schedule_default.md) | Which schedule should be the default, at matched wall-clock? |
 | [`coopt_capacity_crossover`](coopt_capacity_crossover.md) | Does the schedule choice flip with LX capacity? |
 | [`coopt_move_weights`](coopt_move_weights.md) | Are the crude schedule's proposal weights on the score/CPU frontier? |
+| [`coopt_burst`](coopt_burst.md) | How long should a structural move's layout burst be, and should the two moves differ? |
 | [`coopt_reorder_move`](coopt_reorder_move.md) | Best-first reinsertion sweep vs random rotation, at equal time |
 | [`coopt_reorder_focus`](coopt_reorder_focus.md) | The same question at higher power, on the graphs that discriminate |
 | [`coopt_cycle_sweep`](coopt_cycle_sweep.md) | How many reheating cycles? |
@@ -55,6 +60,7 @@ Three conventions matter for interpreting any page here:
 | [`coopt_convergence`](coopt_convergence.md) | Which option reaches the best score soonest? |
 | [`coopt_nested_ab`](coopt_nested_ab.md) | Is the nested two-timescale loop worth its complexity? |
 | [`coopt_polish_sweep`](coopt_polish_sweep.md) | How much final layout polish? (pre-cost-model) |
+| [`warm_start_transfer`](warm_start_transfer.md) | Does the layout permutation survive a division change? (pre-cost-model) |
 
 ## Packer and solver mechanics
 
@@ -77,6 +83,7 @@ coopt_cost_objective
 coopt_schedule_default
 coopt_capacity_crossover
 coopt_move_weights
+coopt_burst
 coopt_reorder_move
 coopt_reorder_focus
 coopt_reorder_move_cap4
@@ -89,6 +96,7 @@ coopt_band_retune_validate
 coopt_convergence
 coopt_nested_ab
 coopt_polish_sweep
+warm_start_transfer
 copy_vs_swap_results
 capped_allocator_plan_results
 simulated_annealing_solve_results
