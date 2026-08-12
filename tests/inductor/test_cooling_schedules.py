@@ -57,6 +57,24 @@ class ConstructionTest(TestCase):
         self.assertIsInstance(s.temperature(), float)
         self.assertIsInstance(s.update(True, 5.0), float)
 
+    def test_only_a_multi_move_schedule_declines_the_single_move_api(self):
+        # A multi-band reset() returns None for its own reason (no single starting
+        # temperature), colliding with the ABC's "no steps". drives_single_move is
+        # how a single-move driver tells the two apart before it starts; the
+        # rejection itself is covered in test_simulated_annealing.py.
+        multi = SelfCalibratingReheatingSchedule(
+            bands=_BANDS, total_steps=100, seed_center=1.0
+        )
+        self.assertFalse(multi.drives_single_move)
+        self.assertIsNone(multi.reset())
+        # One band -- named or default -- is still the single-move case.
+        for bands in (None, {"reorder": (0.6, 0.02)}):
+            single = SelfCalibratingReheatingSchedule(
+                bands=bands, total_steps=100, seed_center=1.0
+            )
+            self.assertTrue(single.drives_single_move)
+            self.assertIsNotNone(single.reset())
+
 
 class BandOrderingTest(TestCase):
     def test_colder_band_is_colder_at_the_same_scale(self):
@@ -117,6 +135,71 @@ class CarrierTest(TestCase):
         # Phase resets and temperature rises again at least once (a reheat).
         self.assertTrue(any(phases[i + 1] < phases[i] for i in range(len(phases) - 1)))
         self.assertTrue(any(temps[i + 1] > temps[i] for i in range(len(temps) - 1)))
+
+    def test_carrier_saturates_in_the_last_cycle(self):
+        # cycle_len floors, so the last cycle runs total_steps % cycles steps
+        # beyond a full cycle (here 10 // 4 = 2, remainder 2). The clamped carrier
+        # holds those steps at the cycle's cold end: the phase stays in the
+        # documented [0, 1] (an overshoot would flip the co-optimizer's hotness
+        # weights negative) and the temperature never dips below the band bottom.
+        s = SelfCalibratingReheatingSchedule(
+            bands={"m": (0.6, 0.02)}, total_steps=10, cycles=4, seed_center=1.0
+        )
+        s.reset()
+        self.assertEqual(s._cycle_len, 2)
+        phases, temps = [], []
+        while not s.finished:
+            phases.append(s.cycle_phase())
+            temps.append(s.temperature("m"))
+            s.update(True, 0.0, "m")  # no-op moves: center stays at the seed
+        self.assertEqual(len(phases), 10)
+        self.assertTrue(all(0.0 <= p <= 1.0 for p in phases), phases)
+        # Three cycles of (0, 0.5), then the last one overrunning by two steps.
+        self.assertEqual(phases, [0.0, 0.5] * 4 + [1.0, 1.0])
+        # With center pinned at the seed, the band is a fixed [bottom, top]: the
+        # two remainder steps sit exactly on the bottom, not below it.
+        top = 1.0 * s._delta["m"]
+        bottom = 1.0 / s._delta["m"]
+        self.assertAlmostEqual(min(temps), bottom)
+        for t in temps:
+            self.assertGreaterEqual(t, bottom - 1e-12)
+            self.assertLessEqual(t, top + 1e-12)
+        self.assertAlmostEqual(temps[-1], bottom)
+        self.assertAlmostEqual(temps[-2], bottom)
+
+    def test_temperature_stays_in_band_across_budget_and_cycle_mixes(self):
+        # Same invariant over remainder shapes (r = 0, 1, 2, and cycles >
+        # total_steps), including a moving center: a live d_hat rescales the band
+        # every step, but the temperature stays within delta of that center.
+        for total_steps, cycles in ((10, 4), (17, 4), (12, 4), (7, 3), (3, 4)):
+            s = SelfCalibratingReheatingSchedule(
+                bands={"m": (0.6, 0.02)},
+                total_steps=total_steps,
+                cycles=cycles,
+                seed_center=1.0,
+            )
+            s.reset()
+            while not s.finished:
+                center = s._center["m"]
+                t = s.temperature("m")
+                where = (total_steps, cycles, s._s)
+                self.assertLessEqual(t, center * s._delta["m"] + 1e-12, where)
+                self.assertGreaterEqual(t, center / s._delta["m"] - 1e-12, where)
+                self.assertLessEqual(s.cycle_phase(), 1.0, where)
+                s.update(True, 5.0, "m")
+
+    def test_cycle_phase_stays_below_one_when_cycles_divide_the_budget(self):
+        # No remainder -> no overrun, so the phase never reaches 1 and the range
+        # is the half-open one the carrier gives naturally.
+        s = SelfCalibratingReheatingSchedule(
+            bands={"m": (0.6, 0.02)}, total_steps=100, cycles=4, seed_center=1.0
+        )
+        s.reset()
+        phases = []
+        while not s.finished:
+            phases.append(s.cycle_phase())
+            s.update(True, 1.0, "m")
+        self.assertAlmostEqual(max(phases), 24 / 25)  # (cycle_len - 1) / cycle_len
 
     def test_update_returns_none_exactly_at_budget(self):
         s = SelfCalibratingReheatingSchedule(

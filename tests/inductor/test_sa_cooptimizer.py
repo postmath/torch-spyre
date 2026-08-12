@@ -121,6 +121,63 @@ def _all_cases_incl_synthetic():
     yield from _large_cases()
 
 
+def _geometry_violations(buffers, capacity, alignment):
+    """Every way a solved layout can be geometrically wrong, as a list of
+    human-readable strings (empty == the layout is realizable).
+
+    Derived from the returned buffers alone -- lifetimes off ``uses``, per-core
+    footprints off ``size`` and the chosen division's ``output_partition`` -- so
+    it shares no code with the packer whose output it judges. That is the point:
+    ``test_probe_walk_leaves_the_packer_consistent`` compares the incremental
+    packer against a from-scratch rebuild, which catches bookkeeping drift but
+    puts the same geometry rules on both sides, so a systematic placement bug
+    would sit in both and go unseen.
+
+    The properties, on the resident (addressed) buffers:
+
+    * each address is a multiple of ``alignment`` (one Spyre stick);
+    * each buffer fits entirely below ``capacity``;
+    * two buffers alive at a common tick never share a byte -- with the one
+      legitimate exception of an in-place pair, where the child takes over the
+      parent's storage at the handoff tick and so must sit at *exactly* the
+      parent's address.
+    """
+    resident = [b for b in buffers if b.address is not None]
+    bad = []
+    footprint = {}
+    for b in resident:
+        part = b.core_divisions[b.chosen_division].output_partition
+        footprint[b.name] = max(0, -(-b.size // part))
+        if b.address % alignment:
+            bad.append(f"{b.name}: address {b.address} is not {alignment}-aligned")
+        if b.address + footprint[b.name] > capacity:
+            bad.append(
+                f"{b.name}: [{b.address}, {b.address + footprint[b.name]}) crosses "
+                f"the capacity {capacity}"
+            )
+    # A buffer with no uses is alive at no tick, so it can overlap nothing; the
+    # alignment and capacity checks above still covered it.
+    live = [b for b in resident if b.uses]
+    for i, bi in enumerate(live):
+        for bj in live[i + 1 :]:
+            # Lifetimes are the half-open [uses[0], uses[-1] + 1), re-derived
+            # here rather than taken from the buffer's own properties.
+            if not (bi.uses[0] < bj.uses[-1] + 1 and bj.uses[0] < bi.uses[-1] + 1):
+                continue
+            lo_i, hi_i = bi.address, bi.address + footprint[bi.name]
+            lo_j, hi_j = bj.address, bj.address + footprint[bj.name]
+            if hi_i <= lo_j or hi_j <= lo_i:
+                continue
+            in_place = bj.name in bi.in_place_parents or bi.name in bj.in_place_parents
+            if in_place and lo_i == lo_j:
+                continue
+            bad.append(
+                f"{bi.name} [{lo_i}, {hi_i}) and {bj.name} [{lo_j}, {hi_j}) are "
+                f"alive together and share bytes"
+            )
+    return bad
+
+
 class OutputContractTest(TestCase):
     def test_every_buffer_gets_division_and_address(self):
         for case, gi, buffers in _all_cases_incl_synthetic():
@@ -143,6 +200,84 @@ class OutputContractTest(TestCase):
     def test_empty_graph(self):
         solver = SaCoOptimizingSolver([], 1024, 128, seed=0)
         self.assertEqual(solver.plan_layout_and_core_divisions(), [])
+
+
+class GeometricValidityTest(TestCase):
+    """The returned layout is physically realizable: stick-aligned, inside the
+    capacity, and free of overlap between buffers that are alive together.
+
+    The output contract above says every buffer got *an* address; this says the
+    addresses describe a placement the hardware could actually take. See
+    :func:`_geometry_violations` for why this cannot be delegated to a rebuild-
+    and-compare check.
+    """
+
+    @staticmethod
+    def _placed(name, size, uses, address, in_place_parents=()):
+        """A buffer already carrying a solved division and address, for the
+        checks that hand the validator a layout instead of solving one."""
+        buf = CoreDivisionBuffer(
+            name=name,
+            size=size,
+            uses=list(uses),
+            first_use_is_read=False,
+            in_place_parents=list(in_place_parents),
+            # The trivial division, so the per-core footprint is ``size``.
+            core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+            boundary=BufferType.Intermediate,
+        )
+        buf.chosen_division = 0
+        buf.address = address
+        return buf
+
+    def test_returned_layout_is_geometrically_valid(self):
+        co_live = 0
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for cap in _capacities(buffers):
+                bufs = copy.deepcopy(buffers)
+                solver = SaCoOptimizingSolver(bufs, cap, 128, seed=0)
+                out = solver.plan_layout_and_core_divisions()
+                self.assertEqual(
+                    _geometry_violations(out, cap, 128), [], f"{case}[{gi}] cap={cap}"
+                )
+                resident = [b for b in out if b.address is not None]
+                co_live += sum(
+                    1
+                    for i, a in enumerate(resident)
+                    for b in resident[i + 1 :]
+                    if a.overlaps_in_time(b)
+                )
+        # Non-overlap is vacuous on a corpus that never holds two buffers at
+        # once, so pin that the fan-out really did exercise it.
+        self.assertGreater(co_live, 0, "no two resident buffers were ever co-live")
+
+    def test_validator_names_each_way_a_layout_can_be_wrong(self):
+        """A validator nothing can fail proves nothing: break one property at a
+        time on a hand-placed layout and confirm each is caught on its own."""
+        cap = 1024
+        a = self._placed("a", 256, (0, 4), 0)
+        b = self._placed("b", 256, (1, 5), 256)
+        self.assertEqual(_geometry_violations([a, b], cap, 128), [])
+
+        b.address = 128  # aligned and in capacity, but overlaps a's [0, 256)
+        self.assertEqual(len(_geometry_violations([a, b], cap, 128)), 1)
+
+        b.address = 300  # clear of a, but not a multiple of 128
+        self.assertEqual(len(_geometry_violations([a, b], cap, 128)), 1)
+
+        b.address = 896  # aligned and clear of a, but [896, 1152) exceeds 1024
+        self.assertEqual(len(_geometry_violations([a, b], cap, 128)), 1)
+
+    def test_in_place_child_may_share_the_parent_address(self):
+        """The one legitimate way two co-live buffers share bytes: the child
+        takes the parent's storage at the handoff tick. It has to land on
+        *exactly* the parent's address -- anywhere else is a real overlap."""
+        parent = self._placed("p", 256, (0, 2), 0)
+        child = self._placed("c", 128, (2, 3), 0, in_place_parents=["p"])
+        self.assertEqual(_geometry_violations([parent, child], 1024, 128), [])
+
+        child.address = 128  # inside the parent, but not its slot
+        self.assertEqual(len(_geometry_violations([parent, child], 1024, 128)), 1)
 
 
 class BaselineGuaranteeTest(TestCase):
@@ -225,6 +360,63 @@ class SeedPermutationTest(TestCase):
                             solver.packer.addresses[i],
                             f"{case}[{gi}] cap={cap} {b.name}: pinned but placed",
                         )
+
+
+class UnsizedBufferTest(TestCase):
+    """An unsized buffer (the ``mem_usage`` ``-1`` sentinel) is always a fixed pin.
+
+    ``_per_core_size`` clamps ``-1`` to a ``0`` footprint, which passes the
+    capacity gate -- so an unsized buffer that ever reached the search would be
+    placed occupying no space and the buffer above it would land on the same
+    address. What prevents that is a coupling across ``utils.mem_usage_by_buf``,
+    ``allocator._op_output_good_for_lx_reuse`` and ``_eligible``'s pin gate,
+    which no single file states. ``_assert_unsized_buffers_are_pinned`` states
+    it; these pin that it holds on the corpus and that it actually bites.
+    """
+
+    @staticmethod
+    def _graph(residency_reason):
+        """A sized buffer alongside an unsized one, co-live, with the pin state
+        under test carried by the unsized buffer."""
+
+        def buf(name, size, reason):
+            return CoreDivisionBuffer(
+                name=name,
+                size=size,
+                uses=[0, 1],
+                first_use_is_read=False,
+                residency_reason=reason,
+                core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+                boundary=BufferType.Intermediate,
+            )
+
+        return [buf("sized", 256, None), buf("unsized", -1, residency_reason)]
+
+    def test_corpus_holds_the_invariant(self):
+        unsized = 0
+        for case, gi, buffers in _all_cases_incl_synthetic():
+            for b in buffers:
+                if b.size < 0:
+                    unsized += 1
+                    self.assertIsNotNone(
+                        b.residency_reason, f"{case}[{gi}] {b.name}: unsized, unpinned"
+                    )
+        # The corpus has to actually carry the sentinel, or this proves nothing.
+        self.assertGreater(unsized, 0, "no unsized buffer in the corpus")
+
+    def test_unsized_and_unpinned_is_rejected(self):
+        solver = SaCoOptimizingSolver(self._graph(None), 1024, 128, seed=0)
+        with self.assertRaisesRegex(AssertionError, "unsized"):
+            solver.plan_layout_and_core_divisions()
+
+    def test_unsized_but_pinned_solves_and_spills(self):
+        solver = SaCoOptimizingSolver(self._graph("op not allowed"), 1024, 128, seed=0)
+        out = {b.name: b for b in solver.plan_layout_and_core_divisions()}
+        # The pin is spilled under its own reason, and never occupies a slot the
+        # sized buffer would then be stacked on top of.
+        self.assertIsNone(out["unsized"].address)
+        self.assertEqual(solver.spill_reasons["unsized"], "op not allowed")
+        self.assertEqual(out["sized"].address, 0)
 
 
 class DeterminismTest(TestCase):
