@@ -37,7 +37,11 @@ interchangeable implementations: the canonical Python
 (`csrc/perm_layout_native.cpp`) that is the default. They are behaviourally
 identical — the differential and SA-equivalence tests assert bit-for-bit
 agreement on addresses, quality, allocation count, and per-operation deltas —
-and the C++ one is substantially faster. Select the Python packer explicitly with
+and the C++ one is substantially faster: measured at roughly 14× end-to-end on
+mid-sized problems at representative capacity, though the margin depends on
+capacity pressure and narrows as the problem grows. See
+[Native packer performance](native_packer_performance.md) for the measurements
+and the harness that produced them. Select the Python packer explicitly with
 `config.native_layout_packer = False` or `TORCH_SPYRE_NATIVE_PACKER=0`. Because
 the `_C` extension is required for torch-spyre to function at all, a missing
 native packer means a stale or incomplete build and raises rather than silently
