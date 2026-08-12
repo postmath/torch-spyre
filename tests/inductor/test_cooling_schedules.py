@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the multi-move surface of SelfCalibratingReheatingSchedule
-(Plan §5.1 / §5.2): one shared reheating carrier, an independent band + move-scale
-EMA per move type. (The single-move responsive path is covered in
-test_simulated_annealing.py.)"""
+"""Unit tests for the multi-move surface of SelfCalibratingReheatingSchedule:
+one shared reheating carrier, an independent band + move-scale EMA per move type.
+(The single-move responsive path is covered in test_simulated_annealing.py.)"""
 
 import math
 import unittest

@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Phase-3 validation for the minimal end-to-end SA co-optimization engine.
+"""Validation for the end-to-end SA co-optimization engine.
 
-The two Plan §8.3 gates:
+The two gates every configuration of the engine must pass:
 
 * **determinism** -- two runs on identical input give bit-for-bit identical
-  ``chosen_division`` + ``address`` (Plan §7.5); and
+  ``chosen_division`` + ``address``; and
 * **>= baseline on the shared scorer** -- the returned state never scores worse
   than the seed (index-0 divisions + FirstFit ``pi``), the seed-from-baseline +
-  keep-best guarantee (Plan §8.1).
+  keep-best guarantee.
 
 Plus the engine's output contract: every buffer gets a ``chosen_division`` and an
 ``address`` (``None`` == spilled), with ``spill_reasons`` populated for the
@@ -90,8 +90,8 @@ def _synthetic_cases():
 
 # Large (25-100 buffer) real captures for manual experiments, kept OUT of CI:
 # they are slow (~2s/solve at n~79) and exist to surface schedule-scaling findings
-# (e.g. reheating regresses vs crude on the largest flash graphs -- see the
-# Phase-5 finding note). Opt in with ``SA_COOPT_LARGE_CAPTURES=1``.
+# (e.g. reheating regresses vs crude on the largest flash graphs -- see
+# ``ScheduleTest`` below). Opt in with ``SA_COOPT_LARGE_CAPTURES=1``.
 _LARGE_CAPTURES_ENV = "SA_COOPT_LARGE_CAPTURES"
 _LARGE_CAPTURES_PATH = os.path.join(
     os.path.dirname(__file__), "cooptimization_captures_large.json"
@@ -294,7 +294,7 @@ class BaselineGuaranteeTest(TestCase):
 
 
 class SeedPermutationTest(TestCase):
-    """Plan §7.4: ``pi`` is *ordered* over the buffers that can ever be resident.
+    """``pi`` is *ordered* over the buffers that can ever be resident.
 
     A fixed pin can never be resident for any ``(pi, W)``, so it must not occupy a
     prefix slot and displace an eligible buffer. It keeps its index -- ``pi`` stays
@@ -420,7 +420,7 @@ class UnsizedBufferTest(TestCase):
 
 
 class DeterminismTest(TestCase):
-    """Two runs on identical input are bit-for-bit identical (Plan §6.5/§7.5)."""
+    """Two runs on identical input are bit-for-bit identical."""
 
     def _run(self, buffers, cap, seed):
         bufs = copy.deepcopy(buffers)
@@ -509,7 +509,7 @@ def _flood(buffers, anchor_name, tiling):
 
 
 class FloodRegionTest(TestCase):
-    """The cd_parent_matches flood (Plan §7.2), on controlled synthetic graphs."""
+    """The cd_parent_matches flood, on controlled synthetic graphs."""
 
     def test_chain_propagates_full_region(self):
         # A -> B -> C, every edge compatible at index 1: the split propagates end
@@ -563,7 +563,8 @@ class FloodRegionTest(TestCase):
 
 class RegionRecolorTest(TestCase):
     """Region-recolor is exercised on the captures, finds real regions, helps,
-    and is deterministic (Plan §4.3 / §8.3 Tier-0 instrumentation)."""
+    and is deterministic -- the instrumentation that would justify escalating to
+    a balanced recolor proposal."""
 
     def test_recolor_exercised_and_finds_multi_op_regions(self):
         max_region_overall = 0
@@ -804,30 +805,30 @@ class StepBudgetTest(TestCase):
 
 
 class ScheduleTest(TestCase):
-    """Plan §5 / §8.3: the reheating schedule + cycle-phase mix beats the crude
-    baseline, records per-move acceptance traces + within-group CVs, and stays
-    deterministic and >= baseline."""
+    """The reheating schedule + cycle-phase mix beats the crude baseline, records
+    per-move acceptance traces + within-group CVs, and stays deterministic and
+    >= baseline."""
 
     def test_reheating_beats_crude_overall(self):
         # Aggregate over the captures at a tight capacity: the reheating schedule
         # must beat the crude one *in total* (same seed, same budget) and strictly
         # better on at least one graph. Per-graph domination is deliberately NOT
-        # asserted: the §5.1 claim is that reheating wins on average, not on every
+        # asserted: the claim is that reheating wins on average, not on every
         # graph -- both are heuristics at a fixed budget/seed, and a large graph
         # can regress (e.g. reheating scores ~3% worse than crude on the 43-buffer
         # flash_attention capture) while the aggregate still favors reheating. That
-        # per-graph regression is a Phase-5 schedule-tuning signal, not a bug, so
-        # the test tracks the honest aggregate claim.
+        # per-graph regression is a schedule-tuning signal, not a bug, so the test
+        # tracks the honest aggregate claim.
         #
-        # Pinned to ``reorder_move="random"``, the move the §5.1 claim was
-        # measured against. Under the (now default) best-first sweep the ordering
+        # Pinned to ``reorder_move="random"``, the move that claim was measured
+        # against. Under the (now default) best-first sweep the ordering
         # *reverses*: the sweep lifts ``crude`` far more than ``reheating`` --
         # 41.44M -> 35.10M on flash_attention against 41.38M -> 41.26M -- so crude
         # wins the aggregate. See ``test_sweep_reverses_the_schedule_ordering``,
         # which pins that finding and explains the (geometric, not feedback)
-        # cause. Retuning the schedule for the sweep is the open Phase-5
-        # follow-up; until then this keeps testing the claim on the configuration
-        # it was made for rather than silently inverting it.
+        # cause. Retuning the schedule for the sweep is an open follow-up; until
+        # then this keeps testing the claim on the configuration it was made for
+        # rather than silently inverting it.
         total_reheat = total_crude = 0
         strictly_better = False
         for case, gi, buffers in _all_cases():
@@ -914,7 +915,7 @@ class ScheduleTest(TestCase):
 
     def test_per_move_acceptance_traces_recorded(self):
         # Every applicable move type is proposed and its accepted count is a valid
-        # subset -- the §8.3 per-move-type acceptance traces.
+        # subset -- the per-move-type acceptance traces.
         for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
             s = SaCoOptimizingSolver(copy.deepcopy(buffers), cap, 128, seed=0)
@@ -926,7 +927,7 @@ class ScheduleTest(TestCase):
                 )
 
     def test_within_group_cv_available_and_finite(self):
-        # The §5.3 within-group-CV instrumentation is populated and non-negative
+        # The within-group-CV instrumentation is populated and non-negative
         # (drives the deferred variance-bucketing decision).
         for case, gi, buffers in _all_cases_incl_synthetic():
             cap = max(1, _seed_footprint(buffers) // 2)
@@ -1013,10 +1014,10 @@ def _solve_with_hashseed(hs, case="sdpa"):
 
 
 class CrossProcessDeterminismTest(TestCase):
-    """The §6.5 CI determinism test done right: solve twice in *separate
-    processes* under different ``PYTHONHASHSEED`` values. In-process determinism
-    tests share one hash seed and so cannot catch set-iteration-order bugs (Plan
-    §7.5) -- this one can (it caught the FirstFit seed nondeterminism)."""
+    """The CI determinism test done right: solve twice in *separate processes*
+    under different ``PYTHONHASHSEED`` values. In-process determinism tests share
+    one hash seed and so cannot catch set-iteration-order bugs -- this one can (it
+    caught the FirstFit seed nondeterminism)."""
 
     # ``sdpa`` is the richest captured graph (pins + reductions); ``big_chain`` is
     # the largest synthetic one (many regions / n~48), so between them they stress

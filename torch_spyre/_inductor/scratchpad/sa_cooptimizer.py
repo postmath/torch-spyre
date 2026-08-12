@@ -12,53 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Joint work-division + LX-layout simulated-annealing engine (Plan Phases 3-5).
+"""Joint work-division + LX-layout simulated-annealing engine.
 
-``SaCoOptimizingSolver`` is the third co-optimization engine (a sibling to the
-substrate's CP-SAT and DFS solvers, Plan §7.3). It *composes* the incremental
-:class:`PermutationBasedLayoutSolver` packer (not subclasses it) and drives a
-single annealing loop over the joint state ``(pi, W)``:
+``SaCoOptimizingSolver`` is the third co-optimization engine, a sibling to the
+substrate's CP-SAT and DFS solvers. It *composes* the incremental
+:class:`PermutationBasedLayoutSolver` packer rather than subclassing it -- this
+loop mixes move types instead of reordering only, scores a richer objective than
+the packer's own ``quality()``, and bursts with O(1) single reinsertions rather
+than the layout-only annealer's O(n) sweep -- and drives a single annealing loop
+over the joint state ``(pi, W)``:
 
 * ``pi`` -- the layout permutation, held in the packer.
 * ``W`` -- the work division, one ``chosen_division`` menu index per buffer.
 
 The move set is **reorder, atomic division flip, and region-recolor**, each
 structural move run as a compound move+burst and judged as a unit by the shared
-scorer's Metropolis test. Region-recolor (Plan §4.3 / §7.2) picks a non-trivial
-(split) anchor tiling and floods the ``cd_parent_matches`` relation bidirectionally
-to a coordinated, mutually-compatible menu-index assignment over the reachable
-region -- the region *is* the flood's reach, boundaries emerge for free, and a
-join with no compatible index keeps the tie-break pick and accepts the internal
-seam. (Region-recolor is Tier 0 -- plain uniform recolor; the §4.3 Tier 1/2
-escalations remain gated on run evidence.)
+scorer's Metropolis test. Region-recolor picks a non-trivial (split) anchor
+tiling and floods the ``cd_parent_matches`` relation bidirectionally to a
+coordinated, mutually-compatible menu-index assignment over the reachable region
+-- the region *is* the flood's reach, boundaries emerge for free, and a join with
+no compatible index keeps the tie-break pick and accepts the internal seam. The
+uniform flood is a deliberately unbalanced proposal: many heterogeneous colorings
+collapse onto the same uniform one, which ratchets the sampler toward homogeneous
+regions. The balanced alternatives (a beta-biased local proposal family; exact
+block-Gibbs over tree-like regions) stay unbuilt until a run shows heterogeneous
+optima are actually being missed -- which is what the recolor instrumentation
+below exists to detect.
 
-Schedule / proposal mix (Plan §5). The default ``"reheating"`` schedule is the
-multi-move self-calibrating reheating carrier of :mod:`cooptimization_schedule`:
-one shared reheating clock, an independent acceptance band + move-scale EMA per
-move type (region-recolor coldest), and a cycle-phase proposal mix that weights
-each move by its neighborhood size times a hotness that lets structural moves
-dominate hot phases and layout reorders dominate cold ones (§5.4). Per-move
-acceptance traces and within-group ``|dE|`` CVs are recorded for the §5.3
-bucketing decision. ``schedule="crude"`` selects the Phase-3/4 single geometric
-cool + fixed weights, retained as the A/B baseline the reheating schedule beats.
-Best-seen over ``(pi, W)`` from the §8.2 seed (every op at index 0, ``pi`` from
-FirstFit) makes every returned state no worse than the baseline regardless of how
-crude the moves/schedule are (§8.1).
+Schedule / proposal mix. The ``"reheating"`` schedule is the multi-move
+self-calibrating reheating carrier of :mod:`cooptimization_schedule`: one shared
+reheating clock, an independent acceptance band + move-scale EMA per move type
+(region-recolor coldest), and a cycle-phase proposal mix that weights each move
+by its neighborhood size times a hotness that lets structural moves
+dominate hot phases and layout reorders dominate cold ones. Per-move acceptance
+traces and within-group ``|dE|`` CVs are recorded, as the signal for whether a
+move type's spread warrants splitting it into size-bucketed sub-groups.
+``schedule="crude"`` -- the default -- is one geometric cool + fixed weights; see
+its per-knob docstring for the A/B that keeps it there. Best-seen over
+``(pi, W)`` from the seed state (every op at index 0, ``pi`` from FirstFit) makes
+every returned state no worse than the baseline regardless of how crude the
+moves/schedule are, which is what lets each piece of the search be added and
+validated on its own.
 
-Objective. The shared scorer (:mod:`cooptimization_scorer`) is authoritative.
-Today it reduces to the substrate's own HBM-traffic model: the *differential*
-``spill_cost`` (``read_count`` re-reads plus the producer write, the latter only
-for an ``Intermediate`` buffer) summed over the buffers that miss LX, with a zero
-node term and unit cohort multiplicity (Plan §7.1). Because the cost is
+Objective. Two are available, selected by ``cost_objective``; see
+``docs/source/compiler/sa_co_optimization.md``. The memory-only objective
+(``cost_objective=None``) is the substrate's own HBM-traffic model: the
+*differential* ``spill_cost`` (``read_count`` re-reads plus the producer write,
+the latter only for an ``Intermediate`` buffer) summed over the buffers that miss
+LX, with a zero node term and unit cohort multiplicity. Because that cost is
 differential, a resident buffer contributes nothing -- the same shape as the
-CP-SAT engine's objective, so the two are comparable on one yardstick. Residency,
-per-core sizing, and the ``cd_parent_matches`` compatibility gate follow the
-substrate exactly. The richer per-edge multiplicity and the matmul node term are
-wired in when real op metadata is available (Phase 6); the scorer already
-supports them.
+CP-SAT engine's objective, so the two are comparable on one yardstick. The
+default ``"bundle"`` objective replaces it with the cost model's per-fused-bundle
+prediction, which prices compute as well as traffic. Residency, per-core sizing,
+and the ``cd_parent_matches`` compatibility gate follow the substrate exactly
+under either.
 
-Determinism (Plan §7.5): a seeded ``Random`` over index-ordered domains and the
-integer fixed-point score make a run bit-for-bit reproducible.
+Determinism: a seeded ``Random`` over index-ordered domains and the integer
+fixed-point score make a run bit-for-bit reproducible.
 """
 
 from __future__ import annotations
@@ -156,9 +166,9 @@ Packer = Union[PermutationBasedLayoutSolver, NativePermutationLayoutSolver]
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
 # Per-move-type acceptance bands (accept_hi, accept_lo) for the reheating
-# schedule (Plan §5.2): reorders warmest, region-recolor the coldest floor so it
-# freezes earliest. Guessed defaults pending benchmarks -- best-seen bounds any
-# bad choice, and the per-move acceptance traces validate the resulting rates.
+# schedule: reorders warmest, region-recolor the coldest floor so it freezes
+# earliest. Guessed defaults pending benchmarks -- best-seen bounds any bad
+# choice, and the per-move acceptance traces validate the resulting rates.
 _DEFAULT_MOVE_BANDS = {
     "reorder": (0.6, 0.02),
     "flip": (0.3, 0.005),
@@ -189,7 +199,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         alignment: placement alignment (128 = one Spyre stick).
         seed: RNG seed; fixes the (deterministic) search trajectory.
         steps_per_buffer: annealing steps scale linearly with the buffer count
-            (crude bounded budget; Plan Appendix H tunes this later).
+            (a crude bounded budget).
         min_steps: floor on the step budget for tiny graphs.
         max_steps: ceiling on the *total* step budget, so a large graph cannot
             run away. Mirrors the layout-only annealer's schedule-level clamp
@@ -198,8 +208,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             wants a larger budget at the same buffer count. Note this bounds
             *steps*, not wall-clock -- per-step cost also grows with ``n``.
         schedule: ``"crude"`` (default -- a single geometric cool with fixed
-            proposal weights) or ``"reheating"`` (Plan §5 -- the multi-move
-            self-calibrating reheating schedule + cycle-phase proposal mix).
+            proposal weights) or ``"reheating"`` (the multi-move self-calibrating
+            reheating schedule + cycle-phase proposal mix).
 
             Crude is the default on the score/CPU frontier, not on score.
 
@@ -268,7 +278,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             not lower ``steps_per_buffer`` to save time without re-checking this
             -- most of the headroom between 20 and 40 is exactly what makes the
             schedule choice free.
-        cycles / horizons_per_cycle: reheating-schedule knobs (Plan §5.1).
+        cycles / horizons_per_cycle: reheating-schedule knobs.
             ``cycles`` was measured as "mildly suboptimal at 4, worth ~2% on the
             graphs that matter" under the memory-only objective. Re-run under the
             cost objective (``docs/source/compiler/benchmarks/coopt_cycle_sweep.md``), the cycle count
@@ -280,8 +290,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             is still worth up to 23%), the spread across counts 1..16 is at most
             3.4% and the best count is inconsistent between budgets (8, 16, 4, 8,
             16) -- noise, not a ranking. Not worth changing.
-        weight_floor: the ``w_floor`` in the cycle-phase proposal mix (Plan §5.4),
-            so no applicable move type is ever fully starved.
+        weight_floor: the ``w_floor`` in the cycle-phase proposal mix, so no
+            applicable move type is ever fully starved.
         move_bands: per-move-type ``(accept_hi, accept_lo)`` acceptance bands for
             the reheating schedule; defaults to :data:`_DEFAULT_MOVE_BANDS`.
         reorder_weight / flip_weight / recolor_weight: fixed proposal weights for
@@ -307,10 +317,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             schedule knob is largely a mix knob, and moving these weights
             re-opens that decision.
         burst_fraction: layout-burst length as a fraction of the buffer count
-            (Plan §4.4; the burst warms ``pi`` to the new footprints before the
-            compound move is judged), applied to both structural moves. ``0.0``
-            disables it entirely. Runs on every flip and recolor -- about half of
-            all proposals under the default schedule. Nested mode never uses it;
+            (the burst warms ``pi`` to the new footprints before the compound
+            move is judged), applied to both structural moves. ``0.0`` disables
+            it entirely. Runs on every flip and recolor -- about half of all
+            proposals under the default schedule. Nested mode never uses it;
             its inner layout loop replaces it.
 
             Swept in ``docs/source/compiler/benchmarks/coopt_burst.md`` (matched
@@ -373,8 +383,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             reach the objective's floor (all traffic from permanently-pinned
             buffers) and can never distinguish any move set or schedule.
 
-            Enabling this prices the reduction half of the §6.3 node term, which
-            is computable from a buffer alone. The matmul half is not (it needs
+            Enabling this prices the reduction half of the node term, which is
+            computable from a buffer alone. The matmul half is not (it needs
             the producing op's b/m/n/k extents and axis roles; see
             :meth:`_precompute_node_costs`), and that asymmetry is the hazard:
             the reduction term charges for splitting a reduction axis while the
@@ -479,8 +489,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             those score-identical positions and steers the layout toward states a
             later structural move can exploit.
         reorder_neighborhood_scale: multiplier on ``reorder``'s neighborhood size
-            in the reheating schedule's cycle-phase proposal mix (§5.4). Exists
-            for investigation, **not** as a tuning recommendation: leave it at 1.
+            in the reheating schedule's cycle-phase proposal mix. Exists for
+            investigation, **not** as a tuning recommendation: leave it at 1.
 
             The mix weights each move by its neighborhood, and ``reorder``'s
             (``n``) is dwarfed by the flip/recolor menus, so reheating spends only
@@ -735,10 +745,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         :class:`MemoryPlanSolver` declares this abstract, but the placement-only
         path deliberately belongs to the standalone layout-only annealer, which
-        Plan §7.3 keeps as its own :class:`MemoryPlanSolver` ("we do not replace
-        it"). ``CoOptimizingAllocator`` -- the only allocator this engine is
-        injected into -- calls :meth:`plan_layout_and_core_divisions` exclusively,
-        so this stays a loud stub rather than a second annealing path to maintain.
+        remains its own :class:`MemoryPlanSolver` -- this engine adds a joint
+        path, it does not replace that one. ``CoOptimizingAllocator`` -- the only
+        allocator this engine is injected into -- calls
+        :meth:`plan_layout_and_core_divisions` exclusively, so this stays a loud
+        stub rather than a second annealing path to maintain.
         """
         raise NotImplementedError(
             "SaCoOptimizingSolver is a joint core-division + placement engine; "
@@ -752,15 +763,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         solver's own buffers (the one-shot interface satisfied by an internal
         solve) -- a solver is single-use, so construct a fresh one per set."""
         self.spill_reasons = {}
-        # Tier-0 move instrumentation (Plan §4.3 / §8.3): per-type proposal and
-        # accept counts, recolor improvement count, the flooded region sizes, and
-        # the anchor-tiling ``output_partition`` of every proposed recolor and of
-        # the accepted subset. The last two answer the open "should the anchor
-        # tiling be weighted by output_partition?" question empirically -- if
-        # aggressive (high-partition) anchors are proposed but rarely accepted
-        # once the real node term is on (Phase 6), that is the measurement that
-        # justifies escalating to a §4.3 Tier-1 biased proposal. Populated only by
-        # the main annealing loop (not the calibration probes).
+        # Move instrumentation: per-type proposal and accept counts, recolor
+        # improvement count, the flooded region sizes, and the anchor-tiling
+        # ``output_partition`` of every proposed recolor and of the accepted
+        # subset. The last two answer the open "should the anchor tiling be
+        # weighted by output_partition?" question empirically -- if aggressive
+        # (high-partition) anchors are proposed but rarely accepted once the real
+        # node term is on, that is the measurement that justifies escalating to a
+        # balanced (beta-biased) recolor proposal. Populated only by the main
+        # annealing loop (not the calibration probes).
         self.moves_proposed = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self.moves_accepted = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self.recolor_improved = 0
@@ -770,8 +781,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._last_recolor_region_size = 0
         self._last_recolor_anchor_partition = 0
         # Within-group score-delta stats per move type (online n / sum / sum-of-
-        # squares over nonzero |dE|), for the §5.3 within-group-CV instrumentation
-        # that gates whether a move type needs size-bucketed sub-groups. Read via
+        # squares over nonzero |dE|), for the within-group-CV instrumentation that
+        # gates whether a move type needs size-bucketed sub-groups. Read via
         # :meth:`move_scale_cv`.
         self._ms_n = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self._ms_sum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
@@ -842,7 +853,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         discounted by an input's unavoidable clone-in, see :meth:`spill_cost`.
         The two agree on every captured graph (see
         ``test_read_count_matches_consumer_count``), and ``_children`` remains
-        available for the Phase-6 cohort multiplicity.
+        available for the cohort multiplicity when op metadata is wired in.
         """
         self._assert_unsized_buffers_are_pinned()
         bufs = self._bufs
@@ -887,16 +898,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 foreign_parents,
             )
 
-        # Region-recolor support (Plan §7.2). ``_edge_pairs[(p, c)]`` is the
-        # compatible ``(p_div, c_div)`` set on the edge p->c; ``_children_idx``
-        # lists each op's children by index (deterministic flood order).
+        # Region-recolor support. ``_edge_pairs[(p, c)]`` is the compatible
+        # ``(p_div, c_div)`` set on the edge p->c; ``_children_idx`` lists each
+        # op's children by index (deterministic flood order).
         self._children_idx = [sorted(c for c, _ in self._children[i]) for i in range(n)]
         self._edge_pairs: dict[tuple[int, int], frozenset] = {
             (i, c): pairs for i in range(n) for c, pairs in self._children[i]
         }
         # Non-trivial (split) menu indices per op -- the only legal recolor
         # anchors, so recolor stays a coordinated *splitting* move and leaves
-        # undividing to atomic flips (Plan §7.2). Anchor candidates are the ops
+        # undividing to atomic flips. Anchor candidates are the ops
         # that have at least one.
         self._nontrivial_menu = [
             sorted(
@@ -912,7 +923,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         (PSUM-ring) cost of choosing that division, in fixed-point time units.
         ``None`` when the node term is off.
 
-        Only the *reduction* half of the §6.3 node term is expressible here. It
+        Only the *reduction* half of the node term is expressible here. It
         needs the reduction split (a product of ``reduction_splits`` values) and
         the per-core output size -- a split factor and an output-side quantity,
         both of which a buffer carries. The matmul half needs the producing op's
@@ -972,7 +983,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _per_core_size(self, idx: int, div_idx: int) -> int:
         """Per-core footprint of buffer ``idx`` under menu index ``div_idx``:
-        ``ceil(total_size / output_partition)`` (Plan §2.2).
+        ``ceil(total_size / output_partition)``.
 
         Uses the substrate's shared :func:`ceil_div` rather than ``math.ceil`` on
         a float quotient, so this rounds identically to every other
@@ -992,7 +1003,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _eligible(self, idx: int) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``
-        (the three division-dependent gates of Plan §7.4, mirroring
+        (the three division-dependent gates, mirroring
         ``DfsLayoutSolver._evaluate``): the fixed residency pin, a per-core
         footprint that fits at all, and a division carrying a compatible
         ``cd_parent_matches`` pair on *every* child edge -- the sole compatibility
@@ -1025,7 +1036,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         parent transparently, so it never in-places onto one.
 
         ``residency_reason`` is carried so that ``MemoryPlanSolver.excluded()``
-        sees the fixed pins during the FirstFit seed pass (Plan §7.4); the packer
+        sees the fixed pins during the FirstFit seed pass; the packer
         ignores it, taking an explicit ``eligible`` mask instead.
         """
         out = []
@@ -1046,7 +1057,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _build_seed_packer(self) -> Packer:
         """Build the packer for the seed state: per-core sizes at index 0, a
-        FirstFit-derived ``pi`` (Plan §8.2), and the seed eligibility mask."""
+        FirstFit-derived ``pi``, and the seed eligibility mask."""
         n = len(self._bufs)
         sizes = [self._per_core_size(i, 0) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
@@ -1054,8 +1065,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # pi from a FirstFit pass over the per-core sizes. ``_lifetime_buffers``
         # carries ``residency_reason``, so ``FirstFitLayoutSolver.excluded()``
         # leaves the fixed pins unplaced and ``SolverToPermutation`` sorts them
-        # after every placed buffer (Plan §7.4: pi is ordered over the buffers
-        # that can ever be resident). They keep their slot in pi -- it stays a
+        # after every placed buffer (pi is ordered over the buffers that can
+        # ever be resident). They keep their slot in pi -- it stays a
         # permutation of all n indices, so the packer's ``eligible`` mask still
         # lines up index-for-index -- they simply stop occupying prefix slots and
         # displacing eligible buffers to higher addresses.
@@ -1133,11 +1144,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         traffic a spill adds **over** residency -- so a resident buffer
         contributes exactly zero and only the spilled ones are summed. This is
         the same shape as the CP-SAT engine's ``spill_cost() * (1 - in_buffer)``,
-        which is what makes the two directly comparable on one yardstick
-        (Plan §7.1).
+        which is what makes the two directly comparable on one yardstick.
 
-        The node term is zero until real op metadata is available (Phase 6); the
-        scorer's fixed-point conversion keeps this deterministic.
+        The node term is zero until real op metadata is available; the scorer's
+        fixed-point conversion keeps this deterministic.
         """
         if self._cost_objective is not None:
             # The cost model prices compute as well as traffic, so it replaces
@@ -1188,15 +1198,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _flood_region(self, anchor: int, tiling: int) -> dict[int, int]:
         """Flood the ``cd_parent_matches`` relation from ``(anchor, tiling)`` to a
-        menu-index assignment over the reachable region (Plan §7.2).
+        menu-index assignment over the reachable region.
 
         Bidirectional: from an assigned op ``u`` (index ``iu``), a child ``c`` joins
         at the smallest ``ic`` with ``(iu, ic)`` compatible, and a parent ``p`` at
         the smallest ``ip`` with ``(ip, iu)`` compatible. The reachable set *is* the
         region; boundaries emerge for free (no compatible index across an edge).
         First-assignment-wins with a min-index frontier and sorted candidates makes
-        this deterministic and independent of ``cd_parent_matches`` list order
-        (Plan §7.5); a join reached with no compatible index simply is not
+        this deterministic and independent of ``cd_parent_matches`` list order;
+        a join reached with no compatible index simply is not
         extended -- its edge becomes an accepted internal seam, never a failure.
         """
         assignment = {anchor: tiling}
@@ -1250,7 +1260,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _burst(self, move: str) -> None:
         """A short cold layout burst: greedily accept layout steps that do not
         lower the packer's quality, letting ``pi`` adapt to the new footprints
-        before the compound move is judged (Plan §4.4).
+        before the compound move is judged.
 
         ``move`` selects the length, since flip and recolor may warrant different
         bursts; see ``burst_fractions``. ``burst_move`` selects the primitive.
@@ -1384,11 +1394,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     @staticmethod
     def _hotness(name: str, phi: float) -> float:
         """Structural moves are hot early (cycle phase near 0), layout reorders
-        late (near 1) -- Plan §5.4."""
+        late (near 1)."""
         return phi if name == "reorder" else 1.0 - phi
 
     def _choose_move_reheating(self, phi: float) -> str:
-        """Cycle-phase proposal mix (Plan §5.4): weight each applicable move by its
+        """Cycle-phase proposal mix: weight each applicable move by its
         neighborhood size times ``max(w_floor, hotness(m, phi))``, so structural
         moves dominate hot phases and layout reorders dominate cold ones."""
         applicable = self._applicable_moves()
@@ -1418,7 +1428,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     # -- instrumentation -----------------------------------------------------
 
     def _record_move_scale(self, name: str, scale: float) -> None:
-        """Fold a nonzero ``|dE|`` into ``name``'s within-group stats (Plan §5.3)."""
+        """Fold a nonzero ``|dE|`` into ``name``'s within-group stats."""
         if scale > 0.0:
             self._ms_n[name] += 1
             self._ms_sum[name] += scale
@@ -1426,7 +1436,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def move_scale_cv(self) -> dict[str, float]:
         """Coefficient of variation (std / mean) of ``|dE|`` within each move type
-        -- the §5.3 signal for whether a type should be split into size buckets.
+        -- the signal for whether a type should be split into size buckets.
         ``0.0`` for a type with < 2 samples or a zero mean."""
         out: dict[str, float] = {}
         for m, n in self._ms_n.items():
@@ -1681,10 +1691,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 self._steps_per_buffer * n,
             )
         self._flippable_ops = self._flippable()
-        # Static proposal-mix neighborhoods (Plan §5.4): reorder ~ n reinsertion
+        # Static proposal-mix neighborhoods: reorder ~ n reinsertion
         # points; flip ~ the available local labels; recolor ~ the anchor tilings
         # (n_regions x n_colors, with the anchor's non-trivial menu size as
-        # n_colors, §7.2).
+        # n_colors).
         self._neighborhoods = {
             "reorder": n * self._reorder_neighborhood_scale,
             "flip": sum(
@@ -1697,7 +1707,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         cur = self._score()
         # Baseline = the seed state's score; best-seen never rises above it, the
-        # >=-baseline guarantee (Plan §8.1).
+        # >=-baseline guarantee.
         self.baseline_score = cur
         self._best_score = cur
         self._best_snap = self._snapshot()
@@ -1723,8 +1733,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._restore_copy(self._best_snap)
 
     def _anneal_crude(self, steps: int, cur: int) -> None:
-        """Phase-3/4 baseline: one geometric cool + fixed proposal weights. Kept as
-        the A/B the reheating schedule must beat."""
+        """The default schedule: one geometric cool + fixed proposal weights, and
+        the A/B the reheating schedule is measured against."""
         t0 = self._calibrate_temperature()
         t_end = max(t0 / 1000.0, 1e-9)
         for step in range(steps):
@@ -1733,8 +1743,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             cur, _, _ = self._step(self._choose_move_crude(), temperature, cur)
 
     def _anneal_reheating(self, steps: int, cur: int) -> None:
-        """Plan §5: the multi-move self-calibrating reheating schedule with the
-        cycle-phase proposal mix. The schedule self-calibrates each move type's
+        """The multi-move self-calibrating reheating schedule with the cycle-phase
+        proposal mix. The schedule self-calibrates each move type's
         band from its streamed ``|dE|``, seeded (pre-snap) from a crude median."""
         schedule = SelfCalibratingReheatingSchedule(
             bands=self._move_bands,
@@ -1859,7 +1869,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Outer SA over structure; each proposal runs an inner layout loop, is
         judged on the full score (end + early-abandon), and a final pure-layout
         polish refines the best structure. Layout warm-starts across structural
-        moves (pi persists, Plan §2.2)."""
+        moves (pi persists)."""
         n = len(self._bufs)
         qtemp = self._calibrate_inner_qtemp()
         polish = int(self._polish_frac * budget)

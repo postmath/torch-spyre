@@ -16,35 +16,37 @@
 
 The captured corpus (``cooptimization_captures.json``) is small -- four building
 blocks, ``n`` <= 25, only ``sdpa`` with real pins or multi-op region structure
-(Plan Section 8.4 flags this as the tracked Phase-4 corpus gap). Real captures
-need the (unlanded) substrate and carry a ``solved`` reference validated by
-``test_cooptimization_types.py``; these synthetic fixtures deliberately do
-*not* -- they have no ground-truth engine output, so they exercise only the
-**shape-invariant** SA guarantees (output contract, >= baseline, determinism,
-region flood, recolor-finds-regions), never the empirical schedule-quality
-assertions calibrated on the real corpus.
+-- too thin for anything whose value only shows up on multiple regions or a
+non-trivial ``n``. Real captures need the substrate and carry a ``solved``
+reference validated by ``test_cooptimization_types.py``; these synthetic fixtures
+deliberately do *not* -- they have no ground-truth engine output, so they
+exercise only the **shape-invariant** SA guarantees (output contract,
+>= baseline, determinism, region flood, recolor-finds-regions), never the
+empirical schedule-quality assertions calibrated on the real corpus.
 
 Each graph is a plain list of ``CoreDivisionBuffer`` built to isolate one
 structure the captures under-cover:
 
 * ``chain_long`` / ``chain_short`` -- one uniform region of very different
-  op-count but similar coloring variety: the Plan Section 7.2 size-proportional
-  anchor-fairness case (a small region under-served by uniform-op anchoring).
+  op-count but similar coloring variety: the anchor-fairness case. Anchors are
+  picked uniformly over ops, so a region draws recolor proposals in proportion to
+  its op-count, which under-serves a small region carrying comparable coloring
+  variety.
 * ``wide_join`` -- a fan-in diamond whose sink cannot satisfy every parent's
   tiling at once: many accepted internal seams + ``num_children`` spill scaling.
 * ``multi_region`` -- three uniform regions separated by boundary edges that
   carry only the trivial pair, so the flood stops for free at each boundary
-  (Plan Section 7.2 "boundaries emerge") and recolor has several regions to pick.
+  (boundaries emerge from the flood rather than being detected) and recolor has
+  several regions to pick.
 * ``k_split_consumers`` -- a clean producer read by reduction-split (K-split)
   consumers via the PSUM ring, plus a reduction-split *producer* that is gated
-  out of LX because no child edge carries its partial-write index (Plan
-  Section 7.4 second gate).
+  out of LX because no child edge carries its partial-write index -- the
+  compatibility gate, not the fixed pin.
 * ``pinned_heavy`` -- resident buffers interleaved with several pinned buffers
   spanning distinct ``residency_reason`` values, so the fixed pin gate is
-  exercised while pins still gate neighbors and contribute always-HBM traffic
-  (Plan Section 7.4).
+  exercised while pins still gate neighbors and contribute always-HBM traffic.
 * ``big_chain`` -- a ~50-buffer multi-region graph for compile-time-budget /
-  burst-scaling exercise (Plan Appendix H / #9.4) and a heavier determinism load.
+  burst-scaling exercise and a heavier determinism load.
 """
 
 from __future__ import annotations
@@ -183,7 +185,7 @@ def k_split_consumers() -> list[CoreDivisionBuffer]:
     """A clean ``producer`` read by two K-split consumers via the PSUM ring, plus a
     reduction-split ``kprod`` whose partial-write index never appears on its child
     edge -- so ``kprod`` is gated out of LX whenever it selects that division
-    (Plan Section 7.4 second gate)."""
+    (the compatibility gate, not the fixed pin)."""
     # producer: clean output menu; consumers read it split on the reduction axis.
     producer = _buf("producer", [], {}, lifetime=(0, 3))
     # consumer menu: index 0 trivial, index 1 output-split-2, index 2 K-split-2.
@@ -242,7 +244,7 @@ def pinned_heavy() -> list[CoreDivisionBuffer]:
 
 def big_chain() -> list[CoreDivisionBuffer]:
     """~48 buffers across several regions -- compile-time-budget / burst-scaling
-    exercise (Plan Appendix H) and a heavier determinism load."""
+    exercise and a heavier determinism load."""
     bufs: list[CoreDivisionBuffer] = []
     prev_tail: str | None = None
     t = 0

@@ -17,16 +17,15 @@
 WHAT THIS DECIDES
 -----------------
 The joint annealer keeps *one* layout permutation ``pi`` and re-uses it across
-work-division changes as a "warm start" (CO_OPTIMIZING_PLAN.md, "Layout stays
-meaningful across a work-division change"). That warm start is the whole reason
+work-division changes as a "warm start": layout progress is meant to stay
+meaningful across a work-division change. That warm start is the whole reason
 the joint loop can be cheaper than the nested baseline (enumerate divisions x
-full layout solve each). But it also creates the risk in review point #1: a
-division flip is judged by Metropolis against a ``pi`` tuned for the *old*
-division, so good flips can be rejected and the search collapses to "layout
-search around the seed division" == the lower bound (guess one division, solve
-layout once).
+full layout solve each). But it also creates a collapse risk: a division flip is
+judged by Metropolis against a ``pi`` tuned for the *old* division, so good flips
+can be rejected and the search collapses to "layout search around the seed
+division" == the lower bound (guess one division, solve layout once).
 
-The severity of #1 is exactly the validity of the warm-start claim, so we
+The severity of that risk is exactly the validity of the warm-start claim, so we
 measure it directly. At the layout solver's interface a division change is just:
   (a) RESIZE a correlated subset of buffers (size = total / prod(splits)), and
   (b) TOGGLE eligibility of some buffers (K-split eviction).
@@ -61,7 +60,7 @@ Part A -- Transfer curve. For each division-change magnitude, how many warm
       * b*_warm ~ L (~ a full solve)         => ordering does not transfer; the
         joint framing buys nothing over the nested baseline. Reconsider.
 
-Part B -- Decision fidelity (the direct test of the #1 collapse risk). Does
+Part B -- Decision fidelity (the direct test of the collapse risk). Does
     ranking divisions by their warm-seed score (stale pi, b=0) agree with ranking
     them by their own cold-optimal score? High agreement => Metropolis on the
     warm seed will not systematically mis-accept/reject divisions; collapse-to-
@@ -131,7 +130,7 @@ def perturb(
 ) -> list[LifetimeBoundBuffer]:
     """Model a work-division change: coherently resize a time-clustered region
     covering ``magnitude`` of the universe (a compatibility region re-tiling).
-    Buffer set and lifetimes are unchanged (the plan's stable universe); only
+    Buffer set and lifetimes are unchanged (a stable buffer universe); only
     sizes move. ``magnitude`` in (0, 1]."""
     random = rnd.Random(seed)
     n = len(base)
@@ -397,7 +396,7 @@ def run(
     print(
         "\n  Read: high sign-agreement (say >~85%) => Metropolis on the warm state\n"
         "  ranks divisions almost like their own optima, so good flips are NOT\n"
-        "  systematically rejected -- the #1 collapse-to-baseline risk is low, and\n"
+        "  systematically rejected -- the collapse-to-baseline risk is low, and\n"
         "  the compound flip+burst row shows how much a small burst buys back."
     )
 

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Phase-2 validation for the shared co-optimization scorer + node oracle.
+"""Validation for the shared co-optimization scorer + node oracle.
 
-Covers the CO_OPTIMIZING_PLAN.md §6.5 checks:
+The safety guards the scorer rests on:
 
 * the ``hbm_us`` conservation test (exact integer equality) -- the strongest
   tripwire that stripping HBM from the matmul node cost neither double-counts nor
@@ -53,7 +53,7 @@ def _matmul_io_edges(op: MatmulNode, served_by_lx=(False, False, False)):
     Byte counts use the *pre-split* footprints and the cohort multiplicity of each
     operand under the op's split, so summing them equals ``_matmul_hbm_us``'s
     ``bytes_total`` exactly when unsplit (multiplicity 1, no cohort penalty) -- the
-    conservation identity of §6.5.
+    conservation identity below.
     """
     (B, b), (M, m), (N, n), (K, k) = op.b_axis, op.m_axis, op.n_axis, op.k_axis
     db = sc.dtype_bytes()
@@ -129,7 +129,7 @@ class NodeOracleTests(TestCase):
 
     def test_matmul_strips_exactly_the_hbm_component(self):
         # The node cost is the native estimate minus its hbm_us, so adding hbm_us
-        # back recovers the full estimate (float identity, §6.5).
+        # back recovers the full estimate (float identity).
         op = MatmulNode((1, 1), (128, 2), (256, 1), (64, 1), max_cores=32)
         total = wd._matmul_split_cost(
             op.b_axis, op.m_axis, op.n_axis, op.k_axis, op.max_cores, op.shared_weight
@@ -157,8 +157,12 @@ class NodeOracleTests(TestCase):
 
 
 class HbmConservationTests(TestCase):
-    """§6.5: the memory term for an all-HBM matmul equals the estimator's hbm_us
-    exactly under integer accumulation."""
+    """The memory term for an all-HBM matmul equals the estimator's hbm_us
+    exactly under integer accumulation.
+
+    The strongest tripwire on the ``hbm_us`` strip: it proves the strip neither
+    double-counts nor drops bytes, and makes any residual mismatch visible rather
+    than a silent bias on the split direction."""
 
     def test_unsplit_conservation_exact(self):
         # Whole matmul, all operands in HBM: multiplicity 1, no cohort penalty, so
@@ -180,7 +184,7 @@ class HbmConservationTests(TestCase):
         # An M-split makes each M-cohort re-read the M-free RHS/output -- traffic
         # the memory term charges via multiplicity but that the estimator's hbm_us
         # (penalized only on N-fanout) does not see. The mismatch is *visible*
-        # (our term is strictly larger), not silently folded away (§6.5).
+        # (our term is strictly larger), not silently folded away.
         unsplit = MatmulNode((1, 1), (128, 1), (256, 1), (64, 1), max_cores=32)
         m_split = MatmulNode((1, 1), (128, 4), (256, 1), (64, 1), max_cores=32)
         base = missed_bytes(_matmul_io_edges(unsplit))

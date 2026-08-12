@@ -20,7 +20,8 @@ stayed green while those protocols drifted away from the landed
 ``CoreDivisionBuffer``. These tests instead pin the engine to the real classes:
 
 * the captured graphs rehydrate into real :class:`CoreDivisionBuffer` objects
-  that are well-formed, self-consistent, and a valid Plan §8.2 seed state;
+  that are well-formed, self-consistent, and a valid seed state (every op at
+  division index 0);
 * the engine really is a :class:`CoreDivisionLayoutSolver` and accepts those
   objects -- the check whose absence let the protocol drift go unnoticed;
 * the two capture-derived assumptions the loader and the objective rest on hold:

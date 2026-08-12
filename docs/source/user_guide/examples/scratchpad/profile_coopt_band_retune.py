@@ -15,7 +15,7 @@
 """Retune the reheating schedule's ``reorder`` band for the best-first sweep.
 
 With the sweep as the reorder move, the ``crude`` schedule beats ``reheating``
-outright -- the reverse of the Plan §5.1 claim (see
+outright -- the reverse of the claim the reheating schedule was adopted on (see
 ``test_sweep_reverses_the_schedule_ordering``). The cause is *geometry*, not
 feedback: ``update()`` ignores its ``accepted`` argument entirely, so the band is
 not a control loop. ``(accept_hi, accept_lo)`` only sets the temperature range in

@@ -1199,11 +1199,11 @@ def _matmul_hbm_us(
 
     Factored out of the estimator so the joint co-optimization scorer can both
     (a) subtract it to recover the pure node/compute term and (b) reproduce it
-    exactly in its memory term -- the ``hbm_us`` conservation check
-    (CO_OPTIMIZING_PLAN.md §6.5). Every input operand is broadcast to the cohort
-    of cores splitting the orthogonal dim; past ``_COHORT_LIMIT`` the broadcasts
-    contend for the shared link, so effective bandwidth falls off with cohort
-    size. Each axis is a ``(size, split)`` pair.
+    exactly in its memory term -- the ``hbm_us`` conservation check in
+    ``tests/inductor/test_cooptimization_scorer.py``. Every input operand is
+    broadcast to the cohort of cores splitting the orthogonal dim; past
+    ``_COHORT_LIMIT`` the broadcasts contend for the shared link, so effective
+    bandwidth falls off with cohort size. Each axis is a ``(size, split)`` pair.
     """
     (B, _b), (M, m), (N, n), (K, _k) = b_axis, m_axis, n_axis, k_axis
     weight_batches = 1 if shared_weight else B

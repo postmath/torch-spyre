@@ -16,10 +16,10 @@
 
 Replaces the former ``fake_cooptimization_substrate``, which rebuilt the dumps as
 parallel dataclasses so the SA engine could be developed against a protocol while
-the substrate branch was unlanded (Plan §8.1 / Phase 0). The substrate has since
-landed, so the fake's only remaining effect was to let the tests pass against a
-type production never sees; these builders construct ``plan_solver``'s own
-:class:`CoreDivision` / :class:`CoreDivisionBuffer` instead.
+the substrate branch was unlanded. The substrate has since landed, so the fake's
+only remaining effect was to let the tests pass against a type production never
+sees; these builders construct ``plan_solver``'s own :class:`CoreDivision` /
+:class:`CoreDivisionBuffer` instead.
 
 The fixture JSON is produced by running the real ``CoOptimizingAllocator`` over
 softmax/mlp/swiglu/sdpa/... and serializing the buffers handed to the solver
@@ -123,7 +123,7 @@ def load_captures(
 
 # The capture pins the committed/legacy division at ``core_divisions[0]`` (the
 # allocator's fixed-division seed), so the SA seed is ``chosen_division = 0`` for
-# every buffer (Plan §8.2), with pi from a FirstFit pass over the sizes.
+# every buffer, with pi from a FirstFit pass over the sizes.
 SEED_DIVISION_INDEX = 0
 
 
