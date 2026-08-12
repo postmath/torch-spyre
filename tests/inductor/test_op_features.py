@@ -22,7 +22,7 @@ well-formed and that it actually separates those cases, so a regression in the
 extractor (or a schema drift in the vendored cost model) is caught here rather
 than as a silently flat search landscape.
 
-Regenerate with ``python3 benchmarks/capture_op_features.py`` on a Spyre machine.
+Regenerate with ``python3 docs/source/user_guide/examples/scratchpad/capture_op_features.py`` on a Spyre machine.
 """
 
 import json

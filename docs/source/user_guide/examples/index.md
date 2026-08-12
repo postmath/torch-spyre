@@ -41,6 +41,7 @@ resulting buffer layouts. They require `matplotlib` and `numpy`.
 | `scratchpad/toy_layout.py` | Plot the layout for a fixed ordering of four buffers, with no annealing |
 | `scratchpad/random_buffers.py` | Compare first-fit against simulated-annealing quality on a set of random buffers |
 | `scratchpad/inplace_annealing.py` | Convergence study on an 18-buffer workload with in-place reuse |
+| `scratchpad/README.md` | Benchmark harnesses behind the [scratchpad and co-optimizer measurements](../../compiler/benchmarks/index.md) — repo checkout required, see the README |
 
 ## Provenance Audit
 

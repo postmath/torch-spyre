@@ -274,7 +274,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         # most of the swaps are O(1) no-ops, so the chain is far cheaper than an O(n^2) rebuild in
         # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
         # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
-        # benchmarks/copy_vs_swap_results.md.)
+        # docs/source/compiler/benchmarks/copy_vs_swap_results.md.)
         delta = 0.0
         if i < j:
             for k in range(i, j):

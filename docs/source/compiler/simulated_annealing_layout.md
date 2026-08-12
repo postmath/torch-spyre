@@ -25,7 +25,7 @@ which contains the following files.
   orders (following a paper by Imanishi & Xu) that drives the permutation solver by composition. It
   is wired in as the opt-in `layout_solver = "simulated_annealing"` config option; the default stays
   `greedy`.
-- **`benchmarks/`** and **`examples/scratchpad/`** — profiling scripts, result docs, and runnable
+- **`docs/source/user_guide/examples/scratchpad/`** — profiling scripts and runnable
   examples.
 
 **Native packer.** The permutation packer the search drives has two

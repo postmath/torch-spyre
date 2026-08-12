@@ -207,7 +207,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             reheating sits off the frontier. At the shipping budget the tie is
             flat:
             re-measured under the cost objective
-            (``benchmarks/coopt_schedule_default.md``, 20 fresh seeds) every
+            (``docs/source/compiler/benchmarks/coopt_schedule_default.md``, 20 fresh seeds) every
             capacity x move cell lands within noise of zero, 25 of 33 exactly
             tied, and the capacity sweep finds no crossover anywhere from 0.80
             down to 0.10 of the footprint.
@@ -221,7 +221,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             schedule is doing real work; the corpus is just too easy at the
             budget we ship to show it.
 
-            Traced directly (``benchmarks/coopt_convergence.md``) the same fact
+            Traced directly (``docs/source/compiler/benchmarks/coopt_convergence.md``) the same fact
             reads off the curve: median 40 steps for reheating to come within 1%
             of the best score any arm reaches, against 82 for crude, and crude is
             slower on every graph that converges at all -- 616 steps vs 224 on
@@ -260,7 +260,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             ones -- ``reorder_weight``, ``flip_weight``, ``recolor_weight`` --
             are now on the live path. Those three have never been swept: they are
             the guessed weights this schedule shipped with as an A/B baseline,
-            and nothing in ``benchmarks/`` has ever varied them. That is the
+            and nothing in the benchmark suite has ever varied them. That is the
             largest unmeasured surface in this engine.
 
             Two consequences. Do not read the tie as licence to drop reheating:
@@ -271,7 +271,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         cycles / horizons_per_cycle: reheating-schedule knobs (Plan §5.1).
             ``cycles`` was measured as "mildly suboptimal at 4, worth ~2% on the
             graphs that matter" under the memory-only objective. Re-run under the
-            cost objective (``benchmarks/coopt_cycle_sweep.md``), the cycle count
+            cost objective (``docs/source/compiler/benchmarks/coopt_cycle_sweep.md``), the cycle count
             changes the result on 3 of 11 graphs and the default is at most 0.35%
             off the best count anywhere.
 
@@ -290,7 +290,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
             Guessed when crude existed only as the A/B baseline reheating had to
             beat, and now measured for the first time
-            (``benchmarks/coopt_move_weights.md``, matched wall-clock, 10 fresh
+            (``docs/source/compiler/benchmarks/coopt_move_weights.md``, matched wall-clock, 10 fresh
             seeds). **They survive.** Nothing swept is both significantly better
             on score and no more expensive; the defaults land on the score/CPU
             frontier, between the arms that buy score with CPU
@@ -361,7 +361,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             * ``None`` -- the memory-only objective, explicitly.
             * an instance -- used as given; how the benchmarks drive captures.
 
-            Default on the evidence in ``benchmarks/coopt_cost_objective.md``:
+            Default on the evidence in ``docs/source/compiler/benchmarks/coopt_cost_objective.md``:
             the cost objective's plans are 18-57% cheaper by the cost model's own
             reckoning, winning on 9 of 11 corpus graphs at every capacity and
             losing on none, with the gap widest where LX is roomy and the
@@ -393,7 +393,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             was better on every capture that discriminated and worse on none, by
             ~3% mean at capacity ``footprint//4`` (11 of 12 graph x budget cells,
             sign-test p = 0.003). Re-run under the cost objective
-            (``benchmarks/coopt_reorder_move.md``, 20 seeds), it is
+            (``docs/source/compiler/benchmarks/coopt_reorder_move.md``, 20 seeds), it is
             indistinguishable from ``random``: 0 of 33 cells significantly
             better, 0 significantly worse, mean +0.01%.
 
@@ -433,7 +433,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             raising this does *not* recover the difference: a sweep over
             1..32 x 2 cycle counts found arms at -2.5 to -2.8% whose advantage
             then collapsed to within noise on held-out seeds, while ``crude``'s
-            ~3.3% lead replicated. See ``benchmarks/coopt_band_retune_scale.md``
+            ~3.3% lead replicated. See ``docs/source/compiler/benchmarks/coopt_band_retune_scale.md``
             and ``..._validate.md``.
         sweep_biased_i: bias the sweep's choice of which buffer to lift toward
             ones that are not fully allocated (the layout-only annealer's
@@ -466,12 +466,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             solver time there, but that saving is fractions of a second per
             graph -- not a trade worth a few percent of plan quality. Turn this
             on together with a raised ``steps_per_buffer``, or not at all. See
-            ``benchmarks/coopt_nested_ab.md``.
+            ``docs/source/compiler/benchmarks/coopt_nested_ab.md``.
 
             The convergence trace puts the same conclusion more starkly: at the
             default budget nested never comes within 1% of the best score any arm
             reaches on 5 of 11 graphs, and needs a median 196 steps where the
-            incumbent needs 40 (``benchmarks/coopt_convergence.md``).
+            incumbent needs 40 (``docs/source/compiler/benchmarks/coopt_convergence.md``).
         inner_curve: how the inner layout loop's length grows over the outer run,
             from ``inner_len_base * n`` to ``inner_len_max * n`` steps:
             ``"constant"`` (never grows), ``"linear"`` / ``"convex"`` in outer
@@ -523,7 +523,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             be left under-refined.
 
             Defaults to ``0.0``: the hypothesis did not survive its sweep
-            (``benchmarks/coopt_polish_sweep.md``). 8 of 11 graphs were
+            (``docs/source/compiler/benchmarks/coopt_polish_sweep.md``). 8 of 11 graphs were
             polish-insensitive and on ``flash_attention`` more polish steadily
             hurt -- 0.0 landed within +1.0% of the incumbent where 0.2 gave
             +12.3% -- because the polish steals budget from the outer structural
