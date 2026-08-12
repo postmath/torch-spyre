@@ -6,28 +6,26 @@ Steps until an arm's best-seen score is within a tolerance of the best score *an
 
 | arm | median steps to within 1% | to within 0.1% | mean final gap % | first to arrive (graphs) |
 |---|--:|--:|--:|--:|
-| `incumbent` | 40 (10/11) | 34 (8/11) | +0.09 | 3 |
-| `crude` | 82 (10/11) | 80 (8/11) | +0.13 | 0 |
-| `reorder=random` | 42 (10/11) | 40 (8/11) | +0.08 | 1 |
-| `cycles=1` | 39 (10/11) | 32 (8/11) | +0.09 | 2 |
-| `cycles=16` | 44 (10/11) | 33 (8/11) | +0.10 | 4 |
-| `nested` | 196 (6/11) | 196 (6/11) | +0.74 | 0 |
+| `incumbent` | 82 (10/11) | 80 (8/11) | +0.13 | 2 |
+| `reheating` | 40 (10/11) | 34 (8/11) | +0.09 | 7 |
+| `reorder=random` | 73 (9/11) | 66 (7/11) | +0.12 | 1 |
+| `nested` | 118 (8/11) | 118 (8/11) | +0.45 | 0 |
 
 ## Per graph: steps to within 1% of the best any arm reached
 
-| graph | n | `incumbent` | `crude` | `reorder=random` | `cycles=1` | `cycles=16` | `nested` |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| mlp | 3 | never | never | never | never | never | never |
-| swiglu | 4 | 29 | 80 | 43 | 25 | 25 | 49 |
-| softmax | 6 | 0 | 0 | 0 | 0 | 0 | 0 |
-| rms_norm | 7 | 0 | 0 | 0 | 0 | 0 | 0 |
-| sdpa | 9 | 39 | 133 | 39 | 38 | 63 | never |
-| simple_attn | 9 | 24 | 69 | 24 | 24 | 20 | never |
-| block_x2 | 26 | 56 | 84 | 56 | 64 | 48 | 343 |
-| block_x3 | 39 | 56 | 81 | 56 | 56 | 50 | 540 |
-| flash_attention | 44 | 224 | 616 | 217 | 161 | 175 | never |
-| block_x4 | 52 | 41 | 205 | 41 | 41 | 41 | 417 |
-| flash_big | 80 | 1254 | 1280 | 589 | 1139 | 602 | never |
+| graph | n | `incumbent` | `reheating` | `reorder=random` | `nested` |
+|---|--:|--:|--:|--:|--:|
+| mlp | 3 | never | never | never | never |
+| swiglu | 4 | 80 | 29 | 46 | 49 |
+| softmax | 6 | 0 | 0 | 0 | 0 |
+| rms_norm | 7 | 0 | 0 | 0 | 0 |
+| sdpa | 9 | 133 | 39 | 73 | 128 |
+| simple_attn | 9 | 69 | 24 | never | 108 |
+| block_x2 | 26 | 84 | 56 | 100 | 355 |
+| block_x3 | 39 | 81 | 56 | 124 | 388 |
+| flash_attention | 44 | 616 | 224 | 539 | never |
+| block_x4 | 52 | 205 | 41 | 66 | 561 |
+| flash_big | 80 | 1280 | 1254 | 1216 | never |
 
 ![curves](results/coopt_convergence_curves.png)
 

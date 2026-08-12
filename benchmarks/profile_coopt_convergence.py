@@ -90,13 +90,14 @@ SWEEP_JSON = os.path.join(_RESULTS, "coopt_convergence.json")
 REPORT_MD = os.path.join(_BENCH, "coopt_convergence.md")
 CURVES_PNG = os.path.join(_RESULTS, "coopt_convergence_curves.png")
 
-# One arm per knob setting worth distinguishing. The incumbent first.
+# One arm per knob setting worth distinguishing, incumbent first. ``cycles`` is
+# absent deliberately: it only shapes the reheating schedule, which stopped being
+# the default, so cycle arms would now be indistinguishable copies of the
+# incumbent rather than a comparison.
 ARMS = {
     "incumbent": {},
-    "crude": dict(schedule="crude"),
+    "reheating": dict(schedule="reheating"),
     "reorder=random": dict(reorder_move="random"),
-    "cycles=1": dict(cycles=1),
-    "cycles=16": dict(cycles=16),
     "nested": dict(nested=True, inner_annealed=False, inner_curve="constant"),
 }
 BASELINE = "incumbent"

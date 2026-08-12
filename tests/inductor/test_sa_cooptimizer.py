@@ -1123,6 +1123,18 @@ class BundleObjectiveStringTest(TestCase):
         )
         self.assertEqual(default, "bundle")
 
+    def test_search_defaults_are_pinned(self):
+        # These three were flipped on benchmark evidence (crude sits on the
+        # score/CPU frontier; constant and 0.0 are the measured nested settings).
+        # Pinned so a revert has to be deliberate rather than incidental -- the
+        # evidence for each is recorded on the corresponding docstring.
+        import inspect
+
+        params = inspect.signature(SaCoOptimizingSolver).parameters
+        self.assertEqual(params["schedule"].default, "crude")
+        self.assertEqual(params["inner_curve"].default, "constant")
+        self.assertEqual(params["polish_frac"].default, 0.0)
+
     def test_bundle_falls_back_without_a_live_graph(self):
         buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(1, 1)]})]
         solver = SaCoOptimizingSolver(
