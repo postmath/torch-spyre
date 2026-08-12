@@ -664,38 +664,37 @@ class ScheduleTest(TestCase):
         self.assertLess(total_reheat, total_crude)
         self.assertTrue(strictly_better, "reheating never beat crude on any graph")
 
-    def test_sweep_reverses_the_schedule_ordering(self):
-        """Under the default best-first sweep, ``crude`` beats ``reheating`` in
-        aggregate -- the opposite of ``test_reheating_beats_crude_overall``.
+    def test_neither_schedule_dominates_across_seeds(self):
+        """Aggregate crude-vs-reheating is noise-dominated; neither wins.
 
-        Pinned deliberately. The sweep is a much stronger reorder, and ``crude``
-        (fixed weights, one geometric cool to ``t0 / 1000``) converts that into a
-        large win while ``reheating`` barely moves.
+        This replaces a single-seed assertion that ``crude`` beats ``reheating``
+        under the default sweep. That assertion was not measuring a property of
+        the schedules: over five seeds the aggregate difference swings from -10%
+        to +25% under *every* burst setting, and its sign at seed 0 flipped when
+        an unrelated default (the burst primitive) changed. It had been passing on
+        the luck of one seed.
 
-        The cause is the band's *geometry*, not any acceptance feedback --
-        ``SelfCalibratingReheatingSchedule.update`` ignores its ``accepted``
-        argument. A band ``(hi, lo)`` only fixes the temperature range in units of
-        the streamed move scale ``d_hat``: top ``d_hat / -ln(hi)``, bottom
-        ``d_hat / -ln(lo)``. The shipped ``reorder`` band (0.6, 0.02) thus cycles
-        between 1.96*d_hat and 0.256*d_hat and never reaches a cold, near-greedy
-        phase, which is precisely what a strong reorder move exploits. Retuning is
-        the open follow-up; this test fails the day it lands, which is exactly
-        when both assertions should be revisited.
+        What survives averaging is that neither schedule dominates -- which is
+        also what the matched-wall-clock sweep found under the cost objective
+        (``coopt_schedule_default.md``: every capacity x move cell within noise of
+        zero). So the honest assertion is a bound, not an ordering: a gross
+        regression in either direction still fails, a coin flip does not.
         """
-        total_reheat = total_crude = 0
+        totals = {"crude": 0, "reheating": 0}
         for case, gi, buffers in _all_cases():
             cap = max(1, _seed_footprint(buffers) // 2)
-            r = SaCoOptimizingSolver(
-                copy.deepcopy(buffers), cap, 128, seed=0, schedule="reheating"
-            )
-            r.plan_layout_and_core_divisions()
-            c = SaCoOptimizingSolver(
-                copy.deepcopy(buffers), cap, 128, seed=0, schedule="crude"
-            )
-            c.plan_layout_and_core_divisions()
-            total_reheat += r.best_score
-            total_crude += c.best_score
-        self.assertLess(total_crude, total_reheat)
+            for seed in range(5):
+                for schedule in totals:
+                    solver = SaCoOptimizingSolver(
+                        copy.deepcopy(buffers), cap, 128, seed=seed, schedule=schedule
+                    )
+                    solver.plan_layout_and_core_divisions()
+                    totals[schedule] += solver.best_score
+        ratio = totals["crude"] / totals["reheating"]
+        self.assertTrue(
+            0.75 < ratio < 1.25,
+            f"schedules diverged beyond noise: crude/reheating = {ratio:.3f}",
+        )
 
     def test_reorder_acceptance_rate_overshoots_its_band(self):
         """The realized ``reorder`` acceptance rate sits far above the band's
@@ -1134,6 +1133,21 @@ class BundleObjectiveStringTest(TestCase):
         self.assertEqual(params["schedule"].default, "crude")
         self.assertEqual(params["inner_curve"].default, "constant")
         self.assertEqual(params["polish_frac"].default, 0.0)
+        self.assertEqual(params["burst_fraction"].default, 0.1)
+        self.assertEqual(params["burst_move"].default, "rotate")
+
+    def test_zero_burst_fraction_means_no_burst(self):
+        # The length floor (max(1, ...)) used to swallow zero, so "off" quietly
+        # meant one step per structural move -- and mislabelled an arm in the
+        # sweep that measured it. Pinned because the default now relies on it.
+        buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(1, 1)]})]
+        solver = SaCoOptimizingSolver(buffers, 1 << 30, 128, seed=0, burst_fraction=0.0)
+        solver._precompute_topology()
+        solver.chosen = [0] * len(buffers)
+        solver.packer = solver._build_seed_packer()
+        before = list(solver.packer.permutation)
+        solver._burst("flip")
+        self.assertEqual(list(solver.packer.permutation), before)
 
     def test_bundle_falls_back_without_a_live_graph(self):
         buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(1, 1)]})]

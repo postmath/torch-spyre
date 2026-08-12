@@ -1,0 +1,937 @@
+{
+ "mlp": {
+  "n": 3,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 29.540556249999888,
+    "cost_ratio": 1.0462712016234212,
+    "spb_grid": [
+     38,
+     153
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 28.868314583332943,
+    "cost_ratio": 1.0224616602453722,
+    "spb_grid": [
+     39,
+     156
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 28.2017999999995,
+    "cost_ratio": 0.998854961437735,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 27.671850000000422,
+    "cost_ratio": 0.9800851245190626,
+    "spb_grid": [
+     41,
+     163
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 27.651514583333185,
+    "cost_ratio": 0.9793648821291806,
+    "spb_grid": [
+     41,
+     163
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 28.248814583333356,
+    "cost_ratio": 1.0005201299667987,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 28.234129166667305,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 30.9166791666667,
+    "cost_ratio": 1.0950108991909822,
+    "spb_grid": [
+     37,
+     146
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 27.77271041666714,
+    "cost_ratio": 0.983657411663863,
+    "spb_grid": [
+     41,
+     163
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 28.054674999999918,
+    "cost_ratio": 0.9936440693598849,
+    "spb_grid": [
+     40,
+     161
+    ]
+   }
+  }
+ },
+ "swiglu": {
+  "n": 4,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 28.62594843749955,
+    "cost_ratio": 0.8838849140848242,
+    "spb_grid": [
+     45,
+     181
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 31.66355312500049,
+    "cost_ratio": 0.9776771936348796,
+    "spb_grid": [
+     41,
+     164
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 31.648774999999688,
+    "cost_ratio": 0.9772208886926979,
+    "spb_grid": [
+     41,
+     164
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 31.455334374999588,
+    "cost_ratio": 0.9712480123500314,
+    "spb_grid": [
+     41,
+     165
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 32.21021406250024,
+    "cost_ratio": 0.9945564721269253,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 32.22825468749968,
+    "cost_ratio": 0.9951135134529963,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 32.38651093750016,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 34.076996875000155,
+    "cost_ratio": 1.052197223120524,
+    "spb_grid": [
+     38,
+     152
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 31.784750000000276,
+    "cost_ratio": 0.9814193959126635,
+    "spb_grid": [
+     41,
+     163
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 31.79848906249977,
+    "cost_ratio": 0.9818436176673936,
+    "spb_grid": [
+     41,
+     163
+    ]
+   }
+  }
+ },
+ "softmax": {
+  "n": 6,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 28.573967708333626,
+    "cost_ratio": 0.9510815354780088,
+    "spb_grid": [
+     42,
+     168
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 30.528937499999888,
+    "cost_ratio": 1.0161525011293346,
+    "spb_grid": [
+     39,
+     157
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 30.438432291667038,
+    "cost_ratio": 1.0131400447078605,
+    "spb_grid": [
+     39,
+     158
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 30.904348958333646,
+    "cost_ratio": 1.02864803237206,
+    "spb_grid": [
+     39,
+     156
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 30.258209375000344,
+    "cost_ratio": 1.0071413437202585,
+    "spb_grid": [
+     40,
+     159
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 31.804585416666622,
+    "cost_ratio": 1.0586123090109987,
+    "spb_grid": [
+     38,
+     151
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 30.043657291666896,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 32.76743437500007,
+    "cost_ratio": 1.0906606361832205,
+    "spb_grid": [
+     37,
+     147
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 29.61697500000008,
+    "cost_ratio": 0.9857979244163073,
+    "spb_grid": [
+     41,
+     162
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 30.67953541666668,
+    "cost_ratio": 1.0211651370812354,
+    "spb_grid": [
+     39,
+     157
+    ]
+   }
+  }
+ },
+ "rms_norm": {
+  "n": 7,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 29.167186607143016,
+    "cost_ratio": 0.9589652483647264,
+    "spb_grid": [
+     42,
+     167
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 24.143301785714158,
+    "cost_ratio": 0.79378884583993,
+    "spb_grid": [
+     50,
+     202
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 24.321855357143214,
+    "cost_ratio": 0.7996593698736035,
+    "spb_grid": [
+     50,
+     200
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 25.399715178570883,
+    "cost_ratio": 0.8350974848100853,
+    "spb_grid": [
+     48,
+     192
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 31.07013928571442,
+    "cost_ratio": 1.021530949767879,
+    "spb_grid": [
+     39,
+     157
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 32.81952857142849,
+    "cost_ratio": 1.0790477597865233,
+    "spb_grid": [
+     37,
+     148
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 30.415269642857552,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 35.650646428571555,
+    "cost_ratio": 1.1721298823646442,
+    "spb_grid": [
+     34,
+     137
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 29.28562142857162,
+    "cost_ratio": 0.9628591747648304,
+    "spb_grid": [
+     42,
+     166
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 31.77684196428562,
+    "cost_ratio": 1.0447660776121972,
+    "spb_grid": [
+     38,
+     153
+    ]
+   }
+  }
+ },
+ "sdpa": {
+  "n": 9,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 47.39036736111091,
+    "cost_ratio": 0.9935759399056671,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 47.60416041666684,
+    "cost_ratio": 0.9980582777297373,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 47.1020326388886,
+    "cost_ratio": 0.987530778017461,
+    "spb_grid": [
+     41,
+     162
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 47.372805555556056,
+    "cost_ratio": 0.9932077429822787,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 47.55887569444413,
+    "cost_ratio": 0.9971088482791709,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 53.786126388888356,
+    "cost_ratio": 1.1276680063168012,
+    "spb_grid": [
+     35,
+     142
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 47.696774305555635,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 54.51622847222276,
+    "cost_ratio": 1.1429751647979431,
+    "spb_grid": [
+     35,
+     140
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 48.055563194444105,
+    "cost_ratio": 1.007522288333169,
+    "spb_grid": [
+     40,
+     159
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 47.48270000000048,
+    "cost_ratio": 0.9955117655507739,
+    "spb_grid": [
+     40,
+     161
+    ]
+   }
+  }
+ },
+ "simple_attn": {
+  "n": 9,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 47.26603819444465,
+    "cost_ratio": 1.0084885508045867,
+    "spb_grid": [
+     40,
+     159
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 45.860164583333415,
+    "cost_ratio": 0.9784922258566112,
+    "spb_grid": [
+     41,
+     164
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 45.34794722222217,
+    "cost_ratio": 0.9675633356018586,
+    "spb_grid": [
+     41,
+     165
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 46.66053958333379,
+    "cost_ratio": 0.995569371618861,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 47.07966180555591,
+    "cost_ratio": 1.0045119438894616,
+    "spb_grid": [
+     40,
+     159
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 49.486334722221976,
+    "cost_ratio": 1.0558617539159443,
+    "spb_grid": [
+     38,
+     152
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 46.86819513888891,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 51.998616666667125,
+    "cost_ratio": 1.109464883650304,
+    "spb_grid": [
+     36,
+     144
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 45.441301388888924,
+    "cost_ratio": 0.9695551803142507,
+    "spb_grid": [
+     41,
+     165
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 46.67555069444471,
+    "cost_ratio": 0.9958896551515731,
+    "spb_grid": [
+     40,
+     161
+    ]
+   }
+  }
+ },
+ "block_x2": {
+  "n": 26,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 109.11298870192321,
+    "cost_ratio": 0.9974612831127329,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 110.06120721153872,
+    "cost_ratio": 1.0061294651735881,
+    "spb_grid": [
+     40,
+     159
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 110.62528533653825,
+    "cost_ratio": 1.0112860106685972,
+    "spb_grid": [
+     40,
+     158
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 115.89667067307685,
+    "cost_ratio": 1.0594746162976607,
+    "spb_grid": [
+     38,
+     151
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 116.36694206730772,
+    "cost_ratio": 1.063773623353385,
+    "spb_grid": [
+     38,
+     150
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 125.6074769230769,
+    "cost_ratio": 1.1482463874444029,
+    "spb_grid": [
+     35,
+     139
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 109.39070072115399,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 124.36296322115379,
+    "cost_ratio": 1.1368696095856021,
+    "spb_grid": [
+     35,
+     141
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 114.73142067307711,
+    "cost_ratio": 1.0488224311272771,
+    "spb_grid": [
+     38,
+     153
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 114.02813942307756,
+    "cost_ratio": 1.042393354017768,
+    "spb_grid": [
+     38,
+     153
+    ]
+   }
+  }
+ },
+ "block_x3": {
+  "n": 39,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 156.08831858974355,
+    "cost_ratio": 0.9748962260286519,
+    "spb_grid": [
+     41,
+     164
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 158.11867275641038,
+    "cost_ratio": 0.9875774095564698,
+    "spb_grid": [
+     41,
+     162
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 159.0638056089744,
+    "cost_ratio": 0.9934805191509946,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 162.5318354166663,
+    "cost_ratio": 1.015141135408641,
+    "spb_grid": [
+     39,
+     158
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 169.01487019230805,
+    "cost_ratio": 1.0556328659435674,
+    "spb_grid": [
+     38,
+     152
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 186.6487416666666,
+    "cost_ratio": 1.1657704784564624,
+    "spb_grid": [
+     34,
+     137
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 160.1076241987177,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 184.13164358974268,
+    "cost_ratio": 1.1500491904196115,
+    "spb_grid": [
+     35,
+     139
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 162.19186057692212,
+    "cost_ratio": 1.0130177209775943,
+    "spb_grid": [
+     39,
+     158
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 169.57922900641046,
+    "cost_ratio": 1.0591577375224621,
+    "spb_grid": [
+     38,
+     151
+    ]
+   }
+  }
+ },
+ "flash_attention": {
+  "n": 44,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 169.3021065340911,
+    "cost_ratio": 0.9540012921157424,
+    "spb_grid": [
+     42,
+     168
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 171.18294843750027,
+    "cost_ratio": 0.9645996576225322,
+    "spb_grid": [
+     41,
+     166
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 174.6683799715906,
+    "cost_ratio": 0.9842397333142873,
+    "spb_grid": [
+     41,
+     163
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 183.50367883522742,
+    "cost_ratio": 1.0340258033443197,
+    "spb_grid": [
+     39,
+     155
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 193.0116740056821,
+    "cost_ratio": 1.08760245317896,
+    "spb_grid": [
+     37,
+     147
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 207.64072357954564,
+    "cost_ratio": 1.1700357582428922,
+    "spb_grid": [
+     34,
+     137
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 177.46528011363623,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 205.08921562499938,
+    "cost_ratio": 1.155658253229447,
+    "spb_grid": [
+     35,
+     138
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 179.44847386363645,
+    "cost_ratio": 1.0111751084422278,
+    "spb_grid": [
+     40,
+     158
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 181.48990923295392,
+    "cost_ratio": 1.0226784028782452,
+    "spb_grid": [
+     39,
+     156
+    ]
+   }
+  }
+ },
+ "block_x4": {
+  "n": 52,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 206.3306110576915,
+    "cost_ratio": 0.9703777070618618,
+    "spb_grid": [
+     41,
+     165
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 211.76856574519195,
+    "cost_ratio": 0.9959525356038446,
+    "spb_grid": [
+     40,
+     161
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 209.65165973557774,
+    "cost_ratio": 0.9859966769498877,
+    "spb_grid": [
+     41,
+     162
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 215.54553257211535,
+    "cost_ratio": 1.0137156992486895,
+    "spb_grid": [
+     39,
+     158
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 233.1811775240376,
+    "cost_ratio": 1.0966565514241258,
+    "spb_grid": [
+     36,
+     146
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 249.9879704326917,
+    "cost_ratio": 1.1756992929841903,
+    "spb_grid": [
+     34,
+     136
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 212.6291747596154,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 237.95747079326907,
+    "cost_ratio": 1.1191195707846215,
+    "spb_grid": [
+     36,
+     143
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 222.90723918269285,
+    "cost_ratio": 1.0483379782416837,
+    "spb_grid": [
+     38,
+     153
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 221.57909254807598,
+    "cost_ratio": 1.042091673443114,
+    "spb_grid": [
+     38,
+     154
+    ]
+   }
+  }
+ },
+ "flash_big": {
+  "n": 80,
+  "arms": {
+   "0.0 (no burst)": {
+    "cpu_per_step_us": 319.6215376562495,
+    "cost_ratio": 0.9615081183372725,
+    "spb_grid": [
+     42,
+     166
+    ]
+   },
+   "rotate 0.05": {
+    "cpu_per_step_us": 327.87171343749975,
+    "cost_ratio": 0.9863268807071387,
+    "spb_grid": [
+     41,
+     162
+    ]
+   },
+   "rotate 0.1": {
+    "cpu_per_step_us": 337.2754466406247,
+    "cost_ratio": 1.0146158561115644,
+    "spb_grid": [
+     39,
+     158
+    ]
+   },
+   "rotate 0.25": {
+    "cpu_per_step_us": 350.97580296874935,
+    "cost_ratio": 1.055830237126691,
+    "spb_grid": [
+     38,
+     152
+    ]
+   },
+   "rotate 0.5": {
+    "cpu_per_step_us": 382.1305744531256,
+    "cost_ratio": 1.149552224470946,
+    "spb_grid": [
+     35,
+     139
+    ]
+   },
+   "rotate 1.0": {
+    "cpu_per_step_us": 433.0269103906259,
+    "cost_ratio": 1.30266218244305,
+    "spb_grid": [
+     31,
+     123
+    ]
+   },
+   "swap 0.5 (previous default)": {
+    "cpu_per_step_us": 332.4168892187496,
+    "cost_ratio": 1.0,
+    "spb_grid": [
+     40,
+     160
+    ]
+   },
+   "swap 3.0": {
+    "cpu_per_step_us": 393.5030121093752,
+    "cost_ratio": 1.1837635958696053,
+    "spb_grid": [
+     34,
+     135
+    ]
+   },
+   "rotate flip 0.1 / recolor 0.5": {
+    "cpu_per_step_us": 355.97635320312463,
+    "cost_ratio": 1.0708732460608268,
+    "spb_grid": [
+     37,
+     149
+    ]
+   },
+   "rotate flip 0.5 / recolor 0.1": {
+    "cpu_per_step_us": 360.95545257812444,
+    "cost_ratio": 1.0858517250024406,
+    "spb_grid": [
+     37,
+     147
+    ]
+   }
+  }
+ }
+}

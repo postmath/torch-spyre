@@ -308,7 +308,63 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             re-opens that decision.
         burst_fraction: layout-burst length as a fraction of the buffer count
             (Plan §4.4; the burst warms ``pi`` to the new footprints before the
-            compound move is judged).
+            compound move is judged), applied to both structural moves. ``0.0``
+            disables it entirely. Runs on every flip and recolor -- about half of
+            all proposals under the default schedule. Nested mode never uses it;
+            its inner layout loop replaces it.
+
+            Swept in ``docs/source/compiler/benchmarks/coopt_burst.md`` (matched
+            wall-clock, 10 fresh seeds, both primitives): **no length differs
+            significantly from any other, under either primitive, from zero up to
+            where the burst costs 30% of the budget.** The mechanism reading is
+            the more useful one: across every arm, flip acceptance moves by 1.5%
+            and recolor by 1.5%, so the burst is not changing how Metropolis
+            judges a structural move at all. It is inert on this corpus rather
+            than merely unhelpful, which is why it is off.
+
+            **The default is a choice among ties, not a measured winner.** 0.1
+            is the nominal best of the swept range (-0.032% against the previous
+            0.5 swap default; a genuinely zero burst is nominally the worst of
+            the short arms at +0.047%), but every CI spans zero, so nothing here
+            separates them. It is preferred over the old 0.5 because it is the
+            cheaper end of a range that does not discriminate, and over 0.0
+            because zero is the one setting the corrected data puts last. Read it
+            as "the least-bad point on a flat surface", and expect a corpus that
+            actually discriminates to move it.
+
+            The obvious explanation was tested and refuted. The burst originally
+            used ``packer.swap``, an adjacent exchange, and the suspicion was that
+            it was too weak to adapt the layout where ``reorder``'s ``rotate`` is
+            not. Rebuilt on ``rotate`` (see ``burst_move``), it is still inert.
+            What remains is that the layout does not need re-adapting after a
+            division change on these graphs -- consistent with the warm-start
+            transfer experiment, which found the warm layout transfers well at
+            small and medium changes -- or that this corpus converges too early
+            for it to show. Both are claims about the corpus, not the mechanism.
+        burst_move: the burst's layout primitive -- ``"rotate"`` (default), an
+            arbitrary reinsertion, or ``"swap"``, the O(1) adjacent exchange the
+            burst originally used. Rotate is the better-mixing move and is what
+            ``reorder`` uses; it was adopted here to test whether the swap burst's
+            measured inertness was the primitive's fault. It was not: both are
+            inert, at every length. The knob is retained because it is the control
+            arm for any future attempt to make the burst do something.
+        burst_fractions: per-move override, ``{"flip": f, "recolor": f}``, merged
+            over ``burst_fraction`` so a partial override keeps the shared value
+            for the move it omits.
+
+            Exists because the two moves change very different amounts of the
+            division vector -- a flip moves one op, a recolor a whole flooded
+            region -- and the warm-start transfer experiment
+            (``docs/source/compiler/benchmarks/warm_start_transfer.md``) found
+            that the warm layout stops transferring at large division changes: at
+            its largest perturbation a warm start needed 970 steps to reach parity
+            against a cold start's 354. That is the regime a recolor is in, so
+            recolor plausibly wants a longer burst than a flip, or none.
+
+            Measured, the asymmetry is not resolvable: the best split arm beats
+            the best shared value by 0.004%, well inside the CIs. The split
+            exists so the question can be asked again once the burst does
+            something -- see ``burst_fraction``.
         node_term: add the cross-core reduction (PSUM-ring) cost of the chosen
             divisions to the objective. **Off by default, and deliberately so.**
 
@@ -550,7 +606,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         reorder_weight: float = 0.5,
         flip_weight: float = 0.3,
         recolor_weight: float = 0.2,
-        burst_fraction: float = 0.5,
+        burst_fraction: float = 0.1,
+        burst_fractions: Optional[dict[str, float]] = None,
+        burst_move: str = "rotate",
         node_term: bool = False,
         cost_objective: Union[str, "BundleCostObjective", None] = "bundle",
         reorder_move: str = "sweep_quality",
@@ -598,7 +656,24 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._reorder_weight = reorder_weight
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
-        self._burst_fraction = burst_fraction
+        # Per-move burst lengths, defaulting to the shared value. Merged rather
+        # than replaced, the way ``move_bands`` is, so a partial override keeps
+        # the default for the move it omits. The two structural moves change very
+        # different amounts of the division vector -- a flip moves one op, a
+        # recolor a whole flooded region -- and the warm-start transfer
+        # experiment found the warm layout stops transferring at large division
+        # changes, so there is a reason to expect they want different bursts.
+        self._burst_fractions = {
+            "flip": burst_fraction,
+            "recolor": burst_fraction,
+            **(burst_fractions or {}),
+        }
+        unknown = set(self._burst_fractions) - {"flip", "recolor"}
+        if unknown:
+            raise ValueError(f"burst_fractions keys must be flip/recolor: {unknown}")
+        if burst_move not in ("swap", "rotate"):
+            raise ValueError("burst_move must be 'swap' or 'rotate'")
+        self._burst_move = burst_move
         self._node_term = node_term
         # ``"bundle"`` is the self-sufficient form, and therefore the default:
         # the engine builds the cost objective itself off the live graph, so a
@@ -1136,21 +1211,40 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self._bufs[anchor].core_divisions[tiling].output_partition
         )
         self._apply_recolor(assignment)
-        self._burst()
+        self._burst("recolor")
 
-    def _burst(self) -> None:
-        """A short cold layout burst: greedily accept O(1) adjacent swaps that do
-        not lower the packer's layout quality, letting ``pi`` adapt to the new
-        footprints before the compound move is judged (Plan §4.4). ``swap`` is its
-        own inverse, so a non-improving step is reverted in place."""
+    def _burst(self, move: str) -> None:
+        """A short cold layout burst: greedily accept layout steps that do not
+        lower the packer's quality, letting ``pi`` adapt to the new footprints
+        before the compound move is judged (Plan §4.4).
+
+        ``move`` selects the length, since flip and recolor may warrant different
+        bursts; see ``burst_fractions``. ``burst_move`` selects the primitive.
+        Both are reverted rather than snapshotted: ``swap`` is its own inverse
+        and ``rotate(j, i)`` undoes ``rotate(i, j)``.
+        """
         n = len(self._bufs)
         if n < 2:
             return
-        burst_len = max(1, int(self._burst_fraction * n))
+        fraction = self._burst_fractions[move]
+        # A fraction of zero means *no* burst. The floor below is there so a
+        # small positive fraction still does something on a small graph, and it
+        # used to swallow zero along with it -- which made "burst off" quietly
+        # mean "one step", and mislabelled an arm in the sweep that measured it.
+        if fraction <= 0.0:
+            return
+        burst_len = max(1, int(fraction * n))
+        if self._burst_move == "swap":
+            for _ in range(burst_len):
+                i = self._rng.randrange(n - 1)
+                if self.packer.swap(i) < 0:
+                    self.packer.swap(i)  # revert (self-inverse)
+            return
         for _ in range(burst_len):
-            i = self._rng.randrange(n - 1)
-            if self.packer.swap(i) < 0:
-                self.packer.swap(i)  # revert (self-inverse)
+            i = self._rng.randrange(n)
+            j = self._rng.randrange(n)
+            if self.packer.rotate(i, j) < 0:
+                self.packer.rotate(j, i)  # greedy revert (pop-i-insert-j inverse)
 
     # -- annealing loop ------------------------------------------------------
 
@@ -1282,7 +1376,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             menu = len(self._bufs[idx].core_divisions)
             offset = self._rng.randrange(1, menu)  # a different index, wrap-around
             self._atomic_flip(idx, (self.chosen[idx] + offset) % menu)
-            self._burst()
+            self._burst("flip")
         elif name == "recolor":
             self._recolor()
         # "none": no applicable move; no-op.
