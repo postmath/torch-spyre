@@ -68,6 +68,7 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
@@ -2210,10 +2211,21 @@ def select_allocator() -> ScratchpadAllocator:
     * Without ``co_optimizing_lx_planning``, returns a :class:`ScratchpadAllocator`
       instance that solves for LX placement only.
     * With ``co_optimizing_lx_planning``, returns a :class:`CoOptimizingAllocator`
-      instance. A core-division-capable factory (currently only ``"cpsat"``, and
+      instance. ``"simulated_annealing"`` is served by
+      :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
+      Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
       only when ortools is available) is used directly; every other factory is
       wrapped in an :class:`ExhaustiveSearchSolver` that does an exhaustive
       search of all the core division options.
+
+    The annealer is deliberately not wrapped in :class:`ExhaustiveSearchSolver`:
+    that wrapper solves the layout once per enumerated division candidate, so
+    nesting a full anneal there would cost one anneal per candidate. It is also a
+    separate class from :class:`SimulatedAnnealingLayoutSolver` rather than one
+    class in two modes (unlike the cpsat pair, where the same solver simply does
+    less work): the layout-only annealer stays a usable
+    :class:`MemoryPlanSolver`, while the joint engine composes the same packer
+    and adds the division moves. Do not merge them.
     """
     size = _lx_planning_size()
 
@@ -2229,6 +2241,10 @@ def select_allocator() -> ScratchpadAllocator:
             logger.warning(
                 "LX relayout is not supported by CoOptimizingAllocator; "
                 "continuing without relayout"
+            )
+        if config.layout_solver == "simulated_annealing":
+            return CoOptimizingAllocator(
+                layout_planning=SaCoOptimizingSolver, size=size
             )
         # Throwaway empty-buffer probe: cheap (no real solving happens in
         # __init__) and the only way to know whether this factory's solver is

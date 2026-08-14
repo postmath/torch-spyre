@@ -225,7 +225,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         The buffer's lifetime and permutation slot are unchanged, so only its
         size-derived footprint and quality move; the shared buffer object is
         **not** mutated (the plan tracks size in ``_sizes``). One of the two
-        co-optimization packer extensions (Plan §4.2 / §7.3).
+        packer extensions the co-optimizing engine needs, and harmless to
+        placement-only use.
 
         ``new_size`` must be non-negative. A negative footprint puts a buffer's
         top below its own address, which breaks the "rest on the max top"
@@ -257,9 +258,9 @@ class PermutationBasedLayoutSolverBase(ABC):
         the flag is unchanged.
 
         An ineligible buffer keeps its permutation slot but is routed to HBM
-        (transparent to the stack). The other co-optimization packer extension
-        (Plan §2.2 / §7.3): the SA engine flips this as a division change makes a
-        buffer's tiling edge (in)compatible.
+        (transparent to the stack). The other co-optimization packer extension:
+        the SA engine flips this as a division change makes a buffer's tiling edge
+        (in)compatible.
         """
         if self._eligible[idx] == flag:
             return 0.0
