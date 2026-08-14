@@ -144,10 +144,58 @@ Every live setting has a measurement behind it; the per-knob docstrings in
 | `polish_frac` | `0.0` | `coopt_polish_sweep.md` — refuted its own hypothesis |
 | `steps_per_buffer` | 40 | Convergence data below; raising it buys −0.06% for ~4× the CPU |
 
-Two entries are dormant rather than active: `polish_frac` and `inner_curve` only take effect
-when `nested=True`, and their evidence predates the cost objective. `cycles`, `move_bands`,
-`horizons_per_cycle`, `weight_floor` and `reorder_neighborhood_scale` became dormant when the
-default schedule changed — they shape the reheating schedule only.
+Several of those entries are dormant at the shipping defaults rather than active — `polish_frac`
+and `inner_curve` need `nested=True`, and `cycles` needs `schedule="reheating"`. The next section
+maps that out.
+
+## Which arguments are live
+
+A gated argument is **silently ignored, not rejected**: `SaCoOptimizingSolver(node_term=True)`
+constructs, runs, and never prices a node term. Validation is the exception — it is unconditional,
+so a misspelled `schedule` or `inner_curve` raises even where that argument is dormant. Two
+switches choose the loop, and the loop chooses which arguments are read at all.
+
+```mermaid
+flowchart TD
+    A["<b>Always live</b><br/>seed · steps_per_buffer · min_steps · max_steps<br/>cost_objective · trace_every"]
+    A --> N{"nested"}
+    N -->|"False — default"| SL["<b>Single loop</b><br/>burst_fraction · burst_fractions · burst_move<br/>reorder_move · sweep_biased_i · sweep_cleanup"]
+    N -->|"True"| NE["<b>Nested loop</b><br/>flip_weight · recolor_weight<br/>inner_len_base · inner_curve · inner_len_max<br/>inner_annealed · early_abandon · abandon_k · polish_frac"]
+    SL --> S{"schedule"}
+    S -->|"crude — default"| C["reorder_weight<br/>flip_weight · recolor_weight"]
+    S -->|"reheating"| R["cycles · horizons_per_cycle · weight_floor<br/>move_bands · reorder_neighborhood_scale"]
+```
+
+`nested=True` ignores `schedule` outright, along with every burst and reorder argument: its outer
+loop proposes only structural moves and its inner layout loop replaces the burst.
+
+Within a live set, an argument can still be switched off by a sibling's value. Read each edge as
+"enables":
+
+```mermaid
+flowchart LR
+    BF["burst_fraction > 0"] --> BM["burst_move<br/>burst_fractions"]
+    RM["reorder_move ≠ random"] --> SW["sweep_biased_i<br/>sweep_cleanup"]
+    IC["inner_curve ≠ constant"] --> IL["inner_len_max"]
+    EA["early_abandon = True"] --> AK["abandon_k"]
+    IA["inner_annealed = True"] --> QT["the calibrated qtemp"]
+    OB["cost_objective resolves to None"] --> NT["node_term"]
+    GR["a multi-entry menu / a non-trivial anchor<br/><i>a property of the graph, not an argument</i>"] --> FR["flip knobs / recolor knobs"]
+```
+
+The last two are the ones that surprise people. `node_term` is a term of the *memory-only*
+objective, which the cost model replaces rather than extends — so at the default
+`cost_objective="bundle"` it does nothing, and it silently comes back to life on a capture where
+the bundle build finds no live graph and falls back. And a graph whose buffers offer no
+alternative division makes the flip weights and every recolor argument inert no matter how they
+are set.
+
+:::{note}
+A dormant argument is not a bit-for-bit no-op. The `T0` calibration probe runs in every mode and
+draws its sample with the crude weights, executing bursts as it goes, so changing a dormant knob
+still moves `T0` and shifts the RNG stream. An A/B on one measures noise, not nothing — which is
+also why a sweep arm that looks like a tiny effect may be measuring only that shift.
+:::
 
 ## Three facts that govern how to measure this engine
 

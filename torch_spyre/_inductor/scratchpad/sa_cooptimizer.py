@@ -14,58 +14,32 @@
 
 """Joint work-division + LX-layout simulated-annealing engine.
 
-``SaCoOptimizingSolver`` is the third co-optimization engine, a sibling to the
-substrate's CP-SAT and DFS solvers. It *composes* the incremental
-:class:`PermutationBasedLayoutSolver` packer rather than subclassing it -- this
-loop mixes move types instead of reordering only, scores a richer objective than
-the packer's own ``quality()``, and bursts with O(1) single reinsertions rather
-than the layout-only annealer's O(n) sweep -- and drives a single annealing loop
-over the joint state ``(pi, W)``:
+``SaCoOptimizingSolver`` is a third co-optimization engine alongside the
+substrate's CP-SAT and DFS solvers. It anneals the joint state ``(pi, W)``:
 
-* ``pi`` -- the layout permutation, held in the packer.
+* ``pi`` -- the layout permutation, held in a *composed* (not subclassed)
+  :class:`PermutationBasedLayoutSolver` packer, because this loop mixes move
+  types and scores a richer objective than the packer's own ``quality()``.
 * ``W`` -- the work division, one ``chosen_division`` menu index per buffer.
 
-The move set is **reorder, atomic division flip, and region-recolor**, each
-structural move run as a compound move+burst and judged as a unit by the shared
-scorer's Metropolis test. Region-recolor picks a non-trivial (split) anchor
-tiling and floods the ``cd_parent_matches`` relation bidirectionally to a
-coordinated, mutually-compatible menu-index assignment over the reachable region
--- the region *is* the flood's reach, boundaries emerge for free, and a join with
-no compatible index keeps the tie-break pick and accepts the internal seam. The
-uniform flood is a deliberately unbalanced proposal: many heterogeneous colorings
-collapse onto the same uniform one, which ratchets the sampler toward homogeneous
-regions. The balanced alternatives (a beta-biased local proposal family; exact
-block-Gibbs over tree-like regions) stay unbuilt until a run shows heterogeneous
-optima are actually being missed -- which is what the recolor instrumentation
-below exists to detect.
+Moves are reorder, atomic division flip, and region-recolor; each structural
+move runs as a compound move+burst judged as a unit by one Metropolis test.
+Region-recolor floods the ``cd_parent_matches`` relation bidirectionally from a
+non-trivial (split) anchor tiling, so the region *is* the flood's reach and
+boundaries emerge for free; an edge with no compatible index becomes an accepted
+internal seam. The uniform flood is a deliberately unbalanced proposal -- it
+ratchets toward homogeneous regions -- and the recolor instrumentation exists to
+detect whether that loses heterogeneous optima; balanced alternatives
+(beta-biased local proposals, block-Gibbs over tree-like regions) stay unbuilt
+until it does.
 
-Schedule / proposal mix. The ``"reheating"`` schedule is the multi-move
-self-calibrating reheating carrier of :mod:`cooptimization_schedule`: one shared
-reheating clock, an independent acceptance band + move-scale EMA per move type
-(region-recolor coldest), and a cycle-phase proposal mix that weights each move
-by its neighborhood size times a hotness that lets structural moves
-dominate hot phases and layout reorders dominate cold ones. Per-move acceptance
-traces and within-group ``|dE|`` CVs are recorded, as the signal for whether a
-move type's spread warrants splitting it into size-bucketed sub-groups.
-``schedule="crude"`` -- the default -- is one geometric cool + fixed weights; see
-its per-knob docstring for the A/B that keeps it there. Best-seen over
-``(pi, W)`` from the seed state (every op at index 0, ``pi`` from FirstFit) makes
-every returned state no worse than the baseline regardless of how crude the
-moves/schedule are, which is what lets each piece of the search be added and
-validated on its own.
+Best-seen over ``(pi, W)`` from the seed state (every op at index 0, ``pi`` from
+FirstFit) keeps every returned state no worse than that baseline, which is what
+lets each piece of the search be added and validated on its own.
 
-Objective. Two are available, selected by ``cost_objective``; see
-``docs/source/compiler/sa_co_optimization.md``. The memory-only objective
-(``cost_objective=None``) is the substrate's own HBM-traffic model: the
-*differential* ``spill_cost`` (``read_count`` re-reads plus the producer write,
-the latter only for an ``Intermediate`` buffer) summed over the buffers that miss
-LX, with a zero node term and unit cohort multiplicity. Because that cost is
-differential, a resident buffer contributes nothing -- the same shape as the
-CP-SAT engine's objective, so the two are comparable on one yardstick. The
-default ``"bundle"`` objective replaces it with the cost model's per-fused-bundle
-prediction, which prices compute as well as traffic. Residency, per-core sizing,
-and the ``cd_parent_matches`` compatibility gate follow the substrate exactly
-under either.
+Objectives, schedules, and the per-knob tuning evidence:
+``docs/source/compiler/sa_co_optimization.md`` and
+``docs/source/compiler/benchmarks/``.
 
 Determinism: a seeded ``Random`` over index-ordered domains and the integer
 fixed-point score make a run bit-for-bit reproducible.
@@ -114,18 +88,13 @@ def _bundle_objective(
 ) -> Optional["BundleCostObjective"]:
     """Build a :class:`BundleCostObjective` from the live Inductor graph.
 
-    The objective needs three things the solver is not handed: per-division
-    ``OpFeatures``, the fused-bundle grouping, and the buffer order. Only the
-    last comes from the arguments; the other two are read off ``V.graph``, which
-    is set while the allocator runs -- this solver *is* an Inductor pass, so the
-    graph is ambient rather than absent.
+    Per-division ``OpFeatures`` and the fused-bundle grouping are read off
+    ``V.graph``, which is ambient while the allocator runs -- this solver *is* an
+    Inductor pass. Only the buffer order comes from the arguments.
 
-    Returns ``None`` when there is no live graph. That is the normal case for
-    every test and benchmark that drives the solver from a serialized capture,
-    where no amount of plumbing could produce features. The caller falls back to
-    the memory-only objective and says so in the log, rather than raising (which
-    would make the string unusable off-hardware) or degrading silently (which
-    would let a run believe it used the cost model when it did not).
+    Returns ``None`` when there is no live graph, the normal case for a run
+    driven from a serialized capture; the caller then falls back to the
+    memory-only objective and logs it.
     """
     from torch._inductor.virtualized import V
 
@@ -133,9 +102,8 @@ def _bundle_objective(
     from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
     from torch_spyre._inductor.scratchpad.op_features import features_for_menu
 
-    # Unset, ``V.graph`` is a ``NullHandler`` rather than ``None`` or a raise, so
-    # detect the live graph by the two things this needs from it instead of by
-    # identity -- that also covers any future stand-in handler.
+    # Unset, ``V.graph`` is a ``NullHandler`` rather than ``None``, so detect the
+    # live graph by what this needs from it rather than by identity.
     graph: Any = getattr(V, "graph", None)
     if graph is None:
         return None
@@ -155,20 +123,17 @@ def _bundle_objective(
     return BundleCostObjective([b.name for b in buffers], features, bundles)
 
 
-# The packer is either the pure-Python solver or the native C++ solver; both
-# expose the same permutation-packer interface the co-optimizer drives, so
-# ``make_permutation_packer`` may return either. Use ``.quality()`` (not the
-# Python-only ``total_quality`` attribute) so both work.
+# ``make_permutation_packer`` returns either the pure-Python or the native C++
+# packer. Use ``.quality()`` (not the Python-only ``total_quality`` attribute) so
+# both work.
 Packer = Union[PermutationBasedLayoutSolver, NativePermutationLayoutSolver]
 
-# Cause recorded for a buffer the SA engine left out of LX (mirrors the
-# substrate's shared drop cause).
+# Cause recorded for a buffer the SA engine left out of LX.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
 # Per-move-type acceptance bands (accept_hi, accept_lo) for the reheating
 # schedule: reorders warmest, region-recolor the coldest floor so it freezes
-# earliest. Guessed defaults pending benchmarks -- best-seen bounds any bad
-# choice, and the per-move acceptance traces validate the resulting rates.
+# earliest. Guessed, not swept.
 _DEFAULT_MOVE_BANDS = {
     "reorder": (0.6, 0.02),
     "flip": (0.3, 0.005),
@@ -177,24 +142,53 @@ _DEFAULT_MOVE_BANDS = {
 
 
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
-    """SA joint core-division + LX-placement engine (see module docstring).
+    """SA joint core-division + LX-placement engine.
+
+    **Argument dependencies.** Most arguments are gated by another's value, and a
+    gated one is silently ignored rather than rejected. Diagrams:
+    ``docs/source/compiler/sa_co_optimization.md``. Live sets::
+
+        always          seed, steps_per_buffer, min_steps, max_steps,
+                        cost_objective, trace_every, nested
+        nested=False    schedule; burst_fraction, burst_fractions, burst_move;
+          (default)     reorder_move (+ sweep_biased_i, sweep_cleanup unless
+                        reorder_move="random")
+          schedule=       "crude"      reorder_weight, flip_weight, recolor_weight
+                          "reheating"  cycles, horizons_per_cycle, weight_floor,
+                                       move_bands, reorder_neighborhood_scale
+        nested=True     flip_weight, recolor_weight, inner_len_base, inner_curve
+                        (+ inner_len_max unless inner_curve="constant"),
+                        inner_annealed, early_abandon (+ abandon_k if set),
+                        polish_frac -- and ``schedule`` and every burst/reorder
+                        knob above are ignored
+
+    ``node_term`` is separate: it enters only the memory-only objective, so it is
+    dead unless ``cost_objective`` resolves to ``None`` (see :meth:`_score`). Flip
+    knobs need a buffer with a multi-entry menu and recolor knobs a non-trivial
+    anchor, so both go dead on a graph offering neither.
+
+    A gated argument is still not a bit-for-bit no-op: the T0 calibration probe
+    (:meth:`_calibrate_temperature`) draws crude-weighted moves and runs bursts in
+    every mode, so changing a dormant knob shifts T0 and the RNG stream. An A/B on
+    one measures noise, not nothing.
+
+    Benchmark files named below live in ``docs/source/compiler/benchmarks/``.
 
     Args:
         buffers: the buffers to plan, in the allocator's order. Declared as
             ``Sequence[LifetimeBoundBuffer]`` so the class itself satisfies
             ``CoreDivisionSolverFactory`` (``Callable`` parameters are
             contravariant, so a narrower annotation would not), but every buffer
-            actually passed must be a :class:`CoreDivisionBuffer` -- the joint
-            engine reads the ``core_divisions`` menu and the
-            ``cd_parent_matches`` compatibility relation off each one.
+            passed must be a :class:`CoreDivisionBuffer` -- the engine reads the
+            ``core_divisions`` menu and the ``cd_parent_matches`` relation off
+            each one.
 
             **Mutated in place, and their order is an index.** The returned list
             is these same objects with ``chosen_division`` and ``address``
-            written back, so a caller that needs the input preserved must copy
-            first (the benchmarks all ``deepcopy``). Position ``i`` here is the
-            index used by ``chosen``, by the packer's permutation, and by the
-            cost objective, so the three stay aligned only as long as this order
-            does. Solvers are single-use: construct a fresh one per buffer set.
+            written back, so a caller needing the input preserved must copy first
+            (the benchmarks ``deepcopy``). Position ``i`` is the index used by
+            ``chosen``, by the packer's permutation, and by the cost objective.
+            Solvers are single-use: construct a fresh one per buffer set.
         size: scratchpad capacity in bytes.
         alignment: placement alignment (128 = one Spyre stick).
         seed: RNG seed; fixes the (deterministic) search trajectory.
@@ -202,400 +196,212 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             (a crude bounded budget).
         min_steps: floor on the step budget for tiny graphs.
         max_steps: ceiling on the *total* step budget, so a large graph cannot
-            run away. Mirrors the layout-only annealer's schedule-level clamp
-            (``SelfCalibratingReheatingSchedule.max_steps``, 5_000) but sits
-            higher: this engine searches divisions as well as layout, so it
-            wants a larger budget at the same buffer count. Note this bounds
-            *steps*, not wall-clock -- per-step cost also grows with ``n``.
-        schedule: ``"crude"`` (default -- a single geometric cool with fixed
-            proposal weights) or ``"reheating"`` (the multi-move self-calibrating
-            reheating schedule + cycle-phase proposal mix).
+            run away. Sits above the layout-only annealer's clamp
+            (``SelfCalibratingReheatingSchedule.max_steps``, 5_000) since this
+            engine searches divisions too. Bounds *steps*, not wall-clock.
+        schedule: ``"crude"`` (default -- one geometric cool with fixed proposal
+            weights) or ``"reheating"`` (the multi-move self-calibrating
+            reheating schedule + cycle-phase proposal mix). Ignored entirely when
+            ``nested=True``, which brings its own outer schedule.
 
-            Crude is the default on the score/CPU frontier, not on score.
+            Crude is the default on the score/CPU frontier, not on score: at
+            matched wall-clock the two tie on score and crude's steps cost
+            0.59-0.76x, because it proposes ~50% reorders where reheating
+            proposes ~46% recolors and a recolor dirties far more bundles under
+            the cost objective (``coopt_schedule_default.md``).
 
-            The two are statistically tied on score, and crude is cheaper, so
-            reheating sits off the frontier. At the shipping budget the tie is
-            flat:
-            re-measured under the cost objective
-            (``docs/source/compiler/benchmarks/coopt_schedule_default.md``, 20 fresh seeds) every
-            capacity x move cell lands within noise of zero, 25 of 33 exactly
-            tied, and the capacity sweep finds no crossover anywhere from 0.80
-            down to 0.10 of the footprint.
-
-            That tie is an artifact of measuring after both have arrived. On this
-            corpus 8 of 11 graphs reach their final score by
-            ``steps_per_buffer`` 20, against a default of 40, so a sweep at or
-            above the default compares two converged searches. Measured *before*
-            convergence, crude is worse by +23.6% at ``spb=2``, +4.7% at 5, +2.8%
-            at 10, +0.7% at 20, and +0.16% at 40 -- a clean decay to the tie. The
-            schedule is doing real work; the corpus is just too easy at the
-            budget we ship to show it.
-
-            Traced directly (``docs/source/compiler/benchmarks/coopt_convergence.md``) the same fact
-            reads off the curve: median 40 steps for reheating to come within 1%
-            of the best score any arm reaches, against 82 for crude, and crude is
-            slower on every graph that converges at all -- 616 steps vs 224 on
-            ``flash_attention``, 205 vs 41 on ``block_x4``.
-
-            **Those are steps, and a step is no longer a fixed price.** The two
-            schedules propose different move *types* -- crude ~50% reorder,
-            reheating ~5% reorder against ~46% recolor -- and under the cost
-            objective a recolor rewrites a region's divisions and dirties many
-            bundles where a reorder only moves residency. Measured, reheating
-            costs ~1.7x per step (``flash_big`` 1.87s vs 1.10s at ``spb=40``).
-            The sweeps in this series assume the opposite ("schedule choice does
-            not change per-step work"), which held under the memory-only
-            objective and does not hold now.
-
-            Re-run with per-arm wall-clock calibration, the step-count advantage
-            does not survive being priced: at matched CPU the two are still a tie,
-            now with a slight tilt the *other* way (mean -0.02% to -0.05% in
-            crude's favour, all four capacity x move cells' CIs spanning zero,
-            25-26 of 33 cells exactly tied). Crude wins 6-7 cells to reheating's
-            1, and the residual mismatch runs against crude -- it received ~13%
-            less CPU than its calibration intended -- so if anything the tilt is
-            understated.
-
-            Pooled over the matched-CPU run, crude scores -0.008% against
-            reheating for 0.73x the CPU, and 9 of 11 graphs tie exactly. Crude
-            converges in more *steps* -- a median 82 against 40 to come within 1%
-            of the best any arm reaches -- but its steps cost 0.59-0.76x, because
-            it proposes ~50% reorders where reheating proposes ~46% recolors and a
-            recolor dirties far more bundles under the cost objective. The two
-            effects cancel on score and do not cancel on time.
-
-            **What this promotes.** The reheating-only knobs (``cycles``,
-            ``move_bands``, ``horizons_per_cycle``, ``weight_floor``,
-            ``reorder_neighborhood_scale``) are now dormant, and the crude-only
-            ones -- ``reorder_weight``, ``flip_weight``, ``recolor_weight`` --
-            are now on the live path. Those three have never been swept: they are
-            the guessed weights this schedule shipped with as an A/B baseline,
-            and nothing in the benchmark suite has ever varied them. That is the
-            largest unmeasured surface in this engine.
-
-            Two consequences. Do not read the tie as licence to drop reheating:
-            on a harder graph, or at a tighter budget, the gap is large. And do
-            not lower ``steps_per_buffer`` to save time without re-checking this
-            -- most of the headroom between 20 and 40 is exactly what makes the
+            Reheating still converges in fewer steps -- median 40 vs 82 to come
+            within 1% of the best any arm reaches (``coopt_convergence.md``) --
+            and is worth up to 23% at budgets below convergence. So do not drop
+            it, and do not lower ``steps_per_buffer`` without re-checking this:
+            most of the headroom between ``spb`` 20 and 40 is what makes the
             schedule choice free.
-        cycles / horizons_per_cycle: reheating-schedule knobs.
-            ``cycles`` was measured as "mildly suboptimal at 4, worth ~2% on the
-            graphs that matter" under the memory-only objective. Re-run under the
-            cost objective (``docs/source/compiler/benchmarks/coopt_cycle_sweep.md``), the cycle count
-            changes the result on 3 of 11 graphs and the default is at most 0.35%
-            off the best count anywhere.
-
-            Unlike ``schedule``, that is not a convergence artifact: checked
-            before the search converges (``spb`` 2-20, where the schedule choice
-            is still worth up to 23%), the spread across counts 1..16 is at most
-            3.4% and the best count is inconsistent between budgets (8, 16, 4, 8,
-            16) -- noise, not a ranking. Not worth changing.
+        cycles / horizons_per_cycle: reheating-schedule knobs, so dormant under
+            the default ``schedule``. The cycle count
+            changes the result on 3 of 11 corpus graphs and the default is at
+            most 0.35% off the best count anywhere; below convergence the spread
+            is noise, not a ranking (``coopt_cycle_sweep.md``).
         weight_floor: the ``w_floor`` in the cycle-phase proposal mix, so no
             applicable move type is ever fully starved.
         move_bands: per-move-type ``(accept_hi, accept_lo)`` acceptance bands for
             the reheating schedule; defaults to :data:`_DEFAULT_MOVE_BANDS`.
         reorder_weight / flip_weight / recolor_weight: fixed proposal weights for
-            the ``"crude"`` schedule -- which, since crude became the default, is
-            the live path.
+            the ``"crude"`` schedule, i.e. the live path. Nested mode reads the
+            flip/recolor pair for its outer move choice and ignores
+            ``reorder_weight``.
 
-            Guessed when crude existed only as the A/B baseline reheating had to
-            beat, and now measured for the first time
-            (``docs/source/compiler/benchmarks/coopt_move_weights.md``, matched wall-clock, 10 fresh
-            seeds). **They survive.** Nothing swept is both significantly better
-            on score and no more expensive; the defaults land on the score/CPU
-            frontier, between the arms that buy score with CPU
-            (``recolor-heavy`` -0.124% at 1.04x) and those that buy CPU with
-            score (``reorder-heavy`` +0.079%, not significant, at 0.92x). Pushing
-            all the way to reorder-only is the one clear mistake: +0.523%
-            (significant) for 0.86x.
+            The defaults land on the score/CPU frontier; reorder-only is the one
+            clear mistake, +0.523% for 0.86x the CPU
+            (``coopt_move_weights.md``). Before retuning: the whole spread is
+            ~0.1% of score against a cost model unvalidated on hardware, and
+            these are not independent of ``schedule`` -- giving crude the
+            reheating mix reproduces reheating's behaviour, so the schedule knob
+            is largely a mix knob.
+        burst_fraction: layout-burst length as a fraction of the buffer count,
+            applied to both structural moves; the burst warms ``pi`` to the new
+            footprints before the compound move is judged. ``0.0`` disables it.
+            Nested mode never uses it -- its inner layout loop replaces it.
 
-            Two things worth knowing before retuning them. The whole spread is
-            ~0.1% of score against a cost model no one has checked on hardware.
-            And they are not independent of ``schedule``: giving crude the
-            reheating schedule's *observed* mix reproduces reheating's shape
-            against crude -- a small score gain bought with CPU -- so the
-            schedule knob is largely a mix knob, and moving these weights
-            re-opens that decision.
-        burst_fraction: layout-burst length as a fraction of the buffer count
-            (the burst warms ``pi`` to the new footprints before the compound
-            move is judged), applied to both structural moves. ``0.0`` disables
-            it entirely. Runs on every flip and recolor -- about half of all
-            proposals under the default schedule. Nested mode never uses it;
-            its inner layout loop replaces it.
-
-            Swept in ``docs/source/compiler/benchmarks/coopt_burst.md`` (matched
-            wall-clock, 10 fresh seeds, both primitives): **no length differs
-            significantly from any other, under either primitive, from zero up to
-            where the burst costs 30% of the budget.** The mechanism reading is
-            the more useful one: across every arm, flip acceptance moves by 1.5%
-            and recolor by 1.5%, so the burst is not changing how Metropolis
-            judges a structural move at all. It is inert on this corpus rather
-            than merely unhelpful, which is why it is off.
-
-            **The default is a choice among ties, not a measured winner.** 0.1
-            is the nominal best of the swept range (-0.032% against the previous
-            0.5 swap default; a genuinely zero burst is nominally the worst of
-            the short arms at +0.047%), but every CI spans zero, so nothing here
-            separates them. It is preferred over the old 0.5 because it is the
-            cheaper end of a range that does not discriminate, and over 0.0
-            because zero is the one setting the corrected data puts last. Read it
-            as "the least-bad point on a flat surface", and expect a corpus that
-            actually discriminates to move it.
-
-            The obvious explanation was tested and refuted. The burst originally
-            used ``packer.swap``, an adjacent exchange, and the suspicion was that
-            it was too weak to adapt the layout where ``reorder``'s ``rotate`` is
-            not. Rebuilt on ``rotate`` (see ``burst_move``), it is still inert.
-            What remains is that the layout does not need re-adapting after a
-            division change on these graphs -- consistent with the warm-start
-            transfer experiment, which found the warm layout transfers well at
-            small and medium changes -- or that this corpus converges too early
-            for it to show. Both are claims about the corpus, not the mechanism.
-        burst_move: the burst's layout primitive -- ``"rotate"`` (default), an
-            arbitrary reinsertion, or ``"swap"``, the O(1) adjacent exchange the
-            burst originally used. Rotate is the better-mixing move and is what
-            ``reorder`` uses; it was adopted here to test whether the swap burst's
-            measured inertness was the primitive's fault. It was not: both are
-            inert, at every length. The knob is retained because it is the control
-            arm for any future attempt to make the burst do something.
+            Measured **inert** on this corpus: no length differs significantly
+            from any other, under either primitive, from zero up to a burst
+            costing 30% of the budget, and structural acceptance moves by only
+            ~1.5% across every arm (``coopt_burst.md``). The default is the
+            cheap end of that flat surface, not a measured winner; expect a
+            corpus that discriminates to move it.
+        burst_move: the burst's layout primitive, so dead at
+            ``burst_fraction=0`` -- ``"rotate"`` (default, an arbitrary
+            reinsertion, what ``reorder`` uses) or ``"swap"`` (the O(1) adjacent
+            exchange the burst originally used). Rotate was adopted to
+            test whether the swap burst's inertness was the primitive's fault; it
+            was not. Retained as the control arm.
         burst_fractions: per-move override, ``{"flip": f, "recolor": f}``, merged
-            over ``burst_fraction`` so a partial override keeps the shared value
-            for the move it omits.
+            over ``burst_fraction`` so a partial override keeps the shared value.
 
-            Exists because the two moves change very different amounts of the
-            division vector -- a flip moves one op, a recolor a whole flooded
-            region -- and the warm-start transfer experiment
-            (``docs/source/compiler/benchmarks/warm_start_transfer.md``) found
-            that the warm layout stops transferring at large division changes: at
-            its largest perturbation a warm start needed 970 steps to reach parity
-            against a cold start's 354. That is the regime a recolor is in, so
-            recolor plausibly wants a longer burst than a flip, or none.
-
-            Measured, the asymmetry is not resolvable: the best split arm beats
-            the best shared value by 0.004%, well inside the CIs. The split
-            exists so the question can be asked again once the burst does
-            something -- see ``burst_fraction``.
+            Exists because a flip moves one op where a recolor moves a whole
+            region, and the warm layout stops transferring at large division
+            changes (``warm_start_transfer.md``) -- so recolor plausibly wants a
+            different burst. Measured, the asymmetry is not resolvable (best
+            split arm beats the best shared value by 0.004%).
         node_term: add the cross-core reduction (PSUM-ring) cost of the chosen
-            divisions to the objective. **Off by default, and deliberately so.**
+            divisions to the objective. Off by default, and a **no-op unless
+            ``cost_objective`` resolves to ``None``** -- it is a term of the
+            memory-only objective, which the cost model replaces outright.
 
-            Today the objective is memory-only, so a division only matters if it
-            changes what fits in LX -- which is why four of the eleven captures
-            reach the objective's floor (all traffic from permanently-pinned
-            buffers) and can never distinguish any move set or schedule.
+            Only the reduction half of the node term is computable from a buffer;
+            the matmul half needs the producing op's b/m/n/k extents (see
+            :meth:`_precompute_node_costs`). That makes this one-sided -- it
+            charges for splitting a reduction axis with no modelled reward -- so
+            the search duly drives every reduction split to zero. It is an
+            instrument, not a better objective; landing the matmul half is what
+            would make it a default.
 
-            Enabling this prices the reduction half of the node term, which is
-            computable from a buffer alone. The matmul half is not (it needs
-            the producing op's b/m/n/k extents and axis roles; see
-            :meth:`_precompute_node_costs`), and that asymmetry is the hazard:
-            the reduction term charges for splitting a reduction axis while the
-            matmul term that would *reward* splitting stays unmodelled. So this
-            is a one-sided objective, biased against reduction splits, and it is
-            an instrument for measuring whether a node term restores the corpus's
-            discriminating power -- not a better objective to solve against.
-            Landing the matmul half is what would make it a default.
+            A bool rather than a scale: the intended pairing, an external cost
+            model's ``macs / cores`` matmul term, distinguishes neither
+            ``reduction_cores`` nor a K-split from an output split at fixed core
+            count, so any positive coefficient yields the same decisions and a
+            magnitude is not identifiable. Stays at the hardware-fitted
+            ``_PSUM_PER_CORE_ELEM_US``.
+        cost_objective: which objective the search minimizes.
 
-            Measured: enabling it does **not** restore discriminating power. The
-            search drives every reduction split to zero -- final node cost 0 on
-            all eleven captures, 0 ops keeping a split -- because a term that is
-            pure cost with no modelled reward has its minimum at "never split".
-            The same three graphs discriminate as before.
-
-            Deliberately a bool rather than a scale. The intended pairing is an
-            external cost model's matmul term (``macs / cores``), which supplies
-            the missing reward. Against *that* scale this term acts only as a
-            tie-breaker: that model reads neither ``reduction_cores`` nor, at
-            fixed core count, anything separating a K-split from an output split
-            (identical predictions for ``(m, n, k)`` of ``(8, 4, 1)``,
-            ``(8, 1, 4)`` and ``(4, 2, 4)``). Any positive coefficient therefore
-            yields the same decisions, so a magnitude is not identifiable from
-            the available evidence and a float knob would be false precision. It
-            stays at the hardware-fitted ``_PSUM_PER_CORE_ELEM_US``; add a scale
-            only if a K-split calibration ever makes one identifiable.
-        cost_objective: which objective the search minimizes -- the cost model's
-            per-bundle prediction (:class:`BundleCostObjective`) or the
-            memory-only spill traffic that preceded it.
-
-            * ``"bundle"`` (default) -- build the cost objective here, off the
-              live Inductor graph. The features and the fused-bundle grouping
-              come from ``V.graph``, which is ambient while the allocator runs,
-              so this form needs nothing from the caller. That is what lets it be
-              the default at all: the allocator constructs solvers through a
-              ``CoreDivisionSolverFactory`` that passes only
+            * ``"bundle"`` (default) -- build a :class:`BundleCostObjective` here
+              off the live Inductor graph, so this form needs nothing from the
+              caller. That is what lets it be the default: the allocator's
+              ``CoreDivisionSolverFactory`` passes only
               ``(buffers, size, alignment)``, so an instance could never arrive
-              that way. With no live graph -- any run driven from a serialized
-              capture -- it logs and falls back to memory-only.
-            * ``None`` -- the memory-only objective, explicitly.
+              that way. With no live graph it logs and falls back to memory-only.
+            * ``None`` -- the memory-only spill-traffic objective, explicitly.
             * an instance -- used as given; how the benchmarks drive captures.
 
-            Default on the evidence in ``docs/source/compiler/benchmarks/coopt_cost_objective.md``:
-            the cost objective's plans are 18-57% cheaper by the cost model's own
-            reckoning, winning on 9 of 11 corpus graphs at every capacity and
-            losing on none, with the gap widest where LX is roomy and the
-            memory-only objective has no signal at all (it leaves the division
-            vector untouched wherever the seed already fits).
-
-            Two caveats travel with that default, deliberately recorded here
-            rather than in a commit message. The comparison is the model grading
-            its own plans -- **no device time has been measured** -- so this is a
-            preliminary outcome, not a validated speedup. And the memory
-            objective's ``best <= baseline`` guarantee on spill traffic does not
-            carry over: this objective trades residency away for divisions (23 of
-            26 buffers resident vs 25 on ``block_x2``), so a miscalibrated
-            traffic term would regress traffic with nothing here to catch it.
-            Pass ``None`` to get the old behaviour back.
+            The bundle plans are 18-57% cheaper on 9 of 11 corpus graphs and
+            worse on none (``coopt_cost_objective.md``), but that is the model
+            grading its own plans -- **no device time has been measured** -- and
+            the memory objective's ``best <= baseline`` guarantee on *traffic*
+            does not carry over, since this objective trades residency away for
+            divisions. Pass ``None`` for the old behaviour.
         reorder_move: how a ``reorder`` proposal picks its reinsertion position.
+            Single-loop modes only -- nested mode proposes no standalone reorder.
 
             * ``"sweep_quality"`` (default) -- the layout-only annealer's
               best-first sweep: lift one buffer, probe every reinsertion
-              position, and try them in descending packer ``quality()`` order.
+              position, try them in descending packer ``quality()`` order.
+              Ranking by the ``quality()`` proxy is deliberate: it breaks ties
+              among the many score-identical positions (reorder acceptance runs
+              at 96-100%) and steers ``pi`` toward states a later structural move
+              can exploit.
             * ``"sweep_score"`` -- the same sweep ranked by the true objective at
-              every position. Exact, but it buys nothing over the proxy (see
-              below) while costing up to 1.4x per step.
-            * ``"random"`` -- the original single random ``(i, j)`` rotation,
-              retained as the A/B baseline.
+              every position. Exact, but buys nothing over the proxy at up to
+              1.4x per step.
+            * ``"random"`` -- a single random ``(i, j)`` rotation, the A/B
+              baseline.
 
-            The sweep became the default on benchmark evidence that **no longer
-            holds**. Under the memory-only objective, at matched wall-clock, it
-            was better on every capture that discriminated and worse on none, by
-            ~3% mean at capacity ``footprint//4`` (11 of 12 graph x budget cells,
-            sign-test p = 0.003). Re-run under the cost objective
-            (``docs/source/compiler/benchmarks/coopt_reorder_move.md``, 20 seeds), it is
-            indistinguishable from ``random``: 0 of 33 cells significantly
-            better, 0 significantly worse, mean +0.01%.
-
-            The reversal is explicable rather than mysterious, and the paragraph
-            below predicted it: the sweep's advantage came from ranking
-            score-identical positions by a continuous proxy under an objective
-            that was a coarse step function. The cost objective is not a step
-            function, so there are far fewer ties to break.
-
-            Nor is that tie a convergence artifact, which is the obvious
-            objection given that most of this corpus has converged by the default
-            budget: measured before convergence too, at ``spb`` 2 through 20, the
-            two stay within -0.21% to +0.18% of each other. The sweep buys
-            nothing at any budget, where the ``schedule`` choice at the same
-            budgets is worth up to 23%.
-
-            It stays the default because the re-run found no *cost* either -- a
-            sweep step is ~1.0-1.1x a random one now that scoring dominates
-            per-step time -- so this is a knob with no measured consequence in
-            either direction, not a knob with a live justification. Prefer
-            ``"random"`` if simplicity is worth anything to you.
-
-            Ranking by ``quality()`` rather than the objective is deliberate. The
-            objective counts only *spilled* buffers, so it is a coarse step
-            function of ``pi`` that most rotations leave untouched (reorder
-            acceptance runs at 96-100%); the continuous quality breaks ties among
-            those score-identical positions and steers the layout toward states a
-            later structural move can exploit.
+            Under the cost objective the sweep is indistinguishable from
+            ``random`` at every budget, and costs nothing either
+            (``coopt_reorder_move.md``); its earlier ~3% win was under the
+            memory-only objective, whose step-function shape gave it far more
+            ties to break. A knob with no measured consequence in either
+            direction -- prefer ``"random"`` if simplicity is worth anything.
         reorder_neighborhood_scale: multiplier on ``reorder``'s neighborhood size
-            in the reheating schedule's cycle-phase proposal mix. Exists for
-            investigation, **not** as a tuning recommendation: leave it at 1.
+            in the reheating schedule's cycle-phase proposal mix, so dormant under
+            the default ``schedule``. Leave it at 1.
 
-            The mix weights each move by its neighborhood, and ``reorder``'s
-            (``n``) is dwarfed by the flip/recolor menus, so reheating spends only
-            7-12% of its proposals on reorder against ``crude``'s ~50%. That is
-            why the (much stronger) sweep pays off far less under reheating. But
-            raising this does *not* recover the difference: a sweep over
-            1..32 x 2 cycle counts found arms at -2.5 to -2.8% whose advantage
-            then collapsed to within noise on held-out seeds, while ``crude``'s
-            ~3.3% lead replicated. See ``docs/source/compiler/benchmarks/coopt_band_retune_scale.md``
-            and ``..._validate.md``.
+            Reheating weights each move by its neighborhood, and ``reorder``'s
+            (``n``) is dwarfed by the flip/recolor menus, so it spends only 7-12%
+            of proposals on reorder against ``crude``'s ~50%. Raising this does
+            not recover the difference: promising arms collapsed to noise on
+            held-out seeds (``coopt_band_retune_scale.md``, ``..._validate.md``).
         sweep_biased_i: bias the sweep's choice of which buffer to lift toward
             ones that are not fully allocated (the layout-only annealer's
-            weighting). Carries a real part of the win -- turning it off erases
-            the sweep's advantage -- so it is on by default.
+            weighting). On by default: turning it off erases the sweep's
+            advantage. Dead at ``reorder_move="random"``, which runs no sweep.
         sweep_cleanup: run a placement-neutral tidy pass after an accepted sweep
             rotation, sorting adjacent non-overlapping buffers into address
-            order. Off by default: it is O(n) swaps per accepted move with
-            quadratic worst-case backtracking, and it showed no benefit.
+            order. Off by default: O(n) swaps per accepted move with quadratic
+            worst-case backtracking, and no measured benefit. Dead at
+            ``reorder_move="random"``.
         nested: run the two-timescale loop (:meth:`_anneal_nested`) instead of
             the single loop. The outer anneal proposes only *structural* moves
-            (flip/recolor); each proposal is followed by an inner layout loop
-            that re-adapts ``pi`` to the new footprints, and the whole proposal
-            is then judged once on the full objective. Layout warm-starts across
-            structural moves -- ``pi`` persists rather than being rebuilt.
+            (flip/recolor); each is followed by an inner layout loop that
+            re-adapts ``pi`` to the new footprints, and the whole proposal is
+            judged once on the full objective. ``pi`` warm-starts across
+            structural moves rather than being rebuilt.
 
-            The economics: the single loop pays a full rescore every step, while
-            this pays one per *structural* move and drives the inner loop on the
-            packer's incremental ``quality()`` instead. Under the cost-model
-            objective a full rescore is expensive, so that is a large saving.
+            The economics: one full rescore per *structural* move instead of one
+            per step, with the inner loop driven on the packer's incremental
+            ``quality()`` -- a large saving under the cost objective.
 
-            **Off by default, and the benchmark that looks like it argues
-            otherwise does not.** At matched steps it ties or beats the incumbent
-            on 9 of 11 graphs at a ~6x median wall-clock speedup -- but every
-            level of that sweep is 4x to 256x the default ``steps_per_buffer``.
-            At the default itself it is behind on 4 of 11 graphs and ahead on
-            none (worst ``flash_big`` +6.5%, ``flash_attention`` +3.7%), because
-            each outer move spends an entire inner loop, so a small budget buys
-            few structural evaluations. It is still several times cheaper in
-            solver time there, but that saving is fractions of a second per
-            graph -- not a trade worth a few percent of plan quality. Turn this
-            on together with a raised ``steps_per_buffer``, or not at all. See
-            ``docs/source/compiler/benchmarks/coopt_nested_ab.md``.
-
-            The convergence trace puts the same conclusion more starkly: at the
-            default budget nested never comes within 1% of the best score any arm
-            reaches on 5 of 11 graphs, and needs a median 196 steps where the
-            incumbent needs 40 (``docs/source/compiler/benchmarks/coopt_convergence.md``).
+            Off by default: at the default ``steps_per_buffer`` it is behind on 4
+            of 11 graphs and ahead on none, because each outer move spends an
+            entire inner loop and a small budget buys few structural evaluations
+            (``coopt_nested_ab.md``); it needs a median 196 steps to come within
+            1% of the best any arm reaches, against the incumbent's 40
+            (``coopt_convergence.md``). It ties or beats the incumbent at 4-256x
+            that budget, so raise ``steps_per_buffer`` with it or leave it off.
         inner_curve: how the inner layout loop's length grows over the outer run,
             from ``inner_len_base * n`` to ``inner_len_max * n`` steps:
             ``"constant"`` (never grows), ``"linear"`` / ``"convex"`` in outer
             progress, or ``"adaptive"`` in the structural *reject* rate -- invest
             more in layout as structure stops moving. Nested mode only.
 
-            ``"constant"`` is the default on measurement: mean +0.02% against
-            the incumbent where ``convex`` gives +0.23%, and convex degrades
-            badly at the shipping budget (+10.3% on ``flash_attention``, +15.8%
-            on ``flash_big``). Effect sizes, not CI-tested -- the sweep behind
-            them ran 5 seeds.
+            ``"constant"`` is the default on measurement (mean +0.02% against
+            the incumbent where ``convex`` gives +0.23% and degrades badly at the
+            shipping budget). Effect sizes over 5 seeds, not CI-tested.
         inner_annealed: run the inner layout loop as a Metropolis anneal on the
             packer-quality delta (at a calibrated constant ``qtemp``) rather than
-            greedy-cold. Off, and it should stay off: annealed is worse than
-            greedy on every graph that discriminates, because with a small early
-            inner budget it wanders instead of converging.
+            greedy-cold; nested mode only, and the sole consumer of ``qtemp``.
+            Off, and should stay off: worse than greedy on every
+            graph that discriminates, because a small early inner budget makes it
+            wander instead of converge.
         inner_len_base / inner_len_max: the inner loop's length envelope, as
-            multiples of the buffer count ``n``. ``inner_curve`` interpolates
-            between them; ``"constant"`` pins the length at ``inner_len_base * n``
-            and ignores ``inner_len_max``.
+            multiples of the buffer count ``n``; nested mode only.
+            ``inner_curve`` interpolates between them, and ``"constant"`` pins the
+            length at ``inner_len_base * n``, ignoring ``inner_len_max``.
         early_abandon: run only a quarter of the inner loop, peek at the full
             score, and skip the remainder when the proposal is already worse than
             ``abandon_k * temperature``. Saves the tail of hopeless proposals.
+            Nested mode only.
         abandon_k: the multiple of the current temperature above which
-            ``early_abandon`` gives up on a proposal. Larger = more patient.
+            ``early_abandon`` gives up on a proposal. Larger = more patient. Dead
+            unless ``early_abandon``.
         trace_every: sample the best-seen score every N steps into ``trace``, a
             list of ``(steps_taken, best_score)``. ``0`` (default) disables it.
 
-            Exists because this series' benchmarks compare *endpoints*, and an
-            endpoint goes blind the moment every arm converges -- which on the
-            current corpus happens by ``steps_per_buffer`` 20, below the default
-            of 40. That blindness is not hypothetical: the ``schedule`` choice
-            reads as a dead tie at the shipping budget and is worth 23% at
-            ``spb=2``, because reheating converges faster rather than better. A
-            trace shows that directly instead of requiring someone to suspect it
-            and go looking.
-
-            The sampling touches no RNG and no search state, so a traced solve
-            follows the identical trajectory to an untraced one -- asserted in
-            the tests rather than assumed, since the engine's determinism
-            guarantee would otherwise mask a perturbation as just another valid
-            search. ``steps_taken`` counts a nested outer move as ``1 + inner``,
+            Exists because endpoint comparisons go blind once every arm
+            converges, which on this corpus happens below the default budget --
+            the ``schedule`` choice reads as a dead tie there and is worth 23% at
+            ``spb=2``. The sampling touches neither the RNG nor any search state,
+            so a traced solve follows the identical trajectory (asserted in the
+            tests). ``steps_taken`` counts a nested outer move as ``1 + inner``,
             so schedules that spend their budget differently share an x-axis.
         polish_frac: fraction of the nested budget held back for a final
-            pure-layout anneal on the *best* structure found, after the outer
-            loop ends. Exists because the outer loop only ever refines layout
-            inside a proposal's inner loop, and a rejected proposal's layout work
-            is discarded with it -- so without a polish the winning structure can
-            be left under-refined.
+            pure-layout anneal on the *best* structure found. Exists because a
+            rejected proposal's inner-loop layout work is discarded with it, so
+            the winning structure can be left under-refined.
 
-            Defaults to ``0.0``: the hypothesis did not survive its sweep
-            (``docs/source/compiler/benchmarks/coopt_polish_sweep.md``). 8 of 11 graphs were
-            polish-insensitive and on ``flash_attention`` more polish steadily
-            hurt -- 0.0 landed within +1.0% of the incumbent where 0.2 gave
-            +12.3% -- because the polish steals budget from the outer structural
-            loop and freezes structure on the best-so-far too early. Measured
-            under the memory-only objective, so re-check it if nested is ever
-            turned on.
+            Defaults to ``0.0``: 8 of 11 graphs are polish-insensitive and on
+            ``flash_attention`` more polish steadily hurts, since it steals
+            budget from the outer loop and freezes structure too early
+            (``coopt_polish_sweep.md``). Measured under the memory-only
+            objective, so re-check it if nested is ever turned on.
     """
 
     def __init__(
@@ -636,12 +442,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         trace_every: int = 0,
     ) -> None:
         super().__init__(buffers, size, alignment)
-        # Declared over ``LifetimeBoundBuffer`` so the class itself satisfies
-        # ``CoreDivisionSolverFactory`` (``Callable`` parameters are
-        # contravariant, so a narrower parameter would not), then narrowed here:
-        # the joint engine needs the ``core_divisions`` menus every buffer it is
-        # actually given carries. Same objects as the base's ``self.buffers``, so
-        # write-back through either name is visible in both.
+        # Narrowed from the contravariant parameter type (see the ``buffers``
+        # arg). Same objects as the base's ``self.buffers``, so write-back
+        # through either name is visible in both.
         self._bufs: Sequence[CoreDivisionBuffer] = cast(
             "list[CoreDivisionBuffer]", list(buffers)
         )
@@ -659,20 +462,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._cycles = cycles
         self._horizons_per_cycle = horizons_per_cycle
         self._weight_floor = weight_floor
-        # Merge (not replace) so a partial override keeps the defaults for the
-        # move types it omits -- otherwise _choose_move_reheating can select a
-        # move type whose band is missing and crash in the reheating schedule.
+        # Merge, not replace: a partial override that dropped a band would let
+        # _choose_move_reheating pick a move type the schedule has no band for.
         self._move_bands = {**_DEFAULT_MOVE_BANDS, **(move_bands or {})}
         self._reorder_weight = reorder_weight
         self._flip_weight = flip_weight
         self._recolor_weight = recolor_weight
-        # Per-move burst lengths, defaulting to the shared value. Merged rather
-        # than replaced, the way ``move_bands`` is, so a partial override keeps
-        # the default for the move it omits. The two structural moves change very
-        # different amounts of the division vector -- a flip moves one op, a
-        # recolor a whole flooded region -- and the warm-start transfer
-        # experiment found the warm layout stops transferring at large division
-        # changes, so there is a reason to expect they want different bursts.
+        # Per-move burst lengths, merged over the shared value the way
+        # ``move_bands`` is.
         self._burst_fractions = {
             "flip": burst_fraction,
             "recolor": burst_fraction,
@@ -685,11 +482,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             raise ValueError("burst_move must be 'swap' or 'rotate'")
         self._burst_move = burst_move
         self._node_term = node_term
-        # ``"bundle"`` is the self-sufficient form, and therefore the default:
-        # the engine builds the cost objective itself off the live graph, so a
-        # caller that cannot reach Inductor's IR (the allocator hands this class
-        # nothing but buffers) still gets it. An instance is still accepted, and
-        # is what the benchmarks pass when driving serialized captures.
         if isinstance(cost_objective, str):
             if cost_objective != "bundle":
                 raise ValueError(f"unknown cost_objective {cost_objective!r}")
@@ -708,24 +500,19 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._reorder_neighborhood_scale = reorder_neighborhood_scale
         self._sweep_biased_i = sweep_biased_i
         self._sweep_cleanup = sweep_cleanup
-        # Per-step sweep cost instrumentation (populated only by the sweep
-        # reorder): positions probed and candidates score-evaluated, so a
-        # benchmark can price a step without guessing at the acceptance depth.
+        # Sweep-reorder cost instrumentation: positions probed and candidates
+        # score-evaluated, so a benchmark can price a step without guessing at
+        # the acceptance depth.
         self.sweep_probes = 0
         self.sweep_evals = 0
         self.sweep_steps = 0
-        # Nested two-timescale mode (experimental): the outer loop anneals over
-        # structure (flip/recolor) and each proposal runs an inner layout loop
-        # whose length grows over the run; see :meth:`_anneal_nested`.
         self._nested = nested
         self._inner_curve = inner_curve
         self._inner_annealed = inner_annealed
         self._inner_len_base = inner_len_base
         self._inner_len_max = inner_len_max
-        # Convergence trace (off by default). ``trace`` is [(steps_taken,
-        # best_score_so_far)], sampled every ``trace_every`` steps -- the
-        # instrument for "which option gets there sooner", which an endpoint
-        # comparison cannot answer once every option has converged.
+        # ``trace`` is [(steps_taken, best_score_so_far)], sampled every
+        # ``trace_every`` steps.
         self._trace_every = max(0, int(trace_every))
         self._steps_taken = 0
         self._last_trace = 0
@@ -733,8 +520,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._early_abandon = early_abandon
         self._polish_frac = polish_frac
         self._abandon_k = abandon_k
-        # Best-seen over the anneal (set in _anneal, read in _step); declared here
-        # so their type is known across methods.
+        # Best-seen over the anneal (set in _anneal, read in _step); declared for
+        # the types.
         self._best_score: int
         self._best_snap: tuple[Packer, list[int]]
 
@@ -743,13 +530,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Not supported: this engine is joint-only.
 
-        :class:`MemoryPlanSolver` declares this abstract, but the placement-only
-        path deliberately belongs to the standalone layout-only annealer, which
-        remains its own :class:`MemoryPlanSolver` -- this engine adds a joint
-        path, it does not replace that one. ``CoOptimizingAllocator`` -- the only
-        allocator this engine is injected into -- calls
-        :meth:`plan_layout_and_core_divisions` exclusively, so this stays a loud
-        stub rather than a second annealing path to maintain.
+        :class:`MemoryPlanSolver` declares this abstract, but placement-only
+        annealing belongs to the standalone layout-only annealer; this engine
+        adds a joint path rather than replacing that one, and
+        ``CoOptimizingAllocator`` only ever calls
+        :meth:`plan_layout_and_core_divisions`.
         """
         raise NotImplementedError(
             "SaCoOptimizingSolver is a joint core-division + placement engine; "
@@ -760,18 +545,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
-        solver's own buffers (the one-shot interface satisfied by an internal
-        solve) -- a solver is single-use, so construct a fresh one per set."""
+        solver's own buffers. Single-use: construct a fresh solver per set."""
         self.spill_reasons = {}
-        # Move instrumentation: per-type proposal and accept counts, recolor
-        # improvement count, the flooded region sizes, and the anchor-tiling
-        # ``output_partition`` of every proposed recolor and of the accepted
-        # subset. The last two answer the open "should the anchor tiling be
-        # weighted by output_partition?" question empirically -- if aggressive
-        # (high-partition) anchors are proposed but rarely accepted once the real
-        # node term is on, that is the measurement that justifies escalating to a
-        # balanced (beta-biased) recolor proposal. Populated only by the main
-        # annealing loop (not the calibration probes).
+        # Move instrumentation, populated by the main loop only (not the
+        # calibration probes). The anchor ``output_partition`` traces answer the
+        # open "weight anchor tilings by output_partition?" question: aggressive
+        # anchors proposed but rarely accepted would justify a balanced
+        # (beta-biased) recolor proposal.
         self.moves_proposed = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self.moves_accepted = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self.recolor_improved = 0
@@ -780,14 +560,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.recolor_accepted_partitions: list[int] = []
         self._last_recolor_region_size = 0
         self._last_recolor_anchor_partition = 0
-        # Within-group score-delta stats per move type (online n / sum / sum-of-
-        # squares over nonzero |dE|), for the within-group-CV instrumentation that
-        # gates whether a move type needs size-bucketed sub-groups. Read via
+        # Online n / sum / sum-of-squares over nonzero |dE| per move type, for
         # :meth:`move_scale_cv`.
         self._ms_n = {"reorder": 0, "flip": 0, "recolor": 0, "none": 0}
         self._ms_sum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
         self._ms_sqsum = {"reorder": 0.0, "flip": 0.0, "recolor": 0.0, "none": 0.0}
-        # Sweep-reorder cost counters, per solve (see :meth:`_step_reorder_sweep`).
+        # Sweep-reorder cost counters, per solve.
         self.sweep_probes = 0
         self.sweep_evals = 0
         self.sweep_steps = 0
@@ -814,25 +592,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _assert_unsized_buffers_are_pinned(self) -> None:
         """Assert every unsized buffer carries a ``residency_reason``.
 
-        An unsized buffer is one whose ``mem_usage`` is the ``-1`` sentinel
-        ``mem_usage_by_buf`` emits (``utils.py``) when it cannot size a buffer.
-        :meth:`_per_core_size` clamps that to ``0``, and a zero footprint passes
-        the capacity gate in :meth:`_eligible` -- so an unsized buffer that
-        reached the search would be placed occupying no space, and the buffer
-        stacked above it would align to the same address. A wrong layout, not a
-        crash.
+        An unsized buffer carries the ``-1`` ``mem_usage`` sentinel
+        ``mem_usage_by_buf`` (``utils.py``) emits when it cannot size a buffer.
+        :meth:`_per_core_size` clamps that to ``0``, which passes
+        :meth:`_eligible`'s capacity gate -- so such a buffer reaching the search
+        would be placed occupying no space and the buffer above it would land on
+        the same address. A wrong layout, not a crash.
 
-        The reason that cannot happen is a coupling across three files:
-        ``mem_usage_by_buf`` emits ``-1`` on exactly the three conditions
-        ``_op_output_good_for_lx_reuse`` (``allocator.py``) refuses -- not a
-        ``ComputedBuffer``, a ``MutationLayoutSHOULDREMOVE`` layout, not a
-        ``FixedTiledLayout`` -- so the allocator hands every such buffer an "op
-        not allowed" ``residency_reason``, and :meth:`_eligible`'s pin gate
-        rejects it before the clamped footprint is ever consulted.
-
-        Nothing in the search re-derives that, so state it here rather than
-        depend on the three staying in lockstep. One pass over the buffers per
-        solve, against a search that is O(steps x n).
+        What prevents it is a coupling across three files: ``mem_usage_by_buf``
+        emits ``-1`` on exactly the conditions ``_op_output_good_for_lx_reuse``
+        (``allocator.py``) refuses, so the allocator gives every such buffer an
+        "op not allowed" ``residency_reason`` and the pin gate rejects it first.
+        Nothing in the search re-derives that, so assert it rather than depend on
+        the three staying in lockstep -- one pass per solve against an
+        O(steps x n) search.
         """
         for b in self._bufs:
             assert b.size >= 0 or b.residency_reason is not None, (
@@ -848,12 +621,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         index -- its children with the ``(parent_div, child_div)`` pairs that keep
         that edge tiling-compatible.
 
-        The consumer *count* is no longer derived here: the landed spill cost
-        scales by the buffer's reads-served count instead -- ``read_count``
-        discounted by an input's unavoidable clone-in, see :meth:`spill_cost`.
-        The two agree on every captured graph (see
-        ``test_read_count_matches_consumer_count``), and ``_children`` remains
-        available for the cohort multiplicity when op metadata is wired in.
+        No consumer *count* is derived here: :meth:`_spill_cost` scales by
+        reads-served instead. ``_children`` remains available for the cohort
+        multiplicity when op metadata is wired in.
         """
         self._assert_unsized_buffers_are_pinned()
         bufs = self._bufs
@@ -865,23 +635,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         foreign_parents = 0
         for c_idx, c in enumerate(bufs):
             for p_name in c.parents:
-                # A parent that is not a solver buffer is skipped, not asserted.
-                # This used to assert, on the premise that the substrate built
-                # ``parents`` by intersecting an op's reads with the solver's
-                # buffer set. It does not: ``_build_cd_bound_buffers`` assigns
+                # A parent outside the solver's buffer set is skipped, not
+                # asserted: ``_build_cd_bound_buffers`` assigns
                 # ``parents=info["op_inputs"]`` unfiltered, so graph inputs,
-                # constants and extern outputs appear here and the assert fired on
-                # 10 of the 11 corpus graphs -- i.e. on essentially every real
-                # compile. (The sibling in-place path in the same builder already
-                # guards this way, for the same reason.)
-                #
-                # Skipping is the correct semantics, not just the convenient one.
-                # The edge exists to gate a child's division against reading the
-                # parent's per-core slice *from LX*; a buffer the solver does not
-                # own is never LX-resident, so there is nothing to gate. Note this
-                # does not silently drop clone-eligible graph inputs -- those *are*
-                # solver buffers (``rms_norm`` owns ``arg0_1``) and resolve here
-                # normally.
+                # constants and extern outputs appear here. The edge only exists
+                # to gate a child's division against reading the parent's per-core
+                # slice *from LX*, and a buffer the solver does not own is never
+                # LX-resident, so there is nothing to gate. Clone-eligible graph
+                # inputs *are* solver buffers and still resolve normally.
                 p_idx = self._name_to_idx.get(p_name)
                 if p_idx is None:
                     foreign_parents += 1
@@ -907,8 +668,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         }
         # Non-trivial (split) menu indices per op -- the only legal recolor
         # anchors, so recolor stays a coordinated *splitting* move and leaves
-        # undividing to atomic flips. Anchor candidates are the ops
-        # that have at least one.
+        # undividing to atomic flips.
         self._nontrivial_menu = [
             sorted(
                 j for j, cd in enumerate(b.core_divisions) if cd.output_partition > 1
@@ -923,21 +683,18 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         (PSUM-ring) cost of choosing that division, in fixed-point time units.
         ``None`` when the node term is off.
 
-        Only the *reduction* half of the node term is expressible here. It
-        needs the reduction split (a product of ``reduction_splits`` values) and
-        the per-core output size -- a split factor and an output-side quantity,
-        both of which a buffer carries. The matmul half needs the producing op's
-        b/m/n/k iteration-space *extents* and axis roles; ``CoreDivision`` records
-        only how each axis is split, keyed by index coefficient, and the K extent
-        is contracted away entirely so no output-side quantity can recover it. See
-        the class docstring for what that asymmetry means for the search.
+        Only the *reduction* half is expressible here: it needs the reduction
+        split and the per-core output size, both of which a buffer carries. The
+        matmul half needs the producing op's b/m/n/k iteration-space *extents*,
+        which ``CoreDivision`` does not record (it keys splits by index
+        coefficient, and the K extent is contracted away). See the ``node_term``
+        arg for what that asymmetry means for the search.
 
         ``shared_weight`` is not recoverable from a buffer either; it only selects
-        between two PSUM coefficients, so this takes ``ReductionNode``'s default
-        (the shared-weight coefficient) rather than inventing a per-op answer.
+        between two PSUM coefficients, so this takes ``ReductionNode``'s default.
 
-        The table is division-invariant, so :meth:`_score` stays a pair of list
-        walks rather than recomputing products in the hot loop.
+        Precomputed because the table is division-invariant, keeping
+        :meth:`_score` to a pair of list walks.
         """
         if not self._node_term:
             self._node_costs = None
@@ -969,11 +726,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Cache each buffer's spill cost and the HBM bandwidth constant for
         :meth:`_score`.
 
-        Both are loop-invariant across the whole anneal: ``spill_cost`` reads only
-        ``boundary`` / ``read_count`` / ``first_use_is_read`` / ``size``, none of
-        which a move touches (a division flip changes the *per-core* footprint the
-        packer sees, never the buffer's total size), and the bandwidth is a
-        hardware constant behind a lazy module lookup.
+        Both are loop-invariant: ``spill_cost`` reads only ``boundary`` /
+        ``read_count`` / ``first_use_is_read`` / ``size``, none of which a move
+        touches (a division flip changes the *per-core* footprint the packer sees,
+        never the total size), and the bandwidth is a hardware constant.
         """
         self._spill_costs = [self._spill_cost(b) for b in self._bufs]
         self._hbm_bytes_per_us = scorer.hbm_bytes_per_us()
@@ -985,19 +741,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Per-core footprint of buffer ``idx`` under menu index ``div_idx``:
         ``ceil(total_size / output_partition)``.
 
-        Uses the substrate's shared :func:`ceil_div` rather than ``math.ceil`` on
-        a float quotient, so this rounds identically to every other
-        footprint-division site (the CP-SAT engine and ``CoreDivisionBuffer``'s
-        own per-core sizes) with no float intermediate to disagree about.
+        Uses the substrate's :func:`ceil_div` rather than ``math.ceil`` on a float
+        quotient, so this rounds identically to every other footprint-division
+        site with no float intermediate to disagree about.
 
-        Clamped to be non-negative: an unsized buffer carries the ``mem_usage``
-        ``-1`` sentinel (a non-placeable "op not allowed" input in the captures),
-        so its footprint is never actually used -- clamp it so a nonsense size can
-        never look placeable, and so the packer never receives a negative size.
-        Mirrors the ``max(0, ...)`` clamp at the other packer-feeding sites in
-        ``allocator.py``. What makes "never actually used" true is asserted in
-        :meth:`_assert_unsized_buffers_are_pinned`, because the clamp on its own
-        would turn an unsized buffer into a zero-footprint *placeable* one."""
+        Clamped non-negative so the packer never sees a negative size from the
+        ``mem_usage`` ``-1`` sentinel, mirroring the other packer-feeding sites in
+        ``allocator.py``. The clamp alone would make an unsized buffer look
+        *placeable* at zero footprint; what rules that out is asserted in
+        :meth:`_assert_unsized_buffers_are_pinned`."""
         part = self._bufs[idx].core_divisions[div_idx].output_partition
         return max(0, ceil_div(self._bufs[idx].size, part))
 
@@ -1006,18 +758,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         (the three division-dependent gates, mirroring
         ``DfsLayoutSolver._evaluate``): the fixed residency pin, a per-core
         footprint that fits at all, and a division carrying a compatible
-        ``cd_parent_matches`` pair on *every* child edge -- the sole compatibility
-        gate; a division missing a pair on any edge is gated out. Those pairs are
-        per-core-view / core-count based (not ``is_clean`` based): a reduction
-        split can appear as a *consumer* index (a K-split reading a clean parent
-        via the PSUM ring), but a reduction-split *producer* writes a partial sum
-        the substrate never lets a child read from LX, so it never appears as a
-        parent index -- such a buffer is always gated out here."""
+        ``cd_parent_matches`` pair on *every* child edge.
+
+        Those pairs are per-core-view / core-count based, not ``is_clean`` based: a
+        reduction split can appear as a *consumer* index (a K-split reading a clean
+        parent via the PSUM ring), but never as a parent index, since a
+        reduction-split producer writes a partial sum no child may read from LX --
+        so such a producer is always gated out here."""
         b = self._bufs[idx]
-        # The fixed pin, read straight off the substrate field. Deliberately not
-        # ``MemoryPlanSolver.excluded()``: that folds in a ``min_footprint >
-        # limit`` capacity test, which is division-*dependent* and is the second
-        # gate below -- routing through it would conflate the two gates.
+        # Not ``MemoryPlanSolver.excluded()``: that folds in a ``min_footprint >
+        # limit`` test, which is division-dependent and is the next gate down.
         if b.residency_reason is not None:
             return False
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
@@ -1035,9 +785,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         parents are kept in full -- the packer treats an ineligible (absent)
         parent transparently, so it never in-places onto one.
 
-        ``residency_reason`` is carried so that ``MemoryPlanSolver.excluded()``
-        sees the fixed pins during the FirstFit seed pass; the packer
-        ignores it, taking an explicit ``eligible`` mask instead.
+        ``residency_reason`` is carried so ``MemoryPlanSolver.excluded()`` sees the
+        fixed pins during the FirstFit seed pass; the packer ignores it, taking an
+        explicit ``eligible`` mask instead.
         """
         out = []
         for i, b in enumerate(self._bufs):
@@ -1065,21 +815,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # pi from a FirstFit pass over the per-core sizes. ``_lifetime_buffers``
         # carries ``residency_reason``, so ``FirstFitLayoutSolver.excluded()``
         # leaves the fixed pins unplaced and ``SolverToPermutation`` sorts them
-        # after every placed buffer (pi is ordered over the buffers that can
-        # ever be resident). They keep their slot in pi -- it stays a
-        # permutation of all n indices, so the packer's ``eligible`` mask still
-        # lines up index-for-index -- they simply stop occupying prefix slots and
-        # displacing eligible buffers to higher addresses.
+        # after every placed buffer, where they stop displacing eligible buffers
+        # to higher addresses. They keep a slot, so pi stays a permutation of all
+        # n indices and the packer's ``eligible`` mask lines up index-for-index.
         #
         # Transient, division-dependent ineligibility is deliberately *not*
-        # expressed here: a buffer whose seed-division footprint exceeds capacity
-        # is already tail-sorted by ``excluded()``'s ``min_footprint`` test (that
-        # predates this and is unchanged), and eligibility that comes and goes
-        # with ``W`` must keep its slot so it can re-enter coherently.
+        # expressed here: it must keep its slot so it can re-enter coherently.
         ff_bufs = self._lifetime_buffers(sizes)
-        # Deep-copied so FirstFit lays out its own objects: SolverToPermutation
-        # only reads addresses back by name, and the buffers it is handed must
-        # not be the ones the solver mutates.
+        # Deep-copied so FirstFit lays out its own objects, never the ones the
+        # solver mutates; SolverToPermutation reads addresses back by name.
         pi = SolverToPermutation(
             FirstFitLayoutSolver(copy.deepcopy(ff_bufs), self.limit, self.alignment)
         ).permutation(ff_bufs)
@@ -1092,37 +836,28 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             eligible=eligible,
         )
 
-    # -- scoring (shared scorer; lower is better) ----------------------------
+    # -- scoring (lower is better) -------------------------------------------
 
     @staticmethod
     def _spill_cost(buffer: CoreDivisionBuffer) -> int:
         """Differential HBM traffic a spill adds over residency, in bytes.
 
         Duplicates :meth:`_LifetimeBufferWithCpVars.spill_cost` in
-        ``ilp_solver_ortools.py`` so the two engines score the same quantity. It
-        is duplicated rather than shared because the landed formula lives on a
-        CP-SAT-private wrapper; lifting it into ``plan_solver.py`` and having both
-        call it is a deliberate follow-up, not a prerequisite.
+        ``ilp_solver_ortools.py`` so the two engines score the same quantity;
+        lifting the formula off that CP-SAT-private wrapper into
+        ``plan_solver.py`` is a follow-up.
 
-        The reads residency would have served from LX, plus the producer's own
-        write, which residency turns into a free LX write. A graph input has no
-        producer write to save and a graph output's write-out is unavoidable
-        either way, so both cancel -- exactly ``boundary != Intermediate``.
+        The reads residency would have served from LX, plus the producer's write,
+        which residency turns into a free LX write -- a graph input has no producer
+        write to save and a graph output's write-out is unavoidable either way, so
+        both cancel, exactly ``boundary != Intermediate``.
 
-        ``read_count`` counts the buffer's reads, not the savings: an input's
-        first read is the clone-in that pinning cannot avoid, so it is discounted
-        here. For a computed buffer the first use is the producing write and
-        ``read_count`` already excludes it, hence the discount is keyed on
-        ``first_use_is_read`` -- the same reasoning, and the same expression, as
-        ``_LifetimeBufferWithCpVars.spill_cost``.
+        The ``first_use_is_read`` discount drops an input's first read, the
+        clone-in that pinning cannot avoid; a computed buffer's first use is the
+        producing write, which ``read_count`` already excludes.
 
-        ``size`` is clamped non-negative for the same reason as in
-        :meth:`_per_core_size`: an unsized buffer carries the ``mem_usage`` ``-1``
-        sentinel, and pricing it as negative traffic would let a mostly-resident
-        state reach a *negative* total, which ``to_fixed_us`` rejects outright.
-        Such buffers are pinned out of LX, so their traffic is the same in every
-        state -- a constant the search cannot act on, and zero is the honest
-        constant when the real size is unknown.
+        ``size`` is clamped non-negative for the ``mem_usage`` ``-1`` sentinel (see
+        :meth:`_per_core_size`). Such buffers are pinned out of LX.
         """
         is_intermediate = buffer.boundary == BufferType.Intermediate
         reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
@@ -1133,26 +868,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         time units. A buffer with a packer address is LX-resident (its address is
         ``None`` iff ineligible or spilled).
 
-        Hot path: this runs at least once per annealing step, so it reads
-        ``packer.addresses`` **once** and sums the per-buffer costs precomputed in
-        :meth:`_precompute_spill_costs`. The native packer materializes a fresh
-        list on every ``addresses`` access, so the obvious per-buffer read inside
-        the loop was quadratic; hoisting it and pricing each spill from a
-        precomputed vector is 8-31x faster across the captured graphs.
+        Hot path: reads ``packer.addresses`` **once** and sums the costs
+        precomputed in :meth:`_precompute_spill_costs`. The native packer
+        materializes a fresh list per ``addresses`` access, so a per-buffer read
+        inside the loop was quadratic; hoisting it is 8-31x faster on the captures.
 
-        The landed substrate objective is *differential* -- ``spill_cost`` is the
-        traffic a spill adds **over** residency -- so a resident buffer
-        contributes exactly zero and only the spilled ones are summed. This is
-        the same shape as the CP-SAT engine's ``spill_cost() * (1 - in_buffer)``,
-        which is what makes the two directly comparable on one yardstick.
-
-        The node term is zero until real op metadata is available; the scorer's
-        fixed-point conversion keeps this deterministic.
+        The memory-only objective is *differential* -- ``spill_cost`` is the
+        traffic a spill adds **over** residency -- so a resident buffer contributes
+        zero and only spilled ones are summed. Same shape as the CP-SAT engine's
+        ``spill_cost() * (1 - in_buffer)``, so the two are comparable on one
+        yardstick.
         """
         if self._cost_objective is not None:
-            # The cost model prices compute as well as traffic, so it replaces
-            # this objective rather than adding to it -- summing the two would
-            # double-count the HBM term, which the model already carries.
+            # The cost model prices compute as well as traffic, so it replaces the
+            # memory-only objective rather than adding to it.
             addresses = self.packer.addresses
             resident = frozenset(
                 b.name
@@ -1187,10 +916,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _atomic_flip(self, idx: int, new_div: int) -> None:
         """Change buffer ``idx``'s division to ``new_div`` and ripple: resize its
-        per-core footprint, then refresh eligibility for ``idx`` and its parents --
-        the only buffers whose LX-feasibility a single flip can change (a buffer's
-        eligibility depends on its own division and its children's, so flipping
-        ``idx`` touches ``idx`` and every op that has ``idx`` as a child)."""
+        per-core footprint, then refresh eligibility for ``idx`` and its parents.
+        Those are the only buffers a flip can change, since eligibility depends on
+        an op's own division and its children's."""
         self.chosen[idx] = new_div
         self.packer.resize(idx, self._per_core_size(idx, new_div))
         for x in sorted({idx} | self._parents_idx[idx]):
@@ -1203,11 +931,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         Bidirectional: from an assigned op ``u`` (index ``iu``), a child ``c`` joins
         at the smallest ``ic`` with ``(iu, ic)`` compatible, and a parent ``p`` at
         the smallest ``ip`` with ``(ip, iu)`` compatible. The reachable set *is* the
-        region; boundaries emerge for free (no compatible index across an edge).
+        region; an edge with no compatible index is simply not extended across --
+        an accepted internal seam, never a failure.
+
         First-assignment-wins with a min-index frontier and sorted candidates makes
-        this deterministic and independent of ``cd_parent_matches`` list order;
-        a join reached with no compatible index simply is not
-        extended -- its edge becomes an accepted internal seam, never a failure.
+        this independent of ``cd_parent_matches`` list order.
         """
         assignment = {anchor: tiling}
         heap = [anchor]
@@ -1244,9 +972,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self.packer.set_eligible(x, self._eligible(x))
 
     def _recolor(self) -> None:
-        """One region-recolor move: a size-proportional anchor (uniform op, so a
-        region is hit ∝ its op-count), a random non-trivial anchor tiling, flood,
-        then recolor + burst."""
+        """One region-recolor move: a uniform anchor op (so a region is hit
+        ∝ its op-count), a random non-trivial anchor tiling, flood, recolor,
+        burst."""
         anchor = self._rng.choice(self._anchor_candidates)
         tiling = self._rng.choice(self._nontrivial_menu[anchor])
         assignment = self._flood_region(anchor, tiling)
@@ -1262,10 +990,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         lower the packer's quality, letting ``pi`` adapt to the new footprints
         before the compound move is judged.
 
-        ``move`` selects the length, since flip and recolor may warrant different
-        bursts; see ``burst_fractions``. ``burst_move`` selects the primitive.
-        Both are reverted rather than snapshotted: ``swap`` is its own inverse
-        and ``rotate(j, i)`` undoes ``rotate(i, j)``.
+        ``move`` selects the length (see ``burst_fractions``), ``burst_move`` the
+        primitive. Rejected steps are reverted rather than snapshotted: ``swap`` is
+        its own inverse and ``rotate(j, i)`` undoes ``rotate(i, j)``.
         """
         n = len(self._bufs)
         if n < 2:
@@ -1301,23 +1028,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _invalidate_cost_objective(self) -> None:
         """Tell the cost objective its diff baseline is stale.
 
-        Restoring a snapshot rewinds ``(pi, W)`` behind the objective's back; its
-        cached bundle *values* stay valid (they are keyed on state) but the
+        Restoring a snapshot rewinds ``(pi, W)`` behind the objective's back. Its
+        cached bundle *values* stay valid (they are keyed on state), but the
         baseline it diffs against no longer describes the live state."""
         if self._cost_objective is not None:
             self._cost_objective.invalidate()
 
     def _adopt(self, snap: tuple[Packer, list[int]]) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
-        copy, so the engine goes on mutating those very objects and the caller
-        must treat ``snap`` as dead from here on.
+        copy, so the engine goes on mutating those objects and the caller must
+        treat ``snap`` as dead from here on.
 
-        This is the rejection path's restore, where ``snap`` was taken at the top
-        of the iteration and dies with it, so the transfer is free and safe.
-        Zero-copy deliberately: a step already pays one O(n) packer copy for its
-        snapshot, and copying again on every rejection would double the hot
-        loop's copy traffic for nothing. A snapshot that must *survive* the
-        subsequent mutation (``_best_snap``) needs :meth:`_restore_copy`.
+        The rejection path's restore, where ``snap`` was taken at the top of the
+        iteration and dies with it. Zero-copy because a step already pays one O(n)
+        packer copy for its snapshot. A snapshot that must *survive* the subsequent
+        mutation (``_best_snap``) needs :meth:`_restore_copy`.
         """
         self.packer, self.chosen = snap[0], snap[1]
         self._invalidate_cost_objective()
@@ -1326,23 +1051,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Install a *copy* of ``snap`` as the live state, leaving ``snap``
         itself untouched and reusable.
 
-        The variant every *retained* snapshot needs, i.e. ``_best_snap``: the
-        nested polish restores it and then keeps mutating the live packer in
-        place, and adopting it there would make those ``rotate`` / ``resize``
-        calls rewrite the recorded best layout. A polish that fails to improve
-        does not refresh ``_best_snap``, so the engine would end up publishing
-        ``_best_score`` (the better number) alongside a state it no longer
-        describes.
+        The variant every *retained* snapshot needs, i.e. ``_best_snap``: the nested
+        polish restores it and keeps mutating the live packer, so adopting it would
+        let those ``rotate`` / ``resize`` calls rewrite the recorded best layout.
+        Since a polish that fails to improve does not refresh ``_best_snap``, the
+        engine would publish ``_best_score`` beside a state it no longer describes.
         """
         self.packer, self.chosen = snap[0].copy(), list(snap[1])
         self._invalidate_cost_objective()
 
     def _calibrate_temperature(self) -> float:
         """A crude scale estimate: the *median* absolute score delta over a sample
-        of random (fixed-weight) moves from the current state. Serves as the crude
-        schedule's ``T0`` and the reheating schedule's pre-snap seed center. The
-        median (not mean) is robust to region-recolor's large deltas. Falls back to
-        1.0 when nothing moved. Restores state; consumes RNG deterministically."""
+        of random (fixed-weight) moves -- the crude schedule's ``T0`` and the
+        reheating schedule's pre-snap seed center. Median, not mean, to survive
+        region-recolor's large deltas; 1.0 when nothing moved. Restores state;
+        consumes RNG deterministically."""
         base = self._score()
         deltas: list[int] = []
         for _ in range(min(64, 4 * len(self._bufs) + 8)):
@@ -1461,11 +1184,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _choose_reinsertion_source(self, allocated: list[bool]) -> int:
         """Pick the permutation *position* to lift out for a sweep reorder.
 
-        With ``sweep_biased_i`` this is the layout-only annealer's bias (weight
-        ``n`` for a fully-allocated buffer, ``n_allocated + 1`` for one that is
-        not): the buffers that miss LX are the ones the objective actually prices,
-        so they get sampled far above their share. Unbiased is the A/B control
-        that separates "sweep over j" from "bias over i".
+        With ``sweep_biased_i`` this is the layout-only annealer's bias (weight ``n``
+        for a fully-allocated buffer, ``n_allocated + 1`` otherwise), which
+        oversamples the buffers that miss LX -- the ones the objective prices.
+        Unbiased is the A/B control separating "sweep over j" from "bias over i".
         """
         n = len(allocated)
         if not self._sweep_biased_i:
@@ -1479,11 +1201,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Highest reinsertion position worth probing for the buffer at position
         ``i`` -- the layout-only annealer's monotonicity bound.
 
-        A buffer's address is non-decreasing in its position, so one that is
-        *not* legally allocated can only be made to fit by moving it earlier:
-        past the last legally-allocated position nothing it can reach changes the
-        outcome. A buffer that is allocated has no such bound and sweeps to the
-        end.
+        A buffer's address is non-decreasing in its position, so one that is *not*
+        legally allocated can only be made to fit by moving earlier: past the last
+        legally-allocated position, nothing it reaches changes the outcome. An
+        allocated buffer has no such bound and sweeps to the end.
         """
         n = len(allocated)
         if allocated[i]:
@@ -1501,25 +1222,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         Lift the buffer at position ``i`` out, probe every reinsertion position by
         rotating it to 0 and bubbling it forward one adjacent swap at a time, then
         try the positions **best-first**, accepting the first that clears the
-        Metropolis test. A random ``(i, j)`` rotation gets one blind sample of a
-        size-``n`` neighborhood; this sees the whole neighborhood and spends its
-        acceptance budget on the good end of it.
+        Metropolis test. Where a random ``(i, j)`` rotation samples the size-``n``
+        neighborhood blindly once, this sees all of it and spends its acceptance
+        budget on the good end.
 
-        Two rankings, which is the point of the A/B:
+        Ranking is ``sweep_quality`` (the packer's ``quality()``, O(1) per position
+        so the sweep is O(n), paying a real ``_score()`` only for the candidates it
+        tries) or ``sweep_score`` (exact, one rescore per probe). Quality is a
+        *proxy*: it weights a resident buffer by uses x size where the objective
+        prices a spilled one by reads-served x size.
 
-        - ``sweep_quality`` ranks by the packer's own ``quality()`` -- O(1) per
-          position, so the sweep is O(n) -- and pays a real ``_score()`` only for
-          the candidates it actually tries, in rank order. Quality is a *proxy*:
-          it weights a resident buffer by uses x size, where the objective prices
-          a spilled one by reads-served x size.
-        - ``sweep_score`` ranks by the true objective at every position, which is
-          exact but costs a rescore per probe.
-
-        The probe walks the live packer and restores from the step's own snapshot,
-        rather than sweeping a second copy: the step already pays one O(n) packer
-        copy, and placement is a pure function of the permutation, so the state
-        reached by rotate-to-``j`` is the same whichever intermediate positions the
-        walk passed through.
+        The probe walks the live packer and restores from the step's own snapshot
+        rather than sweeping a copy: placement is a pure function of the
+        permutation, so rotate-to-``j`` lands in the same state whichever
+        intermediate positions the walk passed through.
         """
         packer = self.packer
         perm = packer.permutation
@@ -1533,8 +1249,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.moves_proposed["reorder"] += 1
 
         # keys[p] ranks position p (higher is better); None = not a candidate.
-        # scores[p] caches the true objective there, which only the exact sweep
-        # knows for free.
+        # scores[p] caches the true objective, which only the exact sweep has free.
         keys: list[Optional[float]] = [None] * n
         scores: list[Optional[int]] = [None] * n
 
@@ -1573,7 +1288,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             delta = candidate - cur
             if delta != 0:
                 deltas.append(float(abs(delta)))
-            # `or` short-circuits, so the RNG is drawn only when delta > 0.
             if delta <= 0 or self._rng.random() < math.exp(-delta / temperature):
                 if pos != j:
                     packer.rotate(pos, j)
@@ -1599,13 +1313,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         to sweep the whole permutation.
 
         Swap any adjacent pair whose buffers do not overlap in time and sit in
-        decreasing address order. That is placement-neutral *now* -- neither
-        buffer can affect the other's address -- but it leaves the permutation in
-        a form from which a later rotation can reach states the unsorted order
-        could not. Returns the objective afterwards, read rather than assumed:
-        the invariant says quality is preserved, and the score is a different
-        functional of the same allocation set, so this stays honest if a swap ever
-        does move something.
+        decreasing address order. Placement-neutral *now* -- neither buffer can
+        affect the other's address -- but it leaves the permutation in a form from
+        which a later rotation can reach states the unsorted order could not.
+        Returns the objective re-read rather than assumed, so this stays honest if
+        a swap ever does move something.
         """
         packer = self.packer
         perm = packer.permutation
@@ -1624,15 +1336,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _tick_trace(self, steps: int = 1) -> None:
         """Advance the step counter and sample the convergence trace.
 
-        Off unless ``trace_every`` is set, and a no-op beyond one integer
-        compare when it is. Deliberately touches neither the RNG nor any search
-        state: a trace that perturbs the trajectory measures a different search
-        than the one it claims to describe, and this engine's determinism
-        guarantee would hide that rather than surface it.
+        Touches neither the RNG nor any search state: a trace that perturbed the
+        trajectory would measure a different search than it claims to describe, and
+        the determinism guarantee would hide that rather than surface it.
 
         ``steps`` is the work the caller just consumed -- 1 for a judged move,
-        ``1 + inner`` for a nested outer move -- so the x-axis means the same
-        thing across schedules that spend their budget differently.
+        ``1 + inner`` for a nested outer move.
         """
         self._steps_taken += steps
         if not self._trace_every:
@@ -1674,11 +1383,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _anneal(self) -> None:
         n = len(self._bufs)
-        # clamp(steps_per_buffer * n, min_steps, max_steps) -- the same shape the
-        # layout-only annealer's schedule uses, so neither engine's budget grows
-        # without bound. The ceiling binds only well past the validated corpus
-        # (15_000/40 = 375 buffers vs. n <= 79 in the captures), so it is
-        # insurance rather than something the tuned range ever meets.
+        # clamp(steps_per_buffer * n, min_steps, max_steps), the shape the
+        # layout-only annealer's schedule uses. The ceiling binds only well past
+        # the validated corpus (375 buffers at the default spb, vs. n <= 79 in the
+        # captures), so it is insurance rather than a tuned bound.
         steps = min(self._max_steps, max(self._min_steps, self._steps_per_buffer * n))
         if self._steps_per_buffer * n > self._max_steps:
             logger.debug(
@@ -1691,10 +1399,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 self._steps_per_buffer * n,
             )
         self._flippable_ops = self._flippable()
-        # Static proposal-mix neighborhoods: reorder ~ n reinsertion
-        # points; flip ~ the available local labels; recolor ~ the anchor tilings
-        # (n_regions x n_colors, with the anchor's non-trivial menu size as
-        # n_colors).
+        # Static proposal-mix neighborhoods: reorder ~ n reinsertion points, flip ~
+        # the available local labels, recolor ~ the anchor tilings.
         self._neighborhoods = {
             "reorder": n * self._reorder_neighborhood_scale,
             "flip": sum(
@@ -1706,8 +1412,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         }
 
         cur = self._score()
-        # Baseline = the seed state's score; best-seen never rises above it, the
-        # >=-baseline guarantee.
+        # The seed state's score; best-seen never rises above it.
         self.baseline_score = cur
         self._best_score = cur
         self._best_snap = self._snapshot()
@@ -1724,8 +1429,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         self.best_score = self._best_score
         if self._trace_every:
-            # The endpoint always lands in the trace, whatever the sampling
-            # interval divides into, so a curve's last point is the reported
+            # Always land the endpoint, so a curve's last point is the reported
             # score rather than the last multiple of trace_every before it.
             self.trace.append((self._steps_taken, self._best_score))
         # Copy, not adopt: ``_best_snap`` stays the record of the published
@@ -1733,8 +1437,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._restore_copy(self._best_snap)
 
     def _anneal_crude(self, steps: int, cur: int) -> None:
-        """The default schedule: one geometric cool + fixed proposal weights, and
-        the A/B the reheating schedule is measured against."""
+        """The default schedule: one geometric cool + fixed proposal weights."""
         t0 = self._calibrate_temperature()
         t_end = max(t0 / 1000.0, 1e-9)
         for step in range(steps):
@@ -1744,8 +1447,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _anneal_reheating(self, steps: int, cur: int) -> None:
         """The multi-move self-calibrating reheating schedule with the cycle-phase
-        proposal mix. The schedule self-calibrates each move type's
-        band from its streamed ``|dE|``, seeded (pre-snap) from a crude median."""
+        proposal mix: one shared reheating clock, and per move type an acceptance
+        band and a move-scale EMA calibrated from its streamed ``|dE|`` (seeded
+        pre-snap from a crude median)."""
         schedule = SelfCalibratingReheatingSchedule(
             bands=self._move_bands,
             total_steps=steps,
@@ -1772,7 +1476,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if not moves:
             return "none"
         w = {"flip": self._flip_weight, "recolor": self._recolor_weight}
-        return self._weighted_choice([(m, w[m]) for m in moves])
+        return self._rng.choices(moves, weights=[w[m] for m in moves])[0]
 
     def _apply_structural(self, name: str) -> None:
         """Apply a structural move's division change + ripple, WITHOUT the burst
@@ -1828,21 +1532,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _inner_layout_loop(self, steps: int, qtemp: float) -> int:
         """Warm-started inner layout anneal: ``steps`` single-buffer reinsertions
-        (``rotate`` -- an arbitrary-position move, far faster-mixing than adjacent
-        swaps) on the current packer. Greedy-cold (keep only non-worsening) or
-        annealed (Metropolis on the quality delta at ``qtemp``, tracking +
-        restoring the best-quality layout). Either way the layout left behind is
-        never worse than the one handed in. Returns the number of steps taken."""
+        (``rotate``, far faster-mixing than adjacent swaps) on the current packer,
+        either greedy-cold (keep only non-worsening) or annealed (Metropolis on the
+        quality delta at ``qtemp``, restoring the best-quality layout at the end).
+        Either way the layout left behind is never worse than the one handed in.
+        Returns the number of steps taken."""
         n = len(self._bufs)
         steps = int(steps)
         if n < 2 or steps < 1:
             return 0
         best_q = self.packer.quality()
-        # The entry layout is itself a candidate for "best", so the loop can
-        # never hand back something worse than it was given. Only the annealed
-        # variant needs this: an all-accepted run of worsening Metropolis steps
-        # otherwise leaves ``best_packer`` unset and returns the degraded
-        # random-walk endpoint. Greedy-cold never worsens, so it pays no copy.
+        # The entry layout is itself a candidate for "best". Only the annealed
+        # variant needs this: without it a run of accepted worsening steps leaves
+        # ``best_packer`` unset and returns the degraded random-walk endpoint.
+        # Greedy-cold never worsens, so it pays no copy.
         best_packer: Optional[Packer] = (
             self.packer.copy() if self._inner_annealed else None
         )
@@ -1896,8 +1599,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             snap = self._snapshot()
             self._apply_structural(name)
             target = self._inner_len(progress, acc, prop, n)
-            # End + early-abandon: run a burn-in, peek the score, and skip the
-            # inner tail if the move is hopelessly worse at this temperature.
+            # Burn in, peek the score, and skip the inner tail if the move is
+            # hopelessly worse at this temperature.
             burn = max(1, target // 4) if self._early_abandon else target
             used = self._inner_layout_loop(burn, qtemp)
             if self._early_abandon and target > burn:
@@ -1926,9 +1629,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         # Final polish: a long pure-layout anneal on the best structure found.
         if polish > 0:
-            # Copy: the polish mutates the live packer in place and only
-            # refreshes ``_best_snap`` if it improves, so aliasing the retained
-            # snapshot here would corrupt the best-seen layout on a failed polish.
+            # Copy: the polish mutates the live packer and only refreshes
+            # ``_best_snap`` if it improves, so aliasing would corrupt the
+            # best-seen layout on a failed polish (see :meth:`_restore_copy`).
             self._restore_copy(self._best_snap)
             self._inner_layout_loop(polish, qtemp)
             polished = self._score()
