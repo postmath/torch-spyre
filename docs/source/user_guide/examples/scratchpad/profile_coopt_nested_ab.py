@@ -502,17 +502,27 @@ def _headline(baseline, data):
         )
         prod_speed.append(_mean(cfgs[baseline]["secs"]) / _mean(nested[best]["secs"]))
     prod_losses = sorted((p for p in prod if p[2] > 0.0), key=lambda p: -p[2])
-    prod_para = (
-        f"""
+    # Gated on the regressions, not on the graph list: with nothing behind, the
+    # reversal paragraph printed "behind on 0 of 11 graphs" and a dangling
+    # "worst ." from joining an empty list.
+    if prod_losses:
+        prod_para = f"""
 ### At the default step budget the result reverses
 
 The grid above starts at `steps_per_buffer={DEFAULT_SPB}`, the engine's default and the only point production runs at. There the nested engine is **behind on {len(prod_losses)} of {len(prod)} graphs and ahead on none**, by {_mean([p[2] for p in prod]):+.2f}% on average -- worst {", ".join(f"`{n}` {d:+.2f}%" for n, _, d in prod_losses[:3])}. It is still {statistics.median(prod_speed):.1f}x cheaper in solver time, but the absolute saving is fractions of a second per graph.
 
 The nested engine needs budget to amortize: each outer structural move spends a whole inner layout loop, so a small total budget buys few structural evaluations. Its advantage therefore appears only well above the operating point, and the equal-steps framing of the table above is what makes it look unconditional. **This is the cell to read before making nested a default.**
 """
-        if prod
-        else ""
-    )
+    elif prod:
+        prod_para = f"""
+### At the default step budget
+
+The grid above starts at `steps_per_buffer={DEFAULT_SPB}`, the engine's default and the only point production runs at. There the nested engine ties the incumbent on all {len(prod)} graphs ({_mean([p[2] for p in prod]):+.2f}% on average), so the equal-steps framing above is not hiding a regression at the operating point. It is {statistics.median(prod_speed):.1f}x cheaper in solver time, but the absolute saving is fractions of a second per graph.
+
+Read that as the search having converged by the default budget rather than as the nested engine having improved: the whole grid sits above the convergence point, so no arm here can lose.
+"""
+    else:
+        prod_para = ""
     curves: dict = {}
     for name, r in data.items():
         level = r["levels"][max(r["levels"], key=lambda s: int(s))]

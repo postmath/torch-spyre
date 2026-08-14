@@ -456,7 +456,10 @@ def write_report():
                 "resolvable here. Splitting the knob is supported by the mechanism (a "
                 "recolor changes far more of the division vector than a flip) but not by "
                 "this measurement."
-                if abs(gap) < abs(rows[best_shared]["hi"] - rows[best_shared]["lo"])
+                # <=, not <: when every arm ties the gap and the CI width are
+                # both exactly zero, and `0 < 0` sent a 0.000% gap down the
+                # "the asymmetry is real" branch.
+                if abs(gap) <= abs(rows[best_shared]["hi"] - rows[best_shared]["lo"])
                 else "larger than the CI width, so the asymmetry is real and worth taking."
             )
             + "\n"

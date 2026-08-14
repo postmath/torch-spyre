@@ -28,7 +28,7 @@
 
 **No arm differs significantly from the incumbent**, in either direction, including `0.0 (no burst)`. On this corpus the burst length is not a lever: the spread across every arm is inside the noise, so the default survives and nothing here recommends changing it. That `0.0` also ties is the more interesting half -- it says the burst is not currently *earning* its cost, which is a claim about this corpus rather than about the mechanism.
 
-**Should the two moves differ?** The best split arm (`rotate flip 0.1 / recolor 0.5`, +0.000%) versus the best shared value (`0.0 (no burst)`, +0.000%) is a gap of +0.000% — larger than the CI width, so the asymmetry is real and worth taking.
+**Should the two moves differ?** The best split arm (`rotate flip 0.1 / recolor 0.5`, +0.000%) versus the best shared value (`0.0 (no burst)`, +0.000%) is a gap of +0.000% — which is the same order as the CIs above, so the asymmetry is not resolvable here. Splitting the knob is supported by the mechanism (a recolor changes far more of the division vector than a flip) but not by this measurement.
 
 **Did the primitive matter?** No. The best rotate arm (`rotate 0.05`, +0.000%) does not separate from the swap arms, and `0.0 (no burst)` at +0.000% is inside the same band as both. The hypothesis behind rebuilding the burst on `rotate` -- that the adjacent swap was too weak a move to adapt the layout -- is not supported: a better-mixing primitive does not make the burst do anything either.
 

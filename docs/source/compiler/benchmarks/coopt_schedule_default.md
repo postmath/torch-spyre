@@ -18,6 +18,6 @@ Cells where both schedules reach the same score under every seed are counted as 
 | graph | n | capacity | move | spb rh/cr | cpu s rh/cr | reheating | crude | delta % |
 |---|--:|---|---|--:|--:|--:|--:|--:|
 
-## Verdict: PROMOTE crude
+## Verdict: NO EVIDENCE -- every cell tied
 
-A global default flip is justified only if crude wins (CI strictly below zero) in **every** capacity x move combination. If it wins under the sweep but not under `random`, the honest change is a conditional default.
+Both schedules reach the same score under every seed, in every cell. This sweep runs at `steps_per_buffer` >= the default, i.e. entirely above the point the search converges, so it cannot separate the arms and says nothing about which default is right. The schedules do separate below convergence; a grid that starts at the operating point cannot see it.

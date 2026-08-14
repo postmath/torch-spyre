@@ -408,16 +408,32 @@ def write_report():
                         f"{rh:,.0f} | {cr:,.0f} | {100.0 * (cr - rh) / rh:+.2f} |"
                     )
 
-    verdict = (
-        "PROMOTE crude"
-        if all(v[2] < 0 for v in headline.values())
-        else "MIXED -- see per-cell table"
-    )
+    # An all-tie sweep contributes no headline rows at all, and `all()` over
+    # nothing is True -- which promoted crude off an empty table. A sweep that
+    # cannot separate the arms is a third outcome, not a win for either.
+    if not headline:
+        verdict = "NO EVIDENCE -- every cell tied"
+    elif all(v[2] < 0 for v in headline.values()):
+        verdict = "PROMOTE crude"
+    else:
+        verdict = "MIXED -- see per-cell table"
     out.append(f"\n## Verdict: {verdict}\n")
     out.append(
-        "A global default flip is justified only if crude wins (CI strictly below "
-        "zero) in **every** capacity x move combination. If it wins under the sweep "
-        "but not under `random`, the honest change is a conditional default.\n"
+        (
+            "Both schedules reach the same score under every seed, in every cell. "
+            "This sweep runs at `steps_per_buffer` >= the default, i.e. entirely "
+            "above the point the search converges, so it cannot separate the arms "
+            "and says nothing about which default is right. The schedules do "
+            "separate below convergence; a grid that starts at the operating "
+            "point cannot see it.\n"
+        )
+        if not headline
+        else (
+            "A global default flip is justified only if crude wins (CI strictly "
+            "below zero) in **every** capacity x move combination. If it wins "
+            "under the sweep but not under `random`, the honest change is a "
+            "conditional default.\n"
+        )
     )
     with open(REPORT_MD, "w") as f:
         f.write("\n".join(out) + "\n")

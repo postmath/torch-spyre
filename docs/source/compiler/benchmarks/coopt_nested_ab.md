@@ -22,11 +22,11 @@ Where the win comes from:
 
 Where the incumbent still wins: none -- no graph favours the incumbent.
 
-### At the default step budget the result reverses
+### At the default step budget
 
-The grid above starts at `steps_per_buffer=40`, the engine's default and the only point production runs at. There the nested engine is **behind on 0 of 11 graphs and ahead on none**, by +0.00% on average -- worst . It is still 6.4x cheaper in solver time, but the absolute saving is fractions of a second per graph.
+The grid above starts at `steps_per_buffer=40`, the engine's default and the only point production runs at. There the nested engine ties the incumbent on all 11 graphs (+0.00% on average), so the equal-steps framing above is not hiding a regression at the operating point. It is 6.4x cheaper in solver time, but the absolute saving is fractions of a second per graph.
 
-The nested engine needs budget to amortize: each outer structural move spends a whole inner layout loop, so a small total budget buys few structural evaluations. Its advantage therefore appears only well above the operating point, and the equal-steps framing of the table above is what makes it look unconditional. **This is the cell to read before making nested a default.**
+Read that as the search having converged by the default budget rather than as the nested engine having improved: the whole grid sits above the convergence point, so no arm here can lose.
 
 Secondary findings:
 
