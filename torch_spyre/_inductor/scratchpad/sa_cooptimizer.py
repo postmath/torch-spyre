@@ -998,24 +998,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if n < 2:
             return
         fraction = self._burst_fractions[move]
-        # A fraction of zero means *no* burst. The floor below is there so a
-        # small positive fraction still does something on a small graph, and it
-        # used to swallow zero along with it -- which made "burst off" quietly
-        # mean "one step", and mislabelled an arm in the sweep that measured it.
-        if fraction <= 0.0:
-            return
-        burst_len = max(1, int(fraction * n))
+        # Zero means *no* burst. The floor of 1 is there so a small positive
+        # fraction still does something on a small graph.
+        burst_len = 0 if fraction <= 0.0 else max(1, int(fraction * n))
         if self._burst_move == "swap":
             for _ in range(burst_len):
                 i = self._rng.randrange(n - 1)
                 if self.packer.swap(i) < 0:
                     self.packer.swap(i)  # revert (self-inverse)
-            return
-        for _ in range(burst_len):
-            i = self._rng.randrange(n)
-            j = self._rng.randrange(n)
-            if self.packer.rotate(i, j) < 0:
-                self.packer.rotate(j, i)  # greedy revert (pop-i-insert-j inverse)
+        else:
+            for _ in range(burst_len):
+                i = self._rng.randrange(n)
+                j = self._rng.randrange(n)
+                if self.packer.rotate(i, j) < 0:
+                    self.packer.rotate(j, i)  # revert
 
     # -- annealing loop ------------------------------------------------------
 
@@ -1091,17 +1087,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             moves.append("recolor")
         return moves
 
-    def _weighted_choice(self, choices: list[tuple[str, float]]) -> str:
-        """Deterministic weighted pick over ``choices`` (in fixed order)."""
-        total = sum(w for _, w in choices)
-        r = self._rng.random() * total
-        acc = 0.0
-        for name, weight in choices:
-            acc += weight
-            if r < acc:
-                return name
-        return choices[-1][0]
-
     def _choose_move_crude(self) -> str:
         """Fixed-weight move choice (the crude schedule and the calibrator)."""
         applicable = self._applicable_moves()
@@ -1112,7 +1097,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             "flip": self._flip_weight,
             "recolor": self._recolor_weight,
         }
-        return self._weighted_choice([(m, w[m]) for m in applicable])
+        return self._rng.choices(applicable, weights=[w[m] for m in applicable])[0]
 
     @staticmethod
     def _hotness(name: str, phi: float) -> float:
@@ -1127,11 +1112,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         applicable = self._applicable_moves()
         if not applicable:
             return "none"
-        choices = [
-            (m, self._neighborhoods[m] * max(self._weight_floor, self._hotness(m, phi)))
+        weights = [
+            self._neighborhoods[m] * max(self._weight_floor, self._hotness(m, phi))
             for m in applicable
         ]
-        return self._weighted_choice(choices)
+        return self._rng.choices(applicable, weights=weights)[0]
 
     def _execute_move(self, name: str) -> None:
         """Apply move ``name`` in place; structural moves carry their own burst."""
