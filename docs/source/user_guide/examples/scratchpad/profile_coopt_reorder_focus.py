@@ -33,9 +33,13 @@ import multiprocessing as mp
 import os
 import random
 import statistics
+import sys
 import time
 
-from benchmarks.profile_coopt_reorder_move import (  # noqa: E402
+# Same convention as the rest of the suite: the sibling has to resolve whether
+# this is run as a script or as a module, so put its directory on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
+from profile_coopt_reorder_move import (  # noqa: E402
     CALIB_JSON,
     CONFIGS,
     SWEEP_JSON as MAIN_JSON,
