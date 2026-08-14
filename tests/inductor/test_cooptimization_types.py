@@ -14,16 +14,17 @@
 
 """The SA co-optimizer against the *real* substrate types.
 
-Formerly ``test_cooptimization_substrate.py``, which asserted that the fake
-substrate conformed to protocols declared alongside it -- a closed loop that
-stayed green while those protocols drifted away from the landed
-``CoreDivisionBuffer``. These tests instead pin the engine to the real classes:
+During development of the SA co-optimizer, the buffer types were in flux. The
+branch was developed on top of an artificial substrate isolated from this
+churn. There was a test suite asserting that this substrate conformed to the
+protocols that defined it. When ``CoreDivisionBuffer`` landed, the test suite
+turned into this file, which pins the engine to the real classes:
 
 * the captured graphs rehydrate into real :class:`CoreDivisionBuffer` objects
   that are well-formed, self-consistent, and a valid seed state (every op at
   division index 0);
 * the engine really is a :class:`CoreDivisionLayoutSolver` and accepts those
-  objects -- the check whose absence let the protocol drift go unnoticed;
+  objects;
 * the two capture-derived assumptions the loader and the objective rest on hold:
   the ``boundary_cost`` -> ``BufferType`` mapping is exact, and ``read_count``
   equals the consumer count the old objective scaled by.

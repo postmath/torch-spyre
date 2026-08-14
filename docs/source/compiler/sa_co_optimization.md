@@ -18,10 +18,10 @@ allocator and the other solvers, see [Scratchpad Planning](scratchpad_planning.m
 `cd_parent_matches` compatibility relation — and hands the list to the solver, which mutates it
 in place with a `chosen_division` and an `address`.
 
-It runs as a **pre-scheduling pass**, which matters more than it sounds: `V.graph` is live but
+It runs as a **pre-scheduling pass**: `V.graph` is live but
 `V.graph.scheduler` is still `None`, so fusion has not happened yet. Anything the engine wants to
 know about the kernels its decisions will land in has to be *estimated* from the ordered
-operation list (see [Bundles](#bundles-an-estimate-not-a-fact)).
+operation list (see [Bundles](#bundles-are-estimates)).
 
 The engine takes no options. The buffers, the capacity and the alignment are its whole interface;
 the search parameters are module constants in `sa_cooptimizer.py`.
@@ -44,10 +44,7 @@ Three move types:
 * **flip** (weight 0.3) — move one buffer to a different entry in its own division menu, then
   ripple: resize its per-core footprint and refresh LX-eligibility for it and its parents.
 * **recolor** (weight 0.2) — flood the `cd_parent_matches` relation bidirectionally from a
-  non-trivial (split) anchor tiling and recolor everything it reaches. The region *is* the
-  flood's reach, so boundaries emerge for free; an edge with no compatible index simply is not
-  crossed, which makes it an accepted internal seam rather than a failure. This keeps recolor a
-  coordinated *splitting* move, leaving undividing to atomic flips.
+  non-trivial (split) anchor tiling and recolor everything it reaches.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test.
@@ -77,12 +74,10 @@ engine logs which objective it took.
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has
-been measured. Switching also gives up the memory-only objective's `best <= baseline` guarantee on
-spill *traffic*: this objective will trade residency away for a better division, so a
-miscalibrated traffic term would regress traffic with nothing in place to catch it.
+been measured.
 :::
 
-## Bundles: an estimate, not a fact
+## Bundles are estimates
 
 The cost model scores one fused kernel at a time, and bundle membership changes the answer —
 external inputs are deduplicated across a bundle, the pointwise arity derate counts its ops, the
@@ -96,7 +91,7 @@ The estimate's accuracy has been checked against real fusion on **one** softmax 
 bundle count, run structure and boundary placement were right and membership under-counted by a
 node scheduling introduces later. If the real grouping splits differently, the search is
 optimizing a cost that is not the cost that gets compiled. Validating the estimate across a
-corpus is the most valuable open piece of work here.
+corpus would be valuable.
 :::
 
 ## Test fixtures
@@ -125,8 +120,6 @@ and resolve normally.
 
 1. **Validate against device time.** Every score is the cost model's own prediction.
 2. **Validate `estimate_bundles` across a corpus**, not one graph.
-3. **A traffic guardrail**, if the cost objective's residency trades ever prove costly — the
-   engine already computes the memory-only score and could log when a chosen plan regresses it.
 
 ## Related documents
 

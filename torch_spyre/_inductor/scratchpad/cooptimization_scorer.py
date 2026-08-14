@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared cost units for the joint work-division + LX-layout SA optimizer.
-
-Every engine and the SA Metropolis test read the same objective in the same
-units, so cross-engine comparison is honest.
+"""Cost units for the joint work-division + LX-layout SA optimizer.
 
 **Determinism**: microsecond quantities are mapped to a fixed-point integer scale
 by a *single* deterministic rounding step, so an accumulated score is
