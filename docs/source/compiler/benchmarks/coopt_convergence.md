@@ -6,26 +6,26 @@ Steps until an arm's best-seen score is within a tolerance of the best score *an
 
 | arm | median steps to within 1% | to within 0.1% | mean final gap % | first to arrive (graphs) |
 |---|--:|--:|--:|--:|
-| `incumbent` | 82 (10/11) | 80 (8/11) | +0.13 | 2 |
-| `reheating` | 40 (10/11) | 34 (8/11) | +0.09 | 7 |
-| `reorder=random` | 73 (9/11) | 66 (7/11) | +0.12 | 1 |
-| `nested` | 118 (8/11) | 118 (8/11) | +0.45 | 0 |
+| `incumbent` | 18 (11/11) | 21 (11/11) | +0.00 | 6 |
+| `reheating` | 10 (11/11) | 10 (11/11) | +0.00 | 5 |
+| `reorder=random` | 18 (11/11) | 20 (11/11) | +0.00 | 0 |
+| `nested` | 23 (11/11) | 28 (11/11) | +0.00 | 0 |
 
 ## Per graph: steps to within 1% of the best any arm reached
 
 | graph | n | `incumbent` | `reheating` | `reorder=random` | `nested` |
 |---|--:|--:|--:|--:|--:|
-| mlp | 3 | never | never | never | never |
-| swiglu | 4 | 80 | 29 | 46 | 49 |
+| mlp | 3 | 18 | 11 | 18 | 20 |
+| swiglu | 4 | 11 | 7 | 14 | 14 |
 | softmax | 6 | 0 | 0 | 0 | 0 |
 | rms_norm | 7 | 0 | 0 | 0 | 0 |
-| sdpa | 9 | 133 | 39 | 73 | 128 |
-| simple_attn | 9 | 69 | 24 | never | 108 |
-| block_x2 | 26 | 84 | 56 | 100 | 355 |
-| block_x3 | 39 | 81 | 56 | 124 | 388 |
-| flash_attention | 44 | 616 | 224 | 539 | never |
-| block_x4 | 52 | 205 | 41 | 66 | 561 |
-| flash_big | 80 | 1280 | 1254 | 1216 | never |
+| sdpa | 9 | 21 | 10 | 21 | 34 |
+| simple_attn | 9 | 18 | 10 | 14 | 23 |
+| block_x2 | 26 | 28 | 20 | 28 | 38 |
+| block_x3 | 39 | 31 | 37 | 43 | 136 |
+| flash_attention | 44 | 0 | 0 | 0 | 0 |
+| block_x4 | 52 | 41 | 49 | 49 | 269 |
+| flash_big | 80 | 64 | 64 | 64 | 504 |
 
 ![curves](../../_static/images/coopt/coopt_convergence_curves.png)
 
