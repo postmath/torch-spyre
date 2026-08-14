@@ -25,9 +25,9 @@ the buffer-centric captures never carried.
 This produces it. For every buffer handed to the solver it emits one
 ``OpFeatures`` per entry of that buffer's candidate division menu, so a menu index
 selects its features directly -- the same indexing ``CoreDivisionBuffer.
-core_divisions`` uses. Residency is left unresolved (``is_lx`` is applied at
-scoring time by ``op_features.with_residency``), since that is the other half of
-what the search decides.
+core_divisions`` uses. Residency is left unresolved (``ArgTraffic.mem`` is applied
+at scoring time by ``op_features.with_residency``), since that is the other half
+of what the search decides.
 
 **Three artifacts from one compile, deliberately.** ``BundleCostObjective`` needs
 all three -- the solver's buffers, the estimated fused bundles, and the features

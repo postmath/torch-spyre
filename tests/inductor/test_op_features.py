@@ -19,7 +19,7 @@ a division change as *exactly free* unless it moves a buffer in or out of LX --
 which is why several captures sit at that objective's floor and can distinguish
 no move set, schedule or capacity at all. These tests assert the fixture is
 well-formed and that it actually separates those cases, so a regression in the
-extractor (or a schema drift in the vendored cost model) is caught here rather
+extractor (or a schema drift in the cost model) is caught here rather
 than as a silently flat search landscape.
 
 Regenerate with ``python3 docs/source/user_guide/examples/scratchpad/capture_op_features.py`` on a Spyre machine.
@@ -68,7 +68,7 @@ class SchemaTest(TestCase):
             self.assertEqual(len(b["output_partitions"]), b["menu_size"], tag)
 
     def test_every_feature_round_trips_and_scores(self):
-        # Guards against schema drift in the vendored cost model: a renamed or
+        # Guards against schema drift in the cost model: a renamed or
         # newly-required field would break op_from_dict, and the branch's own
         # committed dataset already went stale that way once.
         n = 0
@@ -116,10 +116,11 @@ class DiscriminationTest(TestCase):
         # And the separation is large, not a rounding artifact.
         self.assertGreater(max(s[2] for s in separating), 2.0)
 
-    def test_matmul_buffers_are_the_ones_that_separate(self):
-        # cost_model reads ``cores`` only under ``is_matmul``, so a pointwise op's
-        # cost is division-invariant by construction. Asserting the split matches
-        # that expectation keeps the fixture honest about *why* it separates.
+    def test_only_matmul_and_reduction_buffers_separate(self):
+        # cost_model reads ``cores`` only under ``is_matmul`` or ``is_reduction``,
+        # so a pointwise op's cost is division-invariant by construction.
+        # Asserting the split matches that expectation keeps the fixture honest
+        # about *why* it separates.
         for gname, bname, b in _entries():
             feats = [op_from_dict(f) for f in b["features"] if f is not None]
             if not feats:
@@ -127,8 +128,8 @@ class DiscriminationTest(TestCase):
             costs = {round(predict_ops([f]), 6) for f in feats}
             if len(costs) > 1:
                 self.assertTrue(
-                    any(f.is_matmul for f in feats),
-                    f"{gname}/{bname} separates but carries no matmul",
+                    any(f.is_matmul or f.is_reduction for f in feats),
+                    f"{gname}/{bname} separates but is pointwise",
                 )
 
 
@@ -158,9 +159,9 @@ class ResidencyTest(TestCase):
             if raw is None:
                 continue
             op = op_from_dict(raw)
-            before = [a.is_lx for a in op.args]
+            before = [a.mem for a in op.args]
             with_residency(op, {a.name for a in op.args})
-            self.assertEqual([a.is_lx for a in op.args], before)
+            self.assertEqual([a.mem for a in op.args], before)
             return
 
 

@@ -14,7 +14,7 @@
 
 """Cost-model ``OpFeatures`` for a *candidate* core division.
 
-The vendored extractor (:mod:`torch_spyre._inductor.dump_cost_model`) reads each
+The extractor (:mod:`torch_spyre._inductor.dump_cost_model`) reads each
 op's **committed** ``op_it_space_splits``, so it yields features for the division
 the compiler already chose. A co-optimizer needs features for every division in a
 buffer's candidate menu, because the division is exactly what it is searching
@@ -28,13 +28,14 @@ in the same encoding, that ``op_it_space_splits`` holds and that
 evaluated by temporarily installing its pair on the op and re-running the
 extractor: every division-dependent field (``cores``, ``reduction_cores``,
 ``matmul_rows_per_core`` / ``_cols_per_core``, ``tile_rows_per_core``) is then
-recomputed by the vendored code rather than by a second, drifting copy of its
+recomputed by the extractor rather than by a second, drifting copy of its
 axis-decoding rules.
 
-``is_lx`` is deliberately *not* resolved here. It is the other half of what the
-co-optimizer searches over, it is a plain per-argument flag, and no other feature
-depends on it -- so features are emitted once per (op, division) and residency is
-applied at scoring time by :func:`with_residency`.
+Residency (``ArgTraffic.mem``) is deliberately *not* resolved here. It is the
+other half of what the co-optimizer searches over, it is a plain per-argument
+flag, and no other feature depends on it -- so features are emitted once per
+(op, division) and residency is applied at scoring time by
+:func:`with_residency`.
 """
 
 from __future__ import annotations
@@ -51,14 +52,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = get_inductor_logger("scratchpad.op_features")
 
-# The attribute the vendored extractor reads the division from.
+# The attribute the extractor reads the division from.
 _SPLITS_ATTR = "op_it_space_splits"
 
 
 def features_for_division(op, division: "CoreDivision") -> Optional[OpFeatures]:
     """``OpFeatures`` for ``op`` as if it were divided per ``division``.
 
-    Returns ``None`` when the op cannot be featurized (the vendored extractor is
+    Returns ``None`` when the op cannot be featurized (the extractor is
     best-effort and swallows its own failures, so a ``None`` here means the op
     itself was rejected, not that the division was bad).
 
@@ -94,16 +95,17 @@ def features_for_menu(op, divisions) -> list[Optional[OpFeatures]]:
 
 
 def with_residency(features: OpFeatures, lx_names: AbstractSet[str]) -> OpFeatures:
-    """``features`` with each argument's ``is_lx`` set from ``lx_names``.
+    """``features`` with each argument's ``mem`` set from ``lx_names``.
 
-    The cost model charges an LX-resident argument no HBM traffic
-    (``elems * loop_factor * (1 - is_lx)``), so this is what turns a placement
-    decision into a cost. Returns a new object; the input is left alone so one
-    extracted menu can be scored against many candidate placements.
+    The cost model charges an LX-resident argument no HBM traffic, so this is
+    what turns a placement decision into a cost. Returns a new object; the input
+    is left alone so one extracted menu can be scored against many candidate
+    placements.
     """
     return dataclasses.replace(
         features,
         args=[
-            dataclasses.replace(a, is_lx=(a.name in lx_names)) for a in features.args
+            dataclasses.replace(a, mem=("lx" if a.name in lx_names else "hbm"))
+            for a in features.args
         ],
     )
