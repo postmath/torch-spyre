@@ -34,7 +34,7 @@ CONSERVATIVE case: eligibility toggling (b) only removes buffers and relieves
 capacity pressure, making the warm start easier. So resize-only lower-bounds how
 well the warm start transfers.
 
-Everything runs against the existing ``SimulatedAnnealingSolverWithBuffers`` on synthetic
+Everything runs against the existing ``SimulatedAnnealingLayoutSolver`` on synthetic
 buffer universes. No division machinery, memory term, or ``quality()``
 reweighting is needed -- this de-risks the core bet using only what exists today.
 
@@ -86,7 +86,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingSolverWithBuffers,
+    SimulatedAnnealingLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.cooling_schedules import (
     SelfCalibratingReheatingSchedule,
@@ -176,7 +176,7 @@ def solve_curve(
     "first_fit" for a COLD start. ``cycles`` selects the schedule regime:
     1 == a single self-calibrated cool (a refinement "burst", right for warm);
     >1 == reheating exploration (right for a cold from-scratch solve)."""
-    solver = SimulatedAnnealingSolverWithBuffers(
+    solver = SimulatedAnnealingLayoutSolver(
         copy.deepcopy(buffers),
         capacity,
         ALIGN,

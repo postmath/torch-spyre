@@ -49,7 +49,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (  # noqa: E402
     ExponentialCoolingSchedule,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (  # noqa: E402
-    SimulatedAnnealingSolverWithBuffers,
+    SimulatedAnnealingLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (  # noqa: E402
     FirstFitLayoutSolver,
@@ -76,8 +76,8 @@ def build_solver():
     buffers = [_random_buffer(f"B{i}", 1_000_000, n, random) for i in range(n)]
     capacity = peak_memory_load(buffers) // 2
     ff = copy.deepcopy(buffers)
-    FirstFitLayoutSolver(capacity).plan_layout(ff)  # example parity (no rng use)
-    return SimulatedAnnealingSolverWithBuffers(
+    FirstFitLayoutSolver(ff, capacity).plan_layout()  # example parity (no rng use)
+    return SimulatedAnnealingLayoutSolver(
         buffers,
         capacity,
         alignment=1,
@@ -116,7 +116,7 @@ def line_level():
     solver = build_solver()
     PBLS = PL.PermutationBasedLayoutSolver
     BASE = PL.PermutationBasedLayoutSolverBase
-    SA = SimulatedAnnealingSolverWithBuffers
+    SA = SimulatedAnnealingLayoutSolver
     funcs = [
         SA.anneal,
         SA.annealing_step_rotate,

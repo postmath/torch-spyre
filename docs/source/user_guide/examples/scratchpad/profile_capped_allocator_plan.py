@@ -57,6 +57,11 @@ def make_buffers(rng, n):
             pi = rng.randrange(max(0, ci - 12), ci)
             parent = buffers[pi]
             child = buffers[ci]
+            # A single-use parent is written and never read, so it has no storage
+            # to hand over; the solvers assert this. Skip rather than fix up the
+            # lifetime, which would bias the generated overlap density.
+            if len(parent.uses) < 2:
+                continue
             # In-place child: start_time == parent.end_time - 1 (the in-place
             # invariant parent.end_time == child.start_time + 1), ending a random
             # bit later. start_time/end_time derive from uses, so set uses.
