@@ -26,6 +26,7 @@ Run from the repository root::
     python docs/source/user_guide/examples/scratchpad/profile_simulated_annealing_solve.py
 """
 
+import os
 import cProfile
 import copy
 import io
@@ -34,19 +35,23 @@ import pstats
 import random as rnd
 import time
 
+# torch_spyre is imported for its solver only; autoloading the device backend
+# from a repo-root run re-enters the partially initialised package.
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 import torch  # noqa: F401  (importing torch_spyre without torch sometimes fails)
 
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.scratchpad import permutation_layout as PL
-from torch_spyre._inductor.scratchpad import contact_profile as CP
-from torch_spyre._inductor.scratchpad.cooling_schedules import (
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer  # noqa: E402
+from torch_spyre._inductor.scratchpad import permutation_layout as PL  # noqa: E402
+from torch_spyre._inductor.scratchpad import contact_profile as CP  # noqa: E402
+from torch_spyre._inductor.scratchpad.cooling_schedules import (  # noqa: E402
     peak_memory_load,
     ExponentialCoolingSchedule,
 )
-from torch_spyre._inductor.scratchpad.simulated_annealing import (
+from torch_spyre._inductor.scratchpad.simulated_annealing import (  # noqa: E402
     SimulatedAnnealingSolverWithBuffers,
 )
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (  # noqa: E402
     FirstFitLayoutSolver,
 )
 

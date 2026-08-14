@@ -59,7 +59,10 @@ from torch_spyre._inductor.scratchpad.cost_objective import (  # noqa: E402
     BundleCostObjective,
 )
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Repo root: docs/source/user_guide/examples/scratchpad -> five levels up.
+_REPO = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), *([os.pardir] * 5))
+)
 FIXTURE = os.path.join(_REPO, "tests", "inductor", "cooptimization_op_features.json")
 
 # The memory-only objective this has to be affordable *relative to*, measured

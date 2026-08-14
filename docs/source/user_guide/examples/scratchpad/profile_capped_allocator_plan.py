@@ -25,11 +25,16 @@ worst case where every swap hits an overlapping pair (full propagation).
 See capped_allocator_plan_results.md for a sample run and analysis.
 """
 
+import os
 import random
 import time
 
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.scratchpad.permutation_layout import (
+# torch_spyre is imported for its solver only; autoloading the device backend
+# from a repo-root run re-enters the partially initialised package.
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer  # noqa: E402
+from torch_spyre._inductor.scratchpad.permutation_layout import (  # noqa: E402
     PermutationBasedLayoutSolver,
     ReferencePermutationBasedLayoutSolver,
 )
