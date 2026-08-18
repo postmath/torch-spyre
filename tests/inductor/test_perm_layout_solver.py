@@ -1183,6 +1183,56 @@ class EligibilityConstructionTests(TestCase):
         self.assertEqual(fast.quality(), ref.quality())
 
 
+class NativeEligibilityConstructionTests(TestCase):
+    """The native constructor's ``eligible=`` argument. Every other native
+    construction in the suite passes four positional arguments, so neither the
+    branch that reads the flags nor its length check runs anywhere else."""
+
+    BUFFERS = [("a", 64), ("b", 50), ("c", 40)]
+
+    def _buffers(self):
+        return [_buf(name, size, 0, 3) for name, size in self.BUFFERS]
+
+    def _native(self, buffers, **kwargs):
+        return NativePermutationLayoutSolver(
+            buffers, list(range(len(buffers))), 10_000, 1, **kwargs
+        )
+
+    def test_matches_python_with_initial_eligibility(self):
+        buffers = self._buffers()
+        elig = [True, False, True]
+        cpp = self._native(buffers, eligible=list(elig))
+        py = PermutationBasedLayoutSolver(
+            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
+        )
+        # b is transparent (HBM, no address) and c rests on a, not on b.
+        self.assertEqual(list(cpp.addresses), [0, None, 64])
+        self.assertEqual(list(cpp.addresses), list(py.addresses))
+        self.assertEqual(cpp.quality(), py.quality())
+        self.assertEqual(cpp.count_allocated(), py.count_allocated())
+
+    def test_all_eligible_matches_the_default(self):
+        default = self._native(self._buffers())
+        explicit = self._native(self._buffers(), eligible=[True, True, True])
+        self.assertEqual(list(explicit.addresses), list(default.addresses))
+        self.assertEqual(explicit.quality(), default.quality())
+
+    def test_construction_matches_a_later_set_eligible(self):
+        # The constructed state must be the state set_eligible reaches, not just
+        # a plausible one: the two write the same flags through different paths.
+        constructed = self._native(self._buffers(), eligible=[True, False, True])
+        toggled = self._native(self._buffers())
+        toggled.set_eligible(1, False)
+        self.assertEqual(list(toggled.addresses), list(constructed.addresses))
+        self.assertEqual(toggled.quality(), constructed.quality())
+
+    def test_bad_eligible_length_rejected(self):
+        buffers = self._buffers()
+        for bad in ([], [True, False], [True] * 4):
+            with self.assertRaises(ValueError):
+                self._native(buffers, eligible=bad)
+
+
 class ResizeTests(TestCase):
     """resize(idx, new_size): change a footprint in place and re-place."""
 
