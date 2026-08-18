@@ -227,11 +227,14 @@ def assert_in_place_parent_is_read(
     exempt: all their uses are reads, so one use is enough.
 
     Split out of :func:`_assert_in_place_relationships` because the
-    permutation-based layout solvers enforce this one invariant on its own. For
-    them the other two are placement-time gates rather than preconditions: a
-    child that outgrows its parent, or a pair whose lifetimes do not abut, is
-    simply not placed in-place (see ``_can_inplace``), so asserting either here
-    would reject inputs those solvers handle correctly.
+    permutation-based layout solvers call it directly, where they resolve
+    declared pairs (``_compute_inplace_partners``), alongside their own copy of
+    the abutment assert -- their incremental machinery samples the contact
+    profiles at the single tick the pair overlaps and so cannot re-derive a
+    longer overlap. The size invariant is the one they do *not* take as a
+    precondition: an oversized child is simply not placed in-place (see
+    ``_can_inplace``), so asserting it here would reject inputs they handle
+    correctly.
     """
     # Tested as "a use strictly after the first" rather than via ``read_count``:
     # the two agree whenever ``uses`` is strictly increasing, but ``uses`` is

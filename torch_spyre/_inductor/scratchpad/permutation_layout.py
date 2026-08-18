@@ -366,11 +366,12 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # A write-only computed parent has nothing to hand over, so
                     # the pair is not expressible rather than merely unprofitable.
                     # Checked here because this is the one place that resolves
-                    # declared pairs. The other two in-place invariants asserted
-                    # by ``_assert_in_place_relationships`` are placement-time
-                    # gates here rather than preconditions -- an oversized child
-                    # is simply not placed in-place, see ``_can_inplace`` -- so
-                    # asserting them would reject plans this solver handles.
+                    # declared pairs. Of the three in-place invariants asserted
+                    # by ``_assert_in_place_relationships`` only the size one is
+                    # a placement-time gate here rather than a precondition --
+                    # an oversized child is simply not placed in-place, see
+                    # ``_can_inplace`` -- so asserting it would reject plans this
+                    # solver handles.
                     assert_in_place_parent_is_read(self.buffers[parent], buf.name)
                     # Single-tick handoff: a valid in-place pair overlaps at
                     # exactly one tick, the child's first. Both in-place
