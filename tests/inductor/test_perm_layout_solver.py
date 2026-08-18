@@ -1840,6 +1840,40 @@ class NativeGuardTests(TestCase):
             NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)
 
 
+class InPlaceRejectionParityTests(TestCase):
+    """Both packers reject the declared in-place pairs the plan invariants
+    forbid, so that ``TORCH_SPYRE_NATIVE_PACKER=0`` selects the same packer and
+    not a stricter one. Only the exception type differs: the Python packer
+    asserts, the native one raises ``ValueError`` like its other rejections."""
+
+    REJECTED = (AssertionError, ValueError)
+
+    def _constructors(self, buffers):
+        args = (buffers, [0, 1], 10_000, 128)
+        return [
+            lambda: PermutationBasedLayoutSolver(*args),
+            lambda: ReferencePermutationBasedLayoutSolver(*args),
+            lambda: NativePermutationLayoutSolver(*args),
+        ]
+
+    def test_write_only_parent_rejected(self):
+        # p is written at tick 0 and never read, so it has no live storage to
+        # hand to c.
+        buffers = [_buf("p", 64, 0, 1), _buf("c", 32, 0, 3, ["p"])]
+        for make in self._constructors(buffers):
+            with self.assertRaises(self.REJECTED):
+                make()
+
+    def test_multi_tick_overlap_rejected(self):
+        # p is live through tick 3 and c from tick 1: three ticks of overlap
+        # rather than the single handoff tick, so co-locating them would alias
+        # two buffers that are live together.
+        buffers = [_buf("p", 64, 0, 4), _buf("c", 32, 1, 4, ["p"])]
+        for make in self._constructors(buffers):
+            with self.assertRaises(self.REJECTED):
+                make()
+
+
 class NativePermutationViewTests(TestCase):
     """Lifetime and reference semantics of the native ``permutation`` view.
 
