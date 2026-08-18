@@ -1761,6 +1761,40 @@ class ProfileTests(TestCase):
         p.validate()
 
 
+class PythonGuardTests(TestCase):
+    """The Python packers reject the out-of-range indices the native one rejects
+    (:class:`NativeGuardTests`). Without an explicit check Python reads ``idx=-1``
+    as the last buffer and quietly operates on that one instead of raising -- the
+    one class of input the randomized differential tests never draw."""
+
+    def _plans(self, n=3):
+        bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
+        return [
+            PermutationBasedLayoutSolver(bufs, list(range(n)), 10_000, 128),
+            ReferencePermutationBasedLayoutSolver(bufs, list(range(n)), 10_000, 128),
+        ]
+
+    def test_resize_index_out_of_range_raises(self):
+        for plan in self._plans():
+            for bad in (-1, 3, 999):
+                with self.assertRaises(ValueError):
+                    plan.resize(bad, 100)
+
+    def test_set_eligible_index_out_of_range_raises(self):
+        # ``flag=True`` is the flag the aliased buffer already carries, so an
+        # unchecked ``-1`` would take the no-op path and return 0.0.
+        for plan in self._plans():
+            for bad in (-1, 3, 999):
+                with self.assertRaises(ValueError):
+                    plan.set_eligible(bad, True)
+
+    def test_top_or_inf_index_out_of_range_raises(self):
+        for plan in self._plans():
+            for bad in (-1, 3, 999):
+                with self.assertRaises(ValueError):
+                    plan.top_or_inf(bad)
+
+
 class NativeGuardTests(TestCase):
     """The C++ accelerator validates out-of-range / degenerate arguments and
     raises (like ``swap()`` already did, and like the Python packer's fail-fast
@@ -1789,6 +1823,12 @@ class NativeGuardTests(TestCase):
         for bad in (-1, 3, 999):
             with self.assertRaises(ValueError):
                 p.set_eligible(bad, False)
+
+    def test_top_or_inf_index_out_of_range_raises(self):
+        p = self._plan()
+        for bad in (-1, 3, 999):
+            with self.assertRaises(ValueError):
+                p.top_or_inf(bad)
 
     def test_empty_uses_raises(self):
         bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])

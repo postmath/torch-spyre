@@ -218,6 +218,16 @@ class PermutationBasedLayoutSolverBase(ABC):
 
     # --- shared helpers -----------------------------------------------------
 
+    def _check_index(self, idx: int, method: str) -> None:
+        """Reject a buffer index outside ``range(len(buffers))``.
+
+        Python would read ``idx=-1`` as the last buffer and silently mutate (or
+        report on) that one, where the native packer raises. The two are meant to
+        be interchangeable, so raise its ``ValueError``, with its message.
+        """
+        if not 0 <= idx < len(self.buffers):
+            raise ValueError(f"{method} index out of range")
+
     def resize(self, idx: int, new_size: int) -> float:
         """Change buffer ``idx``'s footprint to ``new_size`` in place and
         re-place. Returns the change in :meth:`quality` (new minus old).
@@ -233,6 +243,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         on -- the incremental result then diverges from a from-scratch place.
         Zero is allowed: the allocator clamps unsized entries to 0.
         """
+        self._check_index(idx, "resize")
         if new_size < 0:
             raise ValueError("resize size must be non-negative")
         old_total = self.total_quality
@@ -261,6 +272,9 @@ class PermutationBasedLayoutSolverBase(ABC):
         (Plan §2.2 / §7.3): the SA engine flips this as a division change makes a
         buffer's tiling edge (in)compatible.
         """
+        # Before the unchanged-flag no-op, so an out-of-range ``set_eligible``
+        # cannot return 0.0 instead of raising (as in the native packer).
+        self._check_index(idx, "set_eligible")
         if self._eligible[idx] == flag:
             return 0.0
         old_total = self.total_quality
@@ -312,6 +326,11 @@ class PermutationBasedLayoutSolverBase(ABC):
         search, where it used to read ``buffers[idx].size``) so that it reads the
         plan-local ``_sizes``, which :meth:`resize` mutates.
         """
+        # Inlined rather than via :meth:`_check_index`: the annealer's neighbour
+        # scan calls this twice per adjacent pair, so the call would cost about
+        # as much as the accessor itself.
+        if not 0 <= idx < len(self.buffers):
+            raise ValueError("top_or_inf index out of range")
         top = self._top(idx)
         return math.inf if top is None else float(top)
 
