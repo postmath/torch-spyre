@@ -1861,6 +1861,20 @@ class IndexGuardTestsMixin(MixinBase):
             with self.assertRaises(ValueError):
                 plan.rotate(i, j)
 
+    def test_is_fully_allocated_index_out_of_range_raises(self):
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.is_fully_allocated(bad)
+
+    def test_overlaps_index_out_of_range_raises(self):
+        # Both positions: either one alone reads as the last buffer when
+        # unchecked, and ``overlaps`` is symmetric enough to hide that.
+        plan = self._plan()
+        for i, j in ((-1, 0), (0, -1), (3, 0), (0, 3), (999, 999)):
+            with self.assertRaises(ValueError):
+                plan.overlaps(i, j)
+
 
 class ReferenceSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
     plan_class = ReferencePermutationBasedLayoutSolver

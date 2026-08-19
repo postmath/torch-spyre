@@ -239,13 +239,14 @@ class PermutationBasedLayoutSolverBase(ABC):
         if not 0 <= i < len(self.buffers) - 1:
             raise ValueError("swap index out of range")
 
-    def _check_rotate_indices(self, i: int, j: int) -> None:
-        """Reject an out-of-range rotate position. Called by every :meth:`rotate`
-        before its ``i == j`` no-op, so an out-of-range ``rotate(999, 999)``
-        raises instead of returning 0.0 (as in the native packer)."""
+    def _check_indices(self, i: int, j: int, method: str) -> None:
+        """:meth:`_check_index` for a method taking two buffer indices. Called by
+        every :meth:`rotate` before its ``i == j`` no-op, so an out-of-range
+        ``rotate(999, 999)`` raises instead of returning 0.0 (as in the native
+        packer)."""
         n = len(self.buffers)
         if not (0 <= i < n and 0 <= j < n):
-            raise ValueError("rotate index out of range")
+            raise ValueError(f"{method} index out of range")
 
     def resize(self, idx: int, new_size: int) -> float:
         """Change buffer ``idx``'s footprint to ``new_size`` in place and
@@ -276,7 +277,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         # total; since we just overwrote it, ``idx`` (if allocated) still
         # contributes its *old* quality here, so swap in the delta now. Harmless to
         # the from-scratch reference (its ``_build`` resets the total anyway).
-        if self.is_fully_allocated(idx):
+        if self._is_allocated(idx):
             self.total_quality += self._qualities[idx] - old_q
         self._reflow_resized(idx)
         return self.total_quality - old_total
@@ -309,7 +310,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
         # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
         # benchmarks/copy_vs_swap_results.md.)
-        self._check_rotate_indices(i, j)
+        self._check_indices(i, j, "rotate")
         delta = 0.0
         if i < j:
             for k in range(i, j):
@@ -362,6 +363,13 @@ class PermutationBasedLayoutSolverBase(ABC):
         gate lives in :meth:`_placement_decision`), so "has an address" and
         "fully allocated" coincide.
         """
+        self._check_index(idx, "is_fully_allocated")
+        return self._is_allocated(idx)
+
+    def _is_allocated(self, idx: int) -> bool:
+        """:meth:`is_fully_allocated` without the bounds check, for the internal
+        callers that hold an index they just derived. Mirrors the native packer's
+        split between the exported accessor and the raw predicate."""
         return self.addresses[idx] is not None
 
     def overlaps(self, i: int, j: int) -> bool:
@@ -371,6 +379,12 @@ class PermutationBasedLayoutSolverBase(ABC):
         in-place parent and child (``parent.end_time == child.start_time + 1``)
         overlap at exactly that boundary tick (``child.start_time``).
         """
+        self._check_indices(i, j, "overlaps")
+        return self._overlaps(i, j)
+
+    def _overlaps(self, i: int, j: int) -> bool:
+        """:meth:`overlaps` without the bounds check. Same reasoning as
+        :meth:`_is_allocated`; this one is on the placement hot loop."""
         return self.buffers[i].overlaps_in_time(self.buffers[j])
 
     def _in_place_pair(self, i: int, j: int) -> Optional[tuple[int, int]]:
@@ -696,10 +710,10 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 continue
             prior = self.permutation[:pos]
             candidates = [
-                p for p in prior if self.overlaps(idx, p) and self._eligible[p]
+                p for p in prior if self._overlaps(idx, p) and self._eligible[p]
             ]
             self.addresses[idx] = self._address_from_candidates(idx, candidates)
-            if self.is_fully_allocated(idx):
+            if self._is_allocated(idx):
                 self.total_quality += self._qualities[idx]
                 self.total_allocated_count += 1
 
@@ -760,7 +774,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             lambda pos, idx: [
                 p
                 for p in self.permutation[:pos]
-                if self.overlaps(idx, p) and self._eligible[p]
+                if self._overlaps(idx, p) and self._eligible[p]
             ]
         )
         # Persistent position index, maintained in O(1) by swap().
@@ -773,7 +787,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         self.overlap_dict: dict[int, set[int]] = {i: set() for i in range(n)}
         for a in range(n):
             for b in range(a + 1, n):
-                if self.overlaps(a, b):
+                if self._overlaps(a, b):
                     self.overlap_dict[a].add(b)
                     self.overlap_dict[b].add(a)
         # Minimum |i - j| at which rotate() uses the remove/reinsert fast path
@@ -901,7 +915,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             # eligible stacking order: reordering across it leaves every eligible
             # buffer's contacts and address untouched. Only the positions moved.
             return 0
-        if not self.overlaps(x, y):
+        if not self._overlaps(x, y):
             # Independent buffers: their order does not affect any address.
             return 0
 
@@ -971,7 +985,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             pos_z = self.position[z]
             old_addr = self.addresses[z]
             old_partner = self.inplace_reuse.get(z)
-            if self.is_fully_allocated(z):
+            if self._is_allocated(z):
                 self.total_quality -= self._qualities[z]
                 self.total_allocated_count -= 1
             self._recompute_address(z)
@@ -1024,7 +1038,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             if w in flipped:
                 continue
             flipped.add(w)
-            if self.is_fully_allocated(w):
+            if self._is_allocated(w):
                 self.total_quality -= self._qualities[w]
                 self.total_allocated_count -= 1
             self.addresses[w] = None
@@ -1150,7 +1164,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         """
         # Checked here as well as in ``super().rotate``: neither the ``i == j``
         # no-op nor the fast path below goes through it.
-        self._check_rotate_indices(i, j)
+        self._check_indices(i, j, "rotate")
         if i == j:
             return 0
         if not self._eligible[self.permutation[i]]:
@@ -1425,7 +1439,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 list(self.above_profile[idx].labels),
             )
             seed = {lbl for lbl in old_above.label_set() if lbl is not None}
-            if self.is_fully_allocated(idx):
+            if self._is_allocated(idx):
                 self.total_quality -= self._qualities[idx]
                 self.total_allocated_count -= 1
             self.addresses[idx] = None
