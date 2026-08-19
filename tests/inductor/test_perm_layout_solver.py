@@ -281,16 +281,6 @@ class SkeletonTestsMixin(MixinBase):
         with self.assertRaises(AssertionError):
             self.make_plan(buffers, [0], capacity=128)
 
-    def test_write_only_in_place_parent_rejected(self):
-        # "a" is a computed buffer whose only use is its write, so it is never
-        # read and has no storage to hand over; "b" declaring it as an in-place
-        # parent is not expressible. Rejected while resolving declared pairs, so
-        # it fires for both concrete plans.
-        parent = LifetimeBoundBuffer("a", 64, [0])
-        child = LifetimeBoundBuffer("b", 64, [0, 2], in_place_parents=["a"])
-        with self.assertRaises(AssertionError):
-            self.make_plan([parent, child], [0, 1], capacity=256)
-
     def test_single_use_input_in_place_parent_allowed(self):
         # The same shape is legal when the parent is a graph input: all its uses
         # are reads, so one use still means a genuine read before the handoff.
@@ -1137,8 +1127,82 @@ class FastRotateTests(TestCase):
             self.assertEqual(fast.inplace_reuse, chain.inplace_reuse, tag)
 
 
+class EligibilityConstructionMixin(MixinBase):
+    """Constructing a plan with some buffers ineligible up front, for every
+    packer. Run natively too because the native constructor's ``eligible=``
+    branch (and its length check) is otherwise dead: every other native
+    construction in the suite passes four positional arguments."""
+
+    plan_class: type = None  # type: ignore[assignment]
+    # The Python packers assert on a bad ``eligible`` length; the native one
+    # raises, like its other constructor rejections. Per-class rather than a
+    # tuple, so a packer switching type here is a failure and not a pass.
+    bad_eligible_error: type = AssertionError
+
+    BUFFERS = [("a", 64), ("b", 50), ("c", 40)]
+
+    def _buffers(self):
+        return [_buf(name, size, 0, 3) for name, size in self.BUFFERS]
+
+    def _plan(self, buffers, **kwargs):
+        return self.plan_class(buffers, list(range(len(buffers))), 10_000, 1, **kwargs)
+
+    def test_matches_the_reference_with_initial_eligibility(self):
+        buffers = self._buffers()
+        elig = [True, False, True]
+        plan = self._plan(buffers, eligible=list(elig))
+        ref = ReferencePermutationBasedLayoutSolver(
+            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
+        )
+        # b is transparent (HBM, no address) and c rests on a, not on b.
+        self.assertEqual(list(plan.addresses), [0, None, 64])
+        self.assertEqual(list(plan.addresses), list(ref.addresses))
+        self.assertEqual(plan.quality(), ref.quality())
+        self.assertEqual(plan.count_allocated(), ref.count_allocated())
+
+    def test_all_eligible_matches_the_default(self):
+        default = self._plan(self._buffers())
+        explicit = self._plan(self._buffers(), eligible=[True, True, True])
+        self.assertEqual(list(explicit.addresses), list(default.addresses))
+        self.assertEqual(explicit.quality(), default.quality())
+
+    def test_construction_matches_a_later_set_eligible(self):
+        # The constructed state must be the state set_eligible reaches, not just
+        # a plausible one: the two write the same flags through different paths.
+        constructed = self._plan(self._buffers(), eligible=[True, False, True])
+        toggled = self._plan(self._buffers())
+        toggled.set_eligible(1, False)
+        self.assertEqual(list(toggled.addresses), list(constructed.addresses))
+        self.assertEqual(toggled.quality(), constructed.quality())
+
+    def test_bad_eligible_length_rejected(self):
+        buffers = self._buffers()
+        for bad in ([], [True, False], [True] * 4):
+            with self.assertRaises(self.bad_eligible_error):
+                self._plan(buffers, eligible=bad)
+
+
+class ReferenceSolverEligibilityConstructionTests(
+    EligibilityConstructionMixin, TestCase
+):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverEligibilityConstructionTests(
+    EligibilityConstructionMixin, TestCase
+):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverEligibilityConstructionTests(EligibilityConstructionMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
+    bad_eligible_error = ValueError
+
+
 class EligibilityConstructionTests(TestCase):
-    """Constructing a plan with some buffers ineligible up front."""
+    """What initial ineligibility does to the incremental packer's own state:
+    the flags it stores and the contact profiles it keeps. The behaviour every
+    packer shares is in :class:`EligibilityConstructionMixin`."""
 
     def plan(self, buffers, permutation, eligible, capacity=10_000, alignment=1):
         return PermutationBasedLayoutSolver(
@@ -1149,11 +1213,6 @@ class EligibilityConstructionTests(TestCase):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
         plan = PermutationBasedLayoutSolver(buffers, [0, 1], 10_000, 1)
         self.assertEqual(plan._eligible, [True, True])
-
-    def test_bad_eligible_length_rejected(self):
-        buffers = [_buf("a", 64, 0, 2)]
-        with self.assertRaises(AssertionError):
-            self.plan(buffers, [0], eligible=[True, False])
 
     def test_ineligible_buffer_is_transparent(self):
         # b ineligible: routed to HBM (no address, no quality), and c stacks
@@ -1171,66 +1230,6 @@ class EligibilityConstructionTests(TestCase):
         self.assertEqual(_above_named(plan, "b"), [(0, 3, None)])
         _check_consistency(self, plan)
         _check_contact_faithful(self, plan)
-
-    def test_matches_reference_with_initial_eligibility(self):
-        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
-        elig = [True, False, True]
-        fast = self.plan(buffers, [0, 1, 2], eligible=elig)
-        ref = ReferencePermutationBasedLayoutSolver(
-            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
-        )
-        self.assertEqual(fast.addresses, ref.addresses)
-        self.assertEqual(fast.quality(), ref.quality())
-
-
-class NativeEligibilityConstructionTests(TestCase):
-    """The native constructor's ``eligible=`` argument. Every other native
-    construction in the suite passes four positional arguments, so neither the
-    branch that reads the flags nor its length check runs anywhere else."""
-
-    BUFFERS = [("a", 64), ("b", 50), ("c", 40)]
-
-    def _buffers(self):
-        return [_buf(name, size, 0, 3) for name, size in self.BUFFERS]
-
-    def _native(self, buffers, **kwargs):
-        return NativePermutationLayoutSolver(
-            buffers, list(range(len(buffers))), 10_000, 1, **kwargs
-        )
-
-    def test_matches_python_with_initial_eligibility(self):
-        buffers = self._buffers()
-        elig = [True, False, True]
-        cpp = self._native(buffers, eligible=list(elig))
-        py = PermutationBasedLayoutSolver(
-            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
-        )
-        # b is transparent (HBM, no address) and c rests on a, not on b.
-        self.assertEqual(list(cpp.addresses), [0, None, 64])
-        self.assertEqual(list(cpp.addresses), list(py.addresses))
-        self.assertEqual(cpp.quality(), py.quality())
-        self.assertEqual(cpp.count_allocated(), py.count_allocated())
-
-    def test_all_eligible_matches_the_default(self):
-        default = self._native(self._buffers())
-        explicit = self._native(self._buffers(), eligible=[True, True, True])
-        self.assertEqual(list(explicit.addresses), list(default.addresses))
-        self.assertEqual(explicit.quality(), default.quality())
-
-    def test_construction_matches_a_later_set_eligible(self):
-        # The constructed state must be the state set_eligible reaches, not just
-        # a plausible one: the two write the same flags through different paths.
-        constructed = self._native(self._buffers(), eligible=[True, False, True])
-        toggled = self._native(self._buffers())
-        toggled.set_eligible(1, False)
-        self.assertEqual(list(toggled.addresses), list(constructed.addresses))
-        self.assertEqual(toggled.quality(), constructed.quality())
-
-    def test_bad_eligible_length_rejected(self):
-        buffers = self._buffers()
-        for bad in ([], [True, False], [True] * 4):
-            with self.assertRaises(ValueError):
-                self._native(buffers, eligible=bad)
 
 
 class ResizeTests(TestCase):
@@ -1811,74 +1810,74 @@ class ProfileTests(TestCase):
         p.validate()
 
 
-class PythonGuardTests(TestCase):
-    """The Python packers reject the out-of-range indices the native one rejects
-    (:class:`NativeGuardTests`). Without an explicit check Python reads ``idx=-1``
-    as the last buffer and quietly operates on that one instead of raising -- the
-    one class of input the randomized differential tests never draw."""
+class IndexGuardTestsMixin(MixinBase):
+    """Every packer rejects a buffer index outside ``range(len(buffers))``.
 
-    def _plans(self, n=3):
+    The randomized differential tests draw only valid indices, so this is the
+    one class of input where the packers could disagree unobserved -- and they
+    did: Python read ``idx=-1`` as the last buffer and quietly operated on it
+    where the native packer raised."""
+
+    plan_class: type = None  # type: ignore[assignment]
+
+    BAD_INDICES = (-1, 3, 999)
+
+    def _plan(self, n=3):
         bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
-        return [
-            PermutationBasedLayoutSolver(bufs, list(range(n)), 10_000, 128),
-            ReferencePermutationBasedLayoutSolver(bufs, list(range(n)), 10_000, 128),
-        ]
+        return self.plan_class(bufs, list(range(n)), 10_000, 128)
 
     def test_resize_index_out_of_range_raises(self):
-        for plan in self._plans():
-            for bad in (-1, 3, 999):
-                with self.assertRaises(ValueError):
-                    plan.resize(bad, 100)
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.resize(bad, 100)
 
     def test_set_eligible_index_out_of_range_raises(self):
         # ``flag=True`` is the flag the aliased buffer already carries, so an
         # unchecked ``-1`` would take the no-op path and return 0.0.
-        for plan in self._plans():
-            for bad in (-1, 3, 999):
-                with self.assertRaises(ValueError):
-                    plan.set_eligible(bad, True)
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.set_eligible(bad, True)
 
     def test_top_or_inf_index_out_of_range_raises(self):
-        for plan in self._plans():
-            for bad in (-1, 3, 999):
-                with self.assertRaises(ValueError):
-                    plan.top_or_inf(bad)
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.top_or_inf(bad)
+
+
+class ReferenceSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
 
 
 class NativeGuardTests(TestCase):
-    """The C++ accelerator validates out-of-range / degenerate arguments and
-    raises (like ``swap()`` already did, and like the Python packer's fail-fast
-    asserts) instead of corrupting the heap or crashing. Regression coverage for
-    the memory-safety review's ASan-confirmed findings (bad ``idx``/``i``/``j``
-    into resize/rotate/set_eligible, empty ``uses``, zero alignment)."""
+    """Native-only argument validation: raising instead of corrupting the heap
+    or crashing. Regression coverage for the memory-safety review's
+    ASan-confirmed findings. The checks the native packer shares with the Python
+    ones are in :class:`IndexGuardTestsMixin`."""
 
     def _plan(self, n=3):
         bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
         return NativePermutationLayoutSolver(bufs, list(range(n)), 10_000, 128)
 
-    def test_resize_index_out_of_range_raises(self):
-        p = self._plan()
-        for bad in (-1, 3, 999):
-            with self.assertRaises(ValueError):
-                p.resize(bad, 100)
-
+    # Native-only because the Python ``swap``/``rotate`` (unlike ``resize`` /
+    # ``set_eligible`` / ``top_or_inf``) still take a negative position as a
+    # Python index: ``rotate(-1, 0)`` swaps the last entry with the first
+    # instead of raising.
     def test_rotate_index_out_of_range_raises(self):
         p = self._plan()
         for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1)):
             with self.assertRaises(ValueError):
                 p.rotate(i, j)
-
-    def test_set_eligible_index_out_of_range_raises(self):
-        p = self._plan()
-        for bad in (-1, 3, 999):
-            with self.assertRaises(ValueError):
-                p.set_eligible(bad, False)
-
-    def test_top_or_inf_index_out_of_range_raises(self):
-        p = self._plan()
-        for bad in (-1, 3, 999):
-            with self.assertRaises(ValueError):
-                p.top_or_inf(bad)
 
     def test_empty_uses_raises(self):
         bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])
@@ -1890,38 +1889,47 @@ class NativeGuardTests(TestCase):
             NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)
 
 
-class InPlaceRejectionParityTests(TestCase):
-    """Both packers reject the declared in-place pairs the plan invariants
+class InPlaceRejectionTestsMixin(MixinBase):
+    """Every packer rejects the declared in-place pairs the plan invariants
     forbid, so that ``TORCH_SPYRE_NATIVE_PACKER=0`` selects the same packer and
-    not a stricter one. Only the exception type differs: the Python packer
-    asserts, the native one raises ``ValueError`` like its other rejections."""
+    not a stricter one."""
 
-    REJECTED = (AssertionError, ValueError)
+    plan_class: type = None  # type: ignore[assignment]
+    # As with ``eligible``: the Python packers assert, the native one raises.
+    rejection_error: type = AssertionError
 
-    def _constructors(self, buffers):
-        args = (buffers, [0, 1], 10_000, 128)
-        return [
-            lambda: PermutationBasedLayoutSolver(*args),
-            lambda: ReferencePermutationBasedLayoutSolver(*args),
-            lambda: NativePermutationLayoutSolver(*args),
-        ]
+    def _plan(self, buffers):
+        return self.plan_class(buffers, [0, 1], 10_000, 128)
 
     def test_write_only_parent_rejected(self):
         # p is written at tick 0 and never read, so it has no live storage to
         # hand to c.
         buffers = [_buf("p", 64, 0, 1), _buf("c", 32, 0, 3, ["p"])]
-        for make in self._constructors(buffers):
-            with self.assertRaises(self.REJECTED):
-                make()
+        with self.assertRaises(self.rejection_error):
+            self._plan(buffers)
 
     def test_multi_tick_overlap_rejected(self):
         # p is live through tick 3 and c from tick 1: three ticks of overlap
         # rather than the single handoff tick, so co-locating them would alias
         # two buffers that are live together.
         buffers = [_buf("p", 64, 0, 4), _buf("c", 32, 1, 4, ["p"])]
-        for make in self._constructors(buffers):
-            with self.assertRaises(self.REJECTED):
-                make()
+        with self.assertRaises(self.rejection_error):
+            self._plan(buffers)
+
+
+class ReferenceSolverInPlaceRejectionTests(InPlaceRejectionTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverInPlaceRejectionTests(
+    InPlaceRejectionTestsMixin, TestCase
+):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverInPlaceRejectionTests(InPlaceRejectionTestsMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
+    rejection_error = ValueError
 
 
 class NativePermutationViewTests(TestCase):
