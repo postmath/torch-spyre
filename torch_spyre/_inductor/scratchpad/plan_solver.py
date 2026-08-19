@@ -63,7 +63,7 @@ class LifetimeBoundBuffer:
     is what makes ``read_count`` trustworthy: one entry per accessing op means
     that for a computed buffer ``read_count == 0`` is exactly "written, never
     read", which the in-place invariants rely on (see
-    :func:`assert_in_place_parent_is_read`).  A repeated index would describe a
+    :func:`check_in_place_parent_is_read`).  A repeated index would describe a
     buffer written and read by the same op, i.e. with a single live tick, and
     would let such a buffer pass as an in-place parent.
 
@@ -214,7 +214,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         )
 
 
-def assert_in_place_parent_is_read(
+def check_in_place_parent_is_read(
     parent: "LifetimeBoundBuffer", child_name: str
 ) -> None:
     """Reject an in-place parent whose storage is never read before handover.
@@ -226,7 +226,7 @@ def assert_in_place_parent_is_read(
     and child come alive on the same tick while sharing storage. Graph inputs are
     exempt: all their uses are reads, so one use is enough.
 
-    Split out of :func:`_assert_in_place_relationships` because the
+    Split out of :func:`_check_in_place_relationships` because the
     permutation-based layout solvers call it directly, where they resolve
     declared pairs (``_compute_inplace_partners``), alongside their own copy of
     the abutment check -- their incremental machinery samples the contact
@@ -249,7 +249,7 @@ def assert_in_place_parent_is_read(
         )
 
 
-def _assert_in_place_relationships(
+def _check_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
 ) -> None:
     """Reject any declared in-place pair that violates a required invariant."""
@@ -264,7 +264,7 @@ def _assert_in_place_relationships(
                         f"must equal child {child.name}.start_time+1="
                         f"{child.start_time + 1}"
                     )
-                assert_in_place_parent_is_read(parent, child.name)
+                check_in_place_parent_is_read(parent, child.name)
                 # With core_divisions ``size`` is the *total* footprint, so a static
                 # size check doesn't apply; the per-core match is enforced against the
                 # chosen division in ``CpSatLayoutSolver._add_inplace_relaxation``. Only

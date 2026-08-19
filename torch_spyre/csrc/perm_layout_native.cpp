@@ -164,7 +164,7 @@ class NativePermutationLayoutSolver {
     // Whether each buffer's storage is read before its last use, i.e. whether
     // it could hand that storage to an in-place child (checked below). Derived
     // here because it needs all of ``uses``, which nothing else retains. The
-    // test is the one in ``plan_solver.assert_in_place_parent_is_read``: "a use
+    // test is the one in ``plan_solver.check_in_place_parent_is_read``: "a use
     // strictly after the first", so a repeated index cannot pass as a read.
     std::vector<char> can_hand_over(n, 0);
     for (int i = 0; i < n; ++i) {

@@ -35,7 +35,7 @@ from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.contact_profile import Profile
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
-    assert_in_place_parent_is_read,
+    check_in_place_parent_is_read,
 )
 
 
@@ -421,18 +421,18 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # the pair is not expressible rather than merely unprofitable.
                     # Checked here because this is the one place that resolves
                     # declared pairs. Of the three in-place invariants checked
-                    # by ``_assert_in_place_relationships`` only the size one is
+                    # by ``_check_in_place_relationships`` only the size one is
                     # a placement-time gate here rather than a precondition --
                     # an oversized child is simply not placed in-place, see
                     # ``_can_inplace`` -- so checking it would reject plans this
                     # solver handles.
-                    assert_in_place_parent_is_read(self.buffers[parent], buf.name)
+                    check_in_place_parent_is_read(self.buffers[parent], buf.name)
                     # Single-tick handoff: a valid in-place pair overlaps at
                     # exactly one tick, the child's first. Both in-place
                     # candidate generators upstream enforce it
                     # (``allocator._determine_in_place`` and
                     # ``_determine_in_place_division_invariant``), and
-                    # ``_assert_in_place_relationships`` re-checks it. The
+                    # ``_check_in_place_relationships`` re-checks it. The
                     # incremental machinery *relies* on it and cannot re-derive
                     # it: ``_placement_decision`` co-locates any overlapping
                     # partner that fits, while the in-place dirtying in
