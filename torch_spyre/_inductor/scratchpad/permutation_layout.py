@@ -228,6 +228,25 @@ class PermutationBasedLayoutSolverBase(ABC):
         if not 0 <= idx < len(self.buffers):
             raise ValueError(f"{method} index out of range")
 
+    def _check_swap_index(self, i: int) -> None:
+        """Reject a swap position with no successor to swap with.
+
+        Valid positions are ``0 .. len(buffers) - 2``. Lives on the base but is
+        called from each concrete :meth:`swap`, which is all the base declares.
+        Same reasoning as :meth:`_check_index`: unchecked, ``swap(-1)`` exchanges
+        the last permutation entry with the first.
+        """
+        if not 0 <= i < len(self.buffers) - 1:
+            raise ValueError("swap index out of range")
+
+    def _check_rotate_indices(self, i: int, j: int) -> None:
+        """Reject an out-of-range rotate position. Called by every :meth:`rotate`
+        before its ``i == j`` no-op, so an out-of-range ``rotate(999, 999)``
+        raises instead of returning 0.0 (as in the native packer)."""
+        n = len(self.buffers)
+        if not (0 <= i < n and 0 <= j < n):
+            raise ValueError("rotate index out of range")
+
     def resize(self, idx: int, new_size: int) -> float:
         """Change buffer ``idx``'s footprint to ``new_size`` in place and
         re-place. Returns the change in :meth:`quality` (new minus old).
@@ -290,6 +309,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
         # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
         # benchmarks/copy_vs_swap_results.md.)
+        self._check_rotate_indices(i, j)
         delta = 0.0
         if i < j:
             for k in range(i, j):
@@ -685,6 +705,7 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
 
     def swap(self, i: int) -> float:
         """Swap permutation entries ``i``/``i+1`` and rebuild from scratch."""
+        self._check_swap_index(i)
         old_total = self.total_quality
         perm = self.permutation
         perm[i], perm[i + 1] = perm[i + 1], perm[i]
@@ -870,8 +891,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         Returns:
             The change in :meth:`quality` (new minus old).
         """
-        n = len(self.buffers)
-        assert 0 <= i < n - 1
+        self._check_swap_index(i)
         perm = self.permutation
         x, y = perm[i], perm[i + 1]
         perm[i], perm[i + 1] = y, x
@@ -1128,6 +1148,9 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         selects the fast path; the threshold is a tunable instance attribute
         (set it to 1 to force the fast path on every rotation).
         """
+        # Checked here as well as in ``super().rotate``: neither the ``i == j``
+        # no-op nor the fast path below goes through it.
+        self._check_rotate_indices(i, j)
         if i == j:
             return 0
         if not self._eligible[self.permutation[i]]:

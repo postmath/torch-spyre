@@ -1846,6 +1846,21 @@ class IndexGuardTestsMixin(MixinBase):
             with self.assertRaises(ValueError):
                 plan.top_or_inf(bad)
 
+    def test_swap_index_out_of_range_raises(self):
+        # A swap position needs a successor to swap with, so the last position
+        # (2 of 0..2 here) is out of range as well.
+        plan = self._plan()
+        for bad in (-1, 2, 3, 999):
+            with self.assertRaises(ValueError):
+                plan.swap(bad)
+
+    def test_rotate_index_out_of_range_raises(self):
+        plan = self._plan()
+        # (999, 999) is the pair the ``i == j`` no-op would swallow.
+        for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1), (999, 999)):
+            with self.assertRaises(ValueError):
+                plan.rotate(i, j)
+
 
 class ReferenceSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
     plan_class = ReferencePermutationBasedLayoutSolver
@@ -1868,16 +1883,6 @@ class NativeGuardTests(TestCase):
     def _plan(self, n=3):
         bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
         return NativePermutationLayoutSolver(bufs, list(range(n)), 10_000, 128)
-
-    # Native-only because the Python ``swap``/``rotate`` (unlike ``resize`` /
-    # ``set_eligible`` / ``top_or_inf``) still take a negative position as a
-    # Python index: ``rotate(-1, 0)`` swaps the last entry with the first
-    # instead of raising.
-    def test_rotate_index_out_of_range_raises(self):
-        p = self._plan()
-        for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1)):
-            with self.assertRaises(ValueError):
-                p.rotate(i, j)
 
     def test_empty_uses_raises(self):
         bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])
