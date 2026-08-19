@@ -185,6 +185,13 @@ class NativePermutationLayoutSolver {
         if (uses.empty()) {
           throw std::invalid_argument("buffer uses must be non-empty");
         }
+        // end_time is uses.back() + 1, so the last use has to leave room for
+        // it. A use past INT64_MAX already fails the cast above, making this
+        // the only value that reaches the addition.
+        if (uses.back() == std::numeric_limits<int64_t>::max()) {
+          throw std::invalid_argument("buffer " + std::to_string(i) +
+                                      ": last use must be below INT64_MAX");
+        }
         bool first_read = b.attr("first_use_is_read").cast<bool>();
         parent_names[i] =
             b.attr("in_place_parents").cast<std::vector<std::string>>();

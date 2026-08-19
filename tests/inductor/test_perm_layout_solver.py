@@ -1909,6 +1909,14 @@ class ConstructorGuardTestsMixin(MixinBase):
         with self.assertRaises(ValueError):
             self.plan_class([_buf("a", -64, 0, 3)], [0], 10_000, 128)
 
+    def test_last_use_at_int64_max_raises(self):
+        # end_time is uses[-1] + 1, which overflows the native packer's int64.
+        huge = LifetimeBoundBuffer(
+            name="x", size=64, uses=[0, 2**63 - 1], in_place_parents=[]
+        )
+        with self.assertRaises(ValueError):
+            self.plan_class([huge], [0], 10_000, 128)
+
 
 class ReferenceSolverConstructorGuardTests(ConstructorGuardTestsMixin, TestCase):
     plan_class = ReferencePermutationBasedLayoutSolver

@@ -38,6 +38,10 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     check_in_place_parent_is_read,
 )
 
+# The native packer holds every tick in an int64, so a plan the two packers are
+# meant to agree on cannot carry a use it could not represent.
+_INT64_MAX = 2**63 - 1
+
 
 def _quality_for(buf: LifetimeBoundBuffer, size: int) -> float:
     """The :func:`buffer_quality` value ``buf`` would have at footprint ``size``.
@@ -132,6 +136,11 @@ class PermutationBasedLayoutSolverBase(ABC):
             # precede them), but a packer reads start_time/end_time off them.
             if not buf.uses:
                 raise ValueError("buffer uses must be non-empty")
+            # Python has no overflow here, but the native packer derives
+            # end_time as uses[-1] + 1 in int64. Rejected in both so the choice
+            # of packer stays invisible.
+            if buf.uses[-1] >= _INT64_MAX:
+                raise ValueError(f"buffer {i}: last use must be below INT64_MAX")
         self.buffers = buffers
         self.permutation = list(permutation)
         self.capacity = capacity
