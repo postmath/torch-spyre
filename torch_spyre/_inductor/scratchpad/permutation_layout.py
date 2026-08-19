@@ -359,11 +359,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         search, where it used to read ``buffers[idx].size``) so that it reads the
         plan-local ``_sizes``, which :meth:`resize` mutates.
         """
-        # Inlined rather than via :meth:`_check_index`: the annealer's neighbour
-        # scan calls this twice per adjacent pair, so the call would cost about
-        # as much as the accessor itself.
-        if not 0 <= idx < len(self.buffers):
-            raise ValueError("top_or_inf index out of range")
+        self._check_index(idx, "top_or_inf")
         top = self._top(idx)
         return math.inf if top is None else float(top)
 
