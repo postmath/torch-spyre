@@ -1851,8 +1851,10 @@ class IndexGuardTestsMixin(MixinBase):
 
     def test_rotate_index_out_of_range_raises(self):
         plan = self._plan()
-        # (999, 999) is the pair the ``i == j`` no-op would swallow.
-        for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1), (999, 999)):
+        # (3, 0) and (0, 3) sit at exactly ``n``, the boundary a ``<=`` typo
+        # would let through; (999, 999) is the pair the ``i == j`` no-op would
+        # swallow.
+        for i, j in ((3, 0), (0, 3), (5, 0), (0, 5), (-1, 0), (0, -1), (999, 999)):
             with self.assertRaises(ValueError):
                 plan.rotate(i, j)
 
