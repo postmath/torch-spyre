@@ -119,8 +119,19 @@ class PermutationBasedLayoutSolverBase(ABC):
         eligible: Optional[list[bool]] = None,
     ):
         n = len(buffers)
+        # Checked in the native constructor's order, so that a plan wrong in more
+        # than one way reports the same first complaint from either packer.
+        if alignment <= 0:
+            raise ValueError("alignment must be positive")
         if sorted(permutation) != list(range(n)):
             raise ValueError("permutation must be a permutation of range(len(buffers))")
+        for i, buf in enumerate(buffers):
+            if buf.size < 0:
+                raise ValueError(f"buffer {i}: size must be non-negative")
+            # LifetimeBoundBuffer deliberately allows empty uses (registration can
+            # precede them), but a packer reads start_time/end_time off them.
+            if not buf.uses:
+                raise ValueError("buffer uses must be non-empty")
         self.buffers = buffers
         self.permutation = list(permutation)
         self.capacity = capacity

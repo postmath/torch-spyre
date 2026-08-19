@@ -1883,24 +1883,43 @@ class NativeSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
     plan_class = NativePermutationLayoutSolver
 
 
-class NativeGuardTests(TestCase):
-    """Native-only argument validation: raising instead of corrupting the heap
-    or crashing. Regression coverage for the memory-safety review's
-    ASan-confirmed findings. The checks the native packer shares with the Python
-    ones are in :class:`IndexGuardTestsMixin`."""
+class ConstructorGuardTestsMixin(MixinBase):
+    """Every packer rejects the degenerate constructor arguments. Regression
+    coverage for the memory-safety review's ASan-confirmed findings on the
+    native side; on the Python side these went unchecked, so a negative
+    alignment produced aliased addresses rather than an error."""
 
-    def _plan(self, n=3):
-        bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
-        return NativePermutationLayoutSolver(bufs, list(range(n)), 10_000, 128)
+    plan_class: type = None  # type: ignore[assignment]
 
     def test_empty_uses_raises(self):
         bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])
         with self.assertRaises(ValueError):
-            NativePermutationLayoutSolver([bad], [0], 10_000, 128)
+            self.plan_class([bad], [0], 10_000, 128)
 
-    def test_zero_alignment_raises(self):
+    def test_non_positive_alignment_raises(self):
+        # -128 is the interesting one: _align_up would round *down*, seating two
+        # co-live buffers at one address instead of stacking them.
+        for bad in (0, -128):
+            with self.assertRaises(ValueError):
+                self.plan_class([_buf("a", 64, 0, 3)], [0], 10_000, bad)
+
+    def test_negative_size_raises(self):
         with self.assertRaises(ValueError):
-            NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)
+            self.plan_class([_buf("a", -64, 0, 3)], [0], 10_000, 128)
+
+
+class ReferenceSolverConstructorGuardTests(ConstructorGuardTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverConstructorGuardTests(
+    ConstructorGuardTestsMixin, TestCase
+):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverConstructorGuardTests(ConstructorGuardTestsMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
 
 
 class InPlaceRejectionTestsMixin(MixinBase):
