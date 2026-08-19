@@ -276,9 +276,9 @@ class SkeletonTestsMixin(MixinBase):
 
     def test_invalid_permutation_rejected(self):
         buffers = [_buf("a", 64, 0, 1), _buf("b", 64, 0, 1)]
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             self.make_plan(buffers, [0, 0], capacity=128)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             self.make_plan(buffers, [0], capacity=128)
 
     def test_single_use_input_in_place_parent_allowed(self):
@@ -1134,10 +1134,6 @@ class EligibilityConstructionMixin(MixinBase):
     construction in the suite passes four positional arguments."""
 
     plan_class: type = None  # type: ignore[assignment]
-    # The Python packers assert on a bad ``eligible`` length; the native one
-    # raises, like its other constructor rejections. Per-class rather than a
-    # tuple, so a packer switching type here is a failure and not a pass.
-    bad_eligible_error: type = AssertionError
 
     BUFFERS = [("a", 64), ("b", 50), ("c", 40)]
 
@@ -1178,7 +1174,7 @@ class EligibilityConstructionMixin(MixinBase):
     def test_bad_eligible_length_rejected(self):
         buffers = self._buffers()
         for bad in ([], [True, False], [True] * 4):
-            with self.assertRaises(self.bad_eligible_error):
+            with self.assertRaises(ValueError):
                 self._plan(buffers, eligible=bad)
 
 
@@ -1196,7 +1192,6 @@ class PermutationBasedLayoutSolverEligibilityConstructionTests(
 
 class NativeSolverEligibilityConstructionTests(EligibilityConstructionMixin, TestCase):
     plan_class = NativePermutationLayoutSolver
-    bad_eligible_error = ValueError
 
 
 class EligibilityConstructionTests(TestCase):
@@ -1914,8 +1909,6 @@ class InPlaceRejectionTestsMixin(MixinBase):
     not a stricter one."""
 
     plan_class: type = None  # type: ignore[assignment]
-    # As with ``eligible``: the Python packers assert, the native one raises.
-    rejection_error: type = AssertionError
 
     def _plan(self, buffers):
         return self.plan_class(buffers, [0, 1], 10_000, 128)
@@ -1924,7 +1917,7 @@ class InPlaceRejectionTestsMixin(MixinBase):
         # p is written at tick 0 and never read, so it has no live storage to
         # hand to c.
         buffers = [_buf("p", 64, 0, 1), _buf("c", 32, 0, 3, ["p"])]
-        with self.assertRaises(self.rejection_error):
+        with self.assertRaises(ValueError):
             self._plan(buffers)
 
     def test_multi_tick_overlap_rejected(self):
@@ -1932,7 +1925,7 @@ class InPlaceRejectionTestsMixin(MixinBase):
         # rather than the single handoff tick, so co-locating them would alias
         # two buffers that are live together.
         buffers = [_buf("p", 64, 0, 4), _buf("c", 32, 1, 4, ["p"])]
-        with self.assertRaises(self.rejection_error):
+        with self.assertRaises(ValueError):
             self._plan(buffers)
 
 
@@ -1948,7 +1941,6 @@ class PermutationBasedLayoutSolverInPlaceRejectionTests(
 
 class NativeSolverInPlaceRejectionTests(InPlaceRejectionTestsMixin, TestCase):
     plan_class = NativePermutationLayoutSolver
-    rejection_error = ValueError
 
 
 class NativePermutationViewTests(TestCase):

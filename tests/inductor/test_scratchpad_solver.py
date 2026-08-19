@@ -304,13 +304,11 @@ class BaseLayoutSolverTests:
         # permutation-based ones (which simulated annealing drives) in
         # ``_compute_inplace_partners`` -- and they share no base class, so
         # running one case against all of them is what pins the coverage.
-        # Matched on the message: ``solve`` also asserts layout legality, and a
+        # Matched on the message: ``solve`` also checks layout legality, and a
         # bare ``assertRaises`` would accept that unrelated failure as a pass.
         parent = self.make_buffer("parent", 40, [0])
         child = self.make_buffer("child", 40, [0, 2], in_place_parents=["parent"])
-        with self.assertRaisesRegex(
-            AssertionError, "computed buffer that is never read"
-        ):
+        with self.assertRaisesRegex(ValueError, "computed buffer that is never read"):
             self.solve([parent, child], size=120)
 
     def test_single_use_in_place_parent_allowed_for_an_input(self):
@@ -603,7 +601,7 @@ class BaseLayoutSolverTests:
         c = LifetimeBoundBuffer(
             "C", 15, [3, 8], in_place_parents=["P"]
         )  # uses[0]=3, need P.uses[-1]+1==4
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _assert_in_place_relationships([p, c])
 
     def test_assert_rejects_oversized_child(self):
@@ -611,7 +609,7 @@ class BaseLayoutSolverTests:
         c = LifetimeBoundBuffer(
             "C", 15, [4, 8], in_place_parents=["P"]
         )  # child larger than parent
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _assert_in_place_relationships([p, c])
 
     def test_assert_rejects_write_only_computed_parent(self):
@@ -622,7 +620,7 @@ class BaseLayoutSolverTests:
         p = LifetimeBoundBuffer("P", 20, [3])
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
         self.assertEqual(p.end_time, c.start_time + 1)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _assert_in_place_relationships([p, c])
 
     def test_assert_allows_single_use_input_parent(self):
@@ -683,7 +681,7 @@ class BaseLayoutSolverTests:
         self.assertEqual(p.end_time, c.start_time + 1)  # geometry still holds
         self.assertEqual(p.read_count, 1)  # read_count is fooled...
         with self.assertRaisesRegex(  # ...the invariant is not
-            AssertionError, "computed buffer that is never read"
+            ValueError, "computed buffer that is never read"
         ):
             _assert_in_place_relationships([p, c])
 

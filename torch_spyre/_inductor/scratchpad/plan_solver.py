@@ -217,7 +217,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
 def assert_in_place_parent_is_read(
     parent: "LifetimeBoundBuffer", child_name: str
 ) -> None:
-    """Assert an in-place parent's storage is read before it is handed over.
+    """Reject an in-place parent whose storage is never read before handover.
 
     The child takes the parent's storage over at the parent's last use, so that
     use has to be a read. For a computed buffer the first use is the write, so a
@@ -229,11 +229,11 @@ def assert_in_place_parent_is_read(
     Split out of :func:`_assert_in_place_relationships` because the
     permutation-based layout solvers call it directly, where they resolve
     declared pairs (``_compute_inplace_partners``), alongside their own copy of
-    the abutment assert -- their incremental machinery samples the contact
+    the abutment check -- their incremental machinery samples the contact
     profiles at the single tick the pair overlaps and so cannot re-derive a
     longer overlap. The size invariant is the one they do *not* take as a
     precondition: an oversized child is simply not placed in-place (see
-    ``_can_inplace``), so asserting it here would reject inputs they handle
+    ``_can_inplace``), so checking it here would reject inputs they handle
     correctly.
     """
     # Tested as "a use strictly after the first" rather than via ``read_count``:
@@ -241,26 +241,29 @@ def assert_in_place_parent_is_read(
     # validated at construction and can be mutated afterwards, and this way a
     # repeated index cannot pass as a read.
     has_read_after_write = len(parent.uses) > 1 and parent.uses[-1] > parent.uses[0]
-    assert parent.first_use_is_read or has_read_after_write, (
-        f"In-place parent {parent.name} is a computed buffer that is never read "
-        f"(uses={parent.uses}), so it cannot hand its storage to child "
-        f"{child_name}"
-    )
+    if not (parent.first_use_is_read or has_read_after_write):
+        raise ValueError(
+            f"In-place parent {parent.name} is a computed buffer that is never "
+            f"read (uses={parent.uses}), so it cannot hand its storage to child "
+            f"{child_name}"
+        )
 
 
 def _assert_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
 ) -> None:
-    """Assert that all declared in-place parent/child pairs satisfy required invariants."""
+    """Reject any declared in-place pair that violates a required invariant."""
     buf_by_name = {b.name: b for b in buffers}
     for child in buffers:
         for parent_name in child.in_place_parents:
             parent = buf_by_name.get(parent_name)
             if parent:
-                assert parent.end_time == child.start_time + 1, (
-                    f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
-                    f"child {child.name}.start_time+1={child.start_time + 1}"
-                )
+                if parent.end_time != child.start_time + 1:
+                    raise ValueError(
+                        f"In-place parent {parent_name}.end_time={parent.end_time} "
+                        f"must equal child {child.name}.start_time+1="
+                        f"{child.start_time + 1}"
+                    )
                 assert_in_place_parent_is_read(parent, child.name)
                 # With core_divisions ``size`` is the *total* footprint, so a static
                 # size check doesn't apply; the per-core match is enforced against the
@@ -271,10 +274,11 @@ def _assert_in_place_relationships(
                     getattr(parent, "core_divisions", None)
                     or getattr(child, "core_divisions", None)
                 ):
-                    assert child.size <= parent.size, (
-                        f"In-place child {child.name}.size={child.size} "
-                        f"must be <= parent {parent_name}.size={parent.size}"
-                    )
+                    if child.size > parent.size:
+                        raise ValueError(
+                            f"In-place child {child.name}.size={child.size} "
+                            f"must be <= parent {parent_name}.size={parent.size}"
+                        )
 
 
 class MemoryPlanSolver(ABC):

@@ -119,9 +119,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         eligible: Optional[list[bool]] = None,
     ):
         n = len(buffers)
-        assert sorted(permutation) == list(range(n)), (
-            "permutation must be a permutation of range(len(buffers))"
-        )
+        if sorted(permutation) != list(range(n)):
+            raise ValueError("permutation must be a permutation of range(len(buffers))")
         self.buffers = buffers
         self.permutation = list(permutation)
         self.capacity = capacity
@@ -131,7 +130,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         # duplicate makes ``in_place_parents=["a"]`` ambiguous -- the dict
         # comprehension above silently keeps the last such buffer. Reject
         # instead of resolving to an arbitrary one.
-        assert len(self._name_to_idx) == n, "buffer names must be unique"
+        if len(self._name_to_idx) != n:
+            raise ValueError("buffer names must be unique")
 
         # Per-buffer size as a flat list, for fast access in the placement hot
         # loop (avoids a dataclass attribute lookup per candidate). Mutable via
@@ -149,7 +149,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         # HBM). Mutable via :meth:`set_eligible`; deep-copied by :meth:`copy`.
         # Defaults to all-True, which reproduces the layout-only solver exactly.
         self._eligible = [True] * n if eligible is None else list(eligible)
-        assert len(self._eligible) == n, "eligible must have one flag per buffer"
+        if len(self._eligible) != n:
+            raise ValueError("eligible must have one flag per buffer")
 
         # Per-buffer set of possible in-place partners (its declared parents and
         # the children that declare it). Static -- a function of names and
@@ -419,11 +420,11 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # A write-only computed parent has nothing to hand over, so
                     # the pair is not expressible rather than merely unprofitable.
                     # Checked here because this is the one place that resolves
-                    # declared pairs. Of the three in-place invariants asserted
+                    # declared pairs. Of the three in-place invariants checked
                     # by ``_assert_in_place_relationships`` only the size one is
                     # a placement-time gate here rather than a precondition --
                     # an oversized child is simply not placed in-place, see
-                    # ``_can_inplace`` -- so asserting it would reject plans this
+                    # ``_can_inplace`` -- so checking it would reject plans this
                     # solver handles.
                     assert_in_place_parent_is_read(self.buffers[parent], buf.name)
                     # Single-tick handoff: a valid in-place pair overlaps at
@@ -440,15 +441,16 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # profiles at that single tick. On a multi-tick overlap they
                     # under-seed (stale addresses); when the child starts first
                     # they index outside the parent's span. Fail here instead.
-                    assert (
+                    if (
                         self.buffers[parent].end_time
-                        == self.buffers[child].start_time + 1
-                    ), (
-                        f"in-place pair ({self.buffers[parent].name}, "
-                        f"{buf.name}) must hand off at a single tick: parent "
-                        f"end_time {self.buffers[parent].end_time} != child "
-                        f"start_time {self.buffers[child].start_time} + 1"
-                    )
+                        != self.buffers[child].start_time + 1
+                    ):
+                        raise ValueError(
+                            f"in-place pair ({self.buffers[parent].name}, "
+                            f"{buf.name}) must hand off at a single tick: parent "
+                            f"end_time {self.buffers[parent].end_time} != child "
+                            f"start_time {self.buffers[child].start_time} + 1"
+                        )
                     partners[child].add(parent)
                     partners[parent].add(child)
         return partners
