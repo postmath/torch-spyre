@@ -161,11 +161,12 @@ class NativePermutationLayoutSolver {
     sizes_.resize(n);
     std::vector<std::string> names(n);
     std::vector<std::vector<std::string>> parent_names(n);
-    // Whether each buffer's storage is read before its last use, i.e. whether
-    // it could hand that storage to an in-place child (checked below). Derived
-    // here because it needs all of ``uses``, which nothing else retains. The
-    // test is the one in ``plan_solver.check_in_place_parent_is_read``: "a use
-    // strictly after the first", so a repeated index cannot pass as a read.
+    // Whether each buffer's last use is a read, i.e. whether it has storage to
+    // hand to an in-place child (checked below). Derived here because it needs
+    // ``first_use_is_read``, which nothing else retains -- the rest of the test
+    // is recoverable from ``st->start``/``st->end``. The test is the one in
+    // ``plan_solver.check_in_place_parent_is_read``, "a use strictly after the
+    // first", kept term-for-term so a repeated index cannot pass as a read.
     std::vector<char> can_hand_over(n, 0);
     for (int i = 0; i < n; ++i) {
       // ``py::object``, not ``py::handle``: a handle is a *borrowed* reference
