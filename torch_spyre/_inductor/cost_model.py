@@ -333,11 +333,12 @@ class CostParams:
     # c_loop*L was removed: it was calibrated on the dropped chain/ctsum reduction-dim
     # sweeps and no current op exercises it.) Pipeline-fill (underfill) derate for
     # OUTPUT-dim (pointwise) coarse-tiling: eff = min(1, (rows_per_core / (pass_rows *
-    # target_passes)) ** exponent). Same FORM as the matmul pt_eff (work_division.py);
-    # the 8-row pass is the shared hardware constant, target_passes differs by op
-    # structure. PROVISIONAL -- guessed from the chain K-sweep (flat to ~16 rows/core,
-    # cliff at 8; data hints exponent ~0.4). To be calibrated by the untiled-small-ROWS
-    # underfill-confirm runs.
+    # target_passes)) ** exponent). Same FORM as work_division.py's matmul pt_eff; the
+    # 8-row pass is the shared hardware constant, target_passes differs by op
+    # structure. The matmul term in THIS file no longer shares that form -- it was
+    # measured separately, see `matmul_pt_eff`. PROVISIONAL -- guessed from the chain
+    # K-sweep (flat to ~16 rows/core, cliff at 8; data hints exponent ~0.4). To be
+    # calibrated by the untiled-small-ROWS underfill-confirm runs.
     underfill_pass_rows: float = 8.0  # PT / stream pass granularity (matmul _PT_ROWS)
     underfill_target_passes_pointwise: float = 2.0  # pointwise full-fill ~2 pass (=16)
     # Falloff exponent. CALIBRATED 0.35 from the Section-B chain sweep (rc 16->2): eff
@@ -434,10 +435,27 @@ class CostParams:
     # MATMUL compute term. T_matmul = max(compute, HBM), where
     # compute = MACs/cores/(mac_peak*pt_eff). mac_peak=1140 (sustained) fit on the
     # compute-DOMINANT low-core runs (cores 4-8, compute 80-90% of the kernel; the old
-    # 1536 datasheet was ~33% optimistic). A single peak over-predicts cores=32 -- the
-    # RMS 1.7% across cores 4->32. pt_eff reuses the underfill derate (~1 for M/m>=64).
+    # 1536 datasheet was ~33% optimistic). A core-count ladder never sustained more
+    # than 1073 MAC/ns/core anywhere, so 1140 is ~6% optimistic and that residual is
+    # carried by pt_eff below. It is NOT dropped to the ~850 a cores=32-only sweep
+    # suggests: 850 is the 32-core rate, and pairing it with the pt_eff below would
+    # fold the same core-count derate in twice.
     mac_peak_per_core_ns: float = 1140.0  # MAC/ns/core (sustained; compute-isolate fit)
-    underfill_target_passes_matmul: float = 8.0  # matmul full-fill ~8 passes (=64 rows)
+    # pt_eff is LINEAR in the per-core tile height, and the height at which the array
+    # fills GROWS with the core budget: min(1, (M/m) / (rows * cores**exp)) -- 35 rows
+    # at 1 core, 57 at 32, so the derate is inert for M/m >= 57. FIT on a 54-run
+    # core-count ladder (forced mmwd splits, N=2560 K=5120 fp16, cores 1..32 with m*n
+    # free instead of pinned at 32, which is what separates tile height from core
+    # budget). It replaces `underfill_eff(rows, target_passes=8)` = min(1,(h/64)**0.35),
+    # whose 0.35 was calibrated on the pointwise chain sweep down to 0.125 of full fill
+    # and is 6.2x optimistic at h=2 -- the regime every production bmm sits in. RMS of
+    # (pred/meas - 1) over the ladder: 33% -> 17%; m32xn1 vs m4xn8 at M=64: a 1.00x tie
+    # -> 3.57x against a measured 3.59x. NOT shared with the pointwise underfill --
+    # `underfill_exponent` stays 0.35 there, and work_division._matmul_split_cost keeps
+    # its own. KNOWN GAP, deliberately not fitted: tall tiles on many cores (h >= 32,
+    # cores >= 16) still measure up to 2.3x slower than this predicts.
+    matmul_underfill_rows: float = 35.0  # per-core M rows that fill the array at 1 core
+    matmul_underfill_core_exp: float = 0.14  # how that fill height grows with cores
     # Scale on the loop-invariant re-read. 1.0 = a full HBM pass per iteration. Fitted
     # JOINTLY with the overlap shape because the two are confounded (r = -0.90 between
     # rho and the re-read share): an adversarial review showed 26/125 rows demanding an
@@ -700,8 +718,8 @@ def underfill_eff(
     ``underfill_pass_rows`` (8) rows; a tile shorter than ``pass_rows * target_passes``
     cannot amortise pipeline fill/drain, so effective throughput derates as
     ``(rows / r_full) ** exponent``, capped at 1. ``target_passes`` defaults to the
-    pointwise value (coarse-tiling); pass ``underfill_target_passes_matmul`` for the
-    matmul compute term (same FORM, deeper pipeline). ``rows_per_core <= 0`` (unknown)
+    pointwise value (coarse-tiling). The matmul compute term does NOT use this -- it
+    has its own measured shape in ``matmul_pt_eff``. ``rows_per_core <= 0`` (unknown)
     -> 1.0 (no derate).
     """
     p = params or CostParams()
@@ -712,6 +730,28 @@ def underfill_eff(
     if r_full <= 0:
         return 1.0
     return min(1.0, (rows_per_core / r_full) ** p.underfill_exponent)
+
+
+def matmul_pt_eff(
+    rows_per_core: float,
+    cores: float,
+    params: CostParams | None = None,
+) -> float:
+    """PT-array fill efficiency (<=1) for a matmul core tile of ``rows_per_core`` rows.
+
+    Same role as ``underfill_eff`` plays for pointwise work, but a different measured
+    SHAPE: linear in the tile height, and the height at which the array fills grows
+    with the core budget. See ``CostParams.matmul_underfill_rows`` for the fit and its
+    known gap. ``rows_per_core <= 0`` (unknown) -> 1.0 (no derate), as in
+    ``underfill_eff``.
+    """
+    p = params or CostParams()
+    if rows_per_core <= 0:
+        return 1.0
+    r_full = p.matmul_underfill_rows * max(1.0, cores) ** p.matmul_underfill_core_exp
+    if r_full <= 0:
+        return 1.0
+    return min(1.0, rows_per_core / r_full)
 
 
 def _op_cols(o) -> float:
@@ -729,7 +769,7 @@ def coarse_underfill_eff(
 ) -> float:
     """Pipeline-fill efficiency for a COARSE-tiled (fused pointwise / softmax) kernel whose
     per-core tile is ``rpc`` rows tall (rpc = ROWS/(cores*tiles)) and ``cols`` wide.
-    DISTINCT from the matmul pt_eff (``underfill_eff``). ``rpc<=0`` (untiled) or
+    DISTINCT from the matmul pt_eff (``matmul_pt_eff``). ``rpc<=0`` (untiled) or
     ``cols<=0`` (width unknown) -> 1.0 (no derate).
 
         eff = min(cap, (rpc/r_full)**exp * (cols/col_ref)**col_exp)
@@ -1419,9 +1459,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             if o.tiles_output_dim:
                 pt_eff = 1.0
             else:
-                pt_eff = underfill_eff(
-                    o.matmul_rows_per_core, p, p.underfill_target_passes_matmul
-                )
+                pt_eff = matmul_pt_eff(o.matmul_rows_per_core, o.cores, p)
             # A DEFAULT-LAYOUT bmm (both operands on the slow [0,1,2] tile order,
             # B>=gate) runs the array at the slow rate; every other matmul keeps the
             # plain peak.
@@ -1534,11 +1572,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             pe = (
                 1.0
                 if o.tiles_output_dim
-                else underfill_eff(
-                    o.matmul_rows_per_core, p, p.underfill_target_passes_matmul
-                )
+                else matmul_pt_eff(o.matmul_rows_per_core, o.cores, p)
             )
             mac_peak = _matmul_mac_peak(o, p)
+            fill_rows = p.matmul_underfill_rows * (
+                max(1.0, o.cores) ** p.matmul_underfill_core_exp
+            )
             c_ns = o.matmul_macs / o.cores / (mac_peak * pe)
             mm_us += c_ns / 1000
             slow = (
@@ -1549,7 +1588,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             mm_lines.append(
                 f"     compute = MACs/cores/(mac_peak*pt_eff) = {o.matmul_macs}/"
                 f"{o.cores}/({mac_peak:.0f}*{pe:.3f}) = {c_ns / 1000:.2f}"
-                f" us  (M/m={o.matmul_rows_per_core:.0f}, pt_eff={pe:.3f}){slow}"
+                f" us  (M/m={o.matmul_rows_per_core:.0f}, pt_eff={pe:.3f}"
+                f", fill_rows={fill_rows:.0f}){slow}"
             )
     t = predict_ops(ops, p)
     parts = "(R+W)/BW_PEAK + a*min(R,W)"

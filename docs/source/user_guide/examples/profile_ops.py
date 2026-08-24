@@ -1017,9 +1017,7 @@ def _print_model(feats: list) -> float:
     mm_us, mm_lines = 0.0, []
     for o in feats:
         if getattr(o, "is_matmul", False) and o.matmul_macs > 0 and o.cores > 0:
-            pe = cost_model.underfill_eff(
-                o.matmul_rows_per_core, p, p.underfill_target_passes_matmul
-            )
+            pe = cost_model.matmul_pt_eff(o.matmul_rows_per_core, o.cores, p)
             c_ns = o.matmul_macs / o.cores / (p.mac_peak_per_core_ns * pe)
             mm_us += c_ns / 1000
             mm_lines.append(
