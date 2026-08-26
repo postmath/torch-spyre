@@ -214,10 +214,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             "SimulatedAnnealingLayoutSolver for placement-only annealing."
         )
 
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr=None
+    ) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
         solver's own buffers. Single-use: construct a fresh solver per set."""
+        # TODO: use cost_expr here -- states are scored by self._cost_objective.
         self.spill_reasons = {}
         n = len(self._bufs)
         if n == 0:
