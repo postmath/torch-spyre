@@ -38,6 +38,10 @@ scoring naively is not affordable. Two mechanisms:
 * **Dirty tracking.** Between calls, only the buffers whose division or residency
   actually changed can dirty a bundle, so the rest keep their previous cost.
 
+Parameterization. Scoring uses the same ``CostParams`` the allocator's ILP
+objective uses -- the upstream matmul model with partial compute/HBM overlap --
+not ``predict_ops``' defaults. See ``_COST_PARAMS``.
+
 Determinism. Each bundle's microsecond prediction is converted to the shared
 fixed-point integer scale *once*, then summed as integers. Float accumulation
 would make an incrementally-updated total drift from a recomputed one, which
@@ -50,12 +54,17 @@ from __future__ import annotations
 from collections.abc import Sequence, Set as AbstractSet
 from typing import Optional
 
-from torch_spyre._inductor.cost_model import OpFeatures, predict_ops
+from torch_spyre._inductor.cost_model import CostParams, OpFeatures, predict_ops
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
 from torch_spyre._inductor.scratchpad.op_features import with_residency
 
 logger = get_inductor_logger("scratchpad.cost_objective")
+
+# Must match the parameterization CoOptimizingAllocator._solve uses to build its
+# ILP objective, or the two halves of the co-optimization minimize different
+# functions. predict_ops' own defaults are neither of these values.
+_COST_PARAMS = CostParams(overlap_gamma=0.46, use_bundled_cost_model=False)
 
 
 class BundleCostObjective:
@@ -168,7 +177,9 @@ class BundleCostObjective:
         else:
             # One rounding step per bundle, then integer accumulation -- see the
             # determinism note in the module docstring.
-            value = scorer.to_fixed_us(max(0.0, predict_ops(feats)) / 1000.0)
+            value = scorer.to_fixed_us(
+                max(0.0, predict_ops(feats, params=_COST_PARAMS)) / 1000.0
+            )
         self._cache[key] = value
         self.evaluations += 1
         return value
