@@ -40,14 +40,21 @@ Three move types:
   legal reinsertion position, and try them in descending packer-`quality()` order, accepting the
   first that clears the Metropolis test. Ranking by the `quality()` proxy rather than the true
   objective is deliberate: it costs O(1) per position, and it breaks ties among the many
-  score-identical positions that a permutation move usually offers.
+  score-identical positions that a permutation move usually offers. Its weight drops to 0 while
+  every eligible buffer is resident — `pi` only decides which eligible buffers win LX, so with all
+  of them already in, only a structural move can still pay.
 * **flip** (weight 0.3) — move one buffer to a different entry in its own division menu, then
   ripple: resize its per-core footprint and refresh LX-eligibility for it and its parents.
 * **recolor** (weight 0.2) — flood the `cd_parent_matches` relation bidirectionally from a
   non-trivial (split) anchor tiling and recolor everything it reaches.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
-before the compound move is judged as a unit by one Metropolis test.
+before the compound move is judged as a unit by one Metropolis test. The burst stops early for the
+same reason reorder does — as soon as every eligible buffer is resident.
+
+Once no move applies at all (every eligible buffer resident and neither structural move
+available), nothing can change the state again, so the cool ends there rather than spending its
+remaining budget.
 
 A run is **bit-for-bit reproducible**: the RNG is seeded, every domain it draws from is
 index-ordered, and the score is an integer fixed-point quantity, so there is no float

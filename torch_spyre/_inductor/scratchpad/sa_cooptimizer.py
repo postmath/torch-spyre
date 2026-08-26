@@ -83,7 +83,9 @@ _STEPS_PER_BUFFER = 40
 _MIN_STEPS = 200
 _MAX_STEPS = 15_000
 
-# Fixed proposal weights over the three move types.
+# Fixed proposal weights over the three move types. Reorder's weight is
+# effectively 0 while every eligible buffer is resident (see
+# :meth:`_applicable_moves`).
 _MOVE_WEIGHTS = {"reorder": 0.5, "flip": 0.3, "recolor": 0.2}
 
 # Layout-burst length as a fraction of the buffer count. The burst warms ``pi`` to
@@ -192,7 +194,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # Best-seen over the anneal (set in _anneal, read in _step); declared for
         # the types.
         self._best_score: int
-        self._best_snap: tuple[Packer, list[int]]
+        self._best_snap: tuple[Packer, list[int], int]
+        # Number of buffers passing :meth:`_eligible` under the live ``W``. Kept
+        # as a count, not a mask: the two ripple sites already evaluate
+        # ``_eligible`` over the buffers a move can change, so they carry the
+        # count by differencing that set before and after.
+        self._n_eligible: int
 
     # -- public interface ----------------------------------------------------
 
@@ -358,6 +365,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             (ci, self.chosen[c_idx]) in pairs for c_idx, pairs in self._children[idx]
         )
 
+    def _all_eligible_resident(self) -> bool:
+        """Whether every eligible buffer holds an address, i.e. nothing the solver
+        could place is spilled. O(1): an ineligible buffer never has an address,
+        so ``count_allocated()`` reaches ``_n_eligible`` exactly then."""
+        return self.packer.count_allocated() == self._n_eligible
+
     # -- seed ----------------------------------------------------------------
 
     def _lifetime_buffers(self, sizes: list[int]) -> list[LifetimeBoundBuffer]:
@@ -390,6 +403,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         n = len(self._bufs)
         sizes = [self._per_core_size(i, 0) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
+        self._n_eligible = sum(eligible)
 
         # pi from a FirstFit pass over the per-core sizes. FirstFit leaves the
         # fixed pins unplaced and ``SolverToPermutation`` sorts them after every
@@ -478,10 +492,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         per-core footprint, then refresh eligibility for ``idx`` and its parents.
         Those are the only buffers a flip can change, since eligibility depends on
         an op's own division and its children's."""
+        affected = sorted({idx} | self._parents_idx[idx])
+        before = sum(self._eligible(x) for x in affected)
         self.chosen[idx] = new_div
         self.packer.resize(idx, self._per_core_size(idx, new_div))
-        for x in sorted({idx} | self._parents_idx[idx]):
-            self.packer.set_eligible(x, self._eligible(x))
+        after = 0
+        for x in affected:
+            flag = self._eligible(x)
+            after += flag
+            self.packer.set_eligible(x, flag)
+        self._n_eligible += after - before
 
     def _flood_region(self, anchor: int, tiling: int) -> dict[int, int]:
         """Flood the ``cd_parent_matches`` relation from ``(anchor, tiling)`` to a
@@ -521,14 +541,23 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Commit a flooded region coloring: set every region op's division, resize
         its footprint, and refresh eligibility for the region plus the parents of
         region ops (the same ripple as a flip, unioned over the region)."""
+        # The affected set is division-invariant, so it is built (and its old
+        # eligibility counted) before the coloring lands.
+        affected = set(assignment)
+        for op in assignment:
+            affected |= self._parents_idx[op]
+        affected_sorted = sorted(affected)
+        before = sum(self._eligible(x) for x in affected_sorted)
         for op, div in assignment.items():
             self.chosen[op] = div
-        affected = set(assignment)
         for op in sorted(assignment):
             self.packer.resize(op, self._per_core_size(op, self.chosen[op]))
-            affected |= self._parents_idx[op]
-        for x in sorted(affected):
-            self.packer.set_eligible(x, self._eligible(x))
+        after = 0
+        for x in affected_sorted:
+            flag = self._eligible(x)
+            after += flag
+            self.packer.set_eligible(x, flag)
+        self._n_eligible += after - before
 
     def _recolor(self) -> None:
         """One region-recolor move: a uniform anchor op (so a region is hit
@@ -552,6 +581,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             return
         # The floor of 1 is there so a small graph still gets a burst.
         for _ in range(max(1, int(_BURST_FRACTION * n))):
+            # Nothing left for pi to win once the structural move has left every
+            # eligible buffer resident; the rest of the burst is noise.
+            if self._all_eligible_resident():
+                return
             i = self._rng.randrange(n)
             j = self._rng.randrange(n)
             if self.packer.rotate(i, j) < 0:
@@ -559,13 +592,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- state snapshots -----------------------------------------------------
 
-    def _snapshot(self) -> tuple[Packer, list[int]]:
+    def _snapshot(self) -> tuple[Packer, list[int], int]:
         """An independent copy of the joint state ``(pi, W)``: the packer's
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
-        division vector."""
-        return (self.packer.copy(), list(self.chosen))
+        division vector, and the eligible count ``W`` implies -- rebuilding that
+        from ``W`` would cost an O(n) pass the restore does not otherwise need."""
+        return (self.packer.copy(), list(self.chosen), self._n_eligible)
 
-    def _adopt(self, snap: tuple[Packer, list[int]]) -> None:
+    def _adopt(self, snap: tuple[Packer, list[int], int]) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those objects and the caller must
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
@@ -575,7 +609,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         bundle *values* stay valid (they are keyed on state), but the baseline it
         diffs against no longer describes the live state, so invalidate that.
         """
-        self.packer, self.chosen = snap[0], snap[1]
+        self.packer, self.chosen, self._n_eligible = snap
         if self._cost_objective is not None:
             self._cost_objective.invalidate()
 
@@ -583,9 +617,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _applicable_moves(self) -> list[str]:
         """Move types available this step, in fixed (deterministic) order: reorder
-        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor."""
+        needs >=2 buffers, flip a multi-entry menu, recolor a non-trivial anchor.
+
+        Reorder additionally drops out (its proposal weight becomes 0) once every
+        eligible buffer is resident: ``pi`` only decides which eligible buffers
+        win LX, so with all of them already in there is nothing left for it to
+        win, and only a structural move can still pay."""
         moves = []
-        if len(self._bufs) >= 2:
+        if len(self._bufs) >= 2 and not self._all_eligible_resident():
             moves.append("reorder")
         if self._flippable_ops:
             moves.append("flip")
@@ -765,8 +804,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             t0 = self._calibrate_temperature()
             t_end = max(t0 / _COOLING_SPAN, 1e-9)
             for step in range(steps):
+                move = self._choose_move()
+                # Only a move changes the state, so once none applies (every
+                # eligible buffer resident and no structural move available) the
+                # rest of the budget cannot find anything.
+                if move == "none":
+                    break
                 frac = step / (steps - 1) if steps > 1 else 1.0
-                cur = self._step(self._choose_move(), t0 * (t_end / t0) ** frac, cur)
+                cur = self._step(move, t0 * (t_end / t0) ** frac, cur)
 
         self.best_score = self._best_score
         # Adopting is safe only because nothing mutates the state after this: the

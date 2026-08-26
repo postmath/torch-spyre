@@ -644,11 +644,13 @@ def _chain_caps(buffers):
 
 
 def _live_state(solver):
-    """The observable joint state: layout addresses, packer quality, divisions."""
+    """The observable joint state: layout addresses, packer quality, divisions,
+    and the eligible count ``W`` implies (tracked, so a restore must rewind it)."""
     return (
         list(solver.packer.addresses),
         solver.packer.quality(),
         list(solver.chosen),
+        solver._n_eligible,
     )
 
 
@@ -707,6 +709,143 @@ class StepBudgetTest(TestCase):
         )
 
         self.assertGreater(_MAX_STEPS, SelfCalibratingReheatingSchedule().max_steps)
+
+
+def _n_eligible_recomputed(solver):
+    """``_n_eligible`` from scratch -- the ground truth the incrementally tracked
+    count is judged against."""
+    return sum(solver._eligible(i) for i in range(len(solver._bufs)))
+
+
+def _unsplittable_chain(n=4):
+    """A chain whose buffers offer *no* alternative division (single-entry menus,
+    trivial partition): no flip and no recolor anchor, so reorder is the only move
+    the engine could ever propose."""
+    bufs = []
+    for i in range(n):
+        parents = [f"B{i - 1}"] if i else []
+        matches = {f"B{i - 1}": [(0, 0)]} if i else {}
+        b = _cdbuf(f"B{i}", parents, matches, uses=[i, i + 3])
+        b.core_divisions = [_div(1)]
+        bufs.append(b)
+    return bufs
+
+
+class AllEligibleResidentTest(TestCase):
+    """Once every eligible buffer is resident, ``pi`` has nothing left to win --
+    it only decides *which* eligible buffers make LX -- so reorder is withdrawn
+    from the proposal weights and a structural move's burst stops."""
+
+    def test_gate_agrees_with_the_per_buffer_truth(self):
+        # The O(1) count-vs-count test against the per-buffer definition it
+        # stands in for, over roomy and spill-forcing capacities alike.
+        for buffers in (_chain(), _chain(12)):
+            for cap in [1 << 30] + _chain_caps(buffers):
+                solver = _primed(buffers, cap)
+                spilled = [
+                    i
+                    for i in range(len(buffers))
+                    if solver._eligible(i) and solver.packer.addresses[i] is None
+                ]
+                self.assertEqual(
+                    solver._all_eligible_resident(), not spilled, f"cap={cap}"
+                )
+
+    def test_reorder_is_withdrawn_only_when_all_eligible_are_resident(self):
+        for cap in [1 << 30] + _chain_caps(_chain()):
+            solver = _primed(_chain(), cap)
+            self.assertEqual(
+                "reorder" in solver._applicable_moves(),
+                not solver._all_eligible_resident(),
+                f"cap={cap}",
+            )
+            # The structural moves are unaffected by residency.
+            self.assertIn("flip", solver._applicable_moves(), f"cap={cap}")
+            self.assertIn("recolor", solver._applicable_moves(), f"cap={cap}")
+
+    def test_burst_stops_at_the_first_all_resident_iteration(self):
+        # A roomy capacity leaves the seed fully resident, so the burst returns
+        # having drawn nothing and touched nothing; a tight one has it rotating.
+        # The RNG state is the witness: the packer's methods are read-only on the
+        # native build, so a rotate counter cannot be installed.
+        tight = _chain_caps(_chain())[-1]
+        for cap, expect_rotations in ((1 << 30, False), (tight, True)):
+            solver = _primed(_chain(), cap)
+            rng_before = solver._rng.getstate()
+            perm_before = list(solver.packer.permutation)
+            solver._burst()
+            self.assertEqual(
+                solver._rng.getstate() != rng_before, expect_rotations, f"cap={cap}"
+            )
+            if not expect_rotations:
+                self.assertEqual(list(solver.packer.permutation), perm_before)
+
+    def test_tracked_eligible_count_survives_a_move_storm(self):
+        # Flips and recolors ripple eligibility over a buffer and its parents;
+        # the tracked count differences that set, so it must still match a full
+        # recompute after any sequence of them.
+        for cap in _chain_caps(_chain(12)):
+            solver = _primed(_chain(12), cap)
+            self.assertEqual(solver._n_eligible, _n_eligible_recomputed(solver))
+            for _ in range(50):
+                if solver._rng.random() < 0.5:
+                    idx = solver._rng.choice(solver._flippable_ops)
+                    menu = len(solver._bufs[idx].core_divisions)
+                    solver._atomic_flip(idx, solver._rng.randrange(menu))
+                else:
+                    solver._recolor()
+                self.assertEqual(
+                    solver._n_eligible, _n_eligible_recomputed(solver), f"cap={cap}"
+                )
+
+    def test_a_flip_that_shrinks_a_footprint_into_capacity_raises_the_count(self):
+        # B7 is 4096 bytes and does not fit a 2048-byte scratchpad undivided, so
+        # it is ineligible at menu index 0 and eligible at index 1 (partition 2).
+        # It ends the chain, so no child edge can gate it, and its parent B6 is
+        # already out on size (3072 > 2048) either way -- the count moves by
+        # exactly the one buffer.
+        solver = _primed(_chain(), 2048)
+        idx = solver._name_to_idx["B7"]
+        self.assertFalse(solver._eligible(idx))
+        before = solver._n_eligible
+        snap = solver._snapshot()
+        solver._atomic_flip(idx, 1)
+        self.assertTrue(solver._eligible(idx))
+        self.assertFalse(solver._eligible(solver._name_to_idx["B6"]))
+        self.assertEqual(solver._n_eligible, before + 1)
+        self.assertEqual(solver._n_eligible, _n_eligible_recomputed(solver))
+        solver._adopt(snap)
+        self.assertEqual(solver._n_eligible, before)
+
+    def test_a_graph_with_no_move_left_returns_the_seed(self):
+        # Single-entry menus and a roomy capacity: reorder is withdrawn and
+        # neither structural move applies, so the cool never starts.
+        buffers = _unsplittable_chain()
+        solver = _primed(buffers, 1 << 30)
+        self.assertEqual(solver._applicable_moves(), [])
+        self.assertEqual(solver._choose_move(), "none")
+
+        solver = SaCoOptimizingSolver(copy.deepcopy(buffers), 1 << 30, 128)
+        out = solver.plan_layout_and_core_divisions()
+        self.assertEqual(solver.best_score, _baseline_score(buffers, 1 << 30))
+        self.assertTrue(all(b.address is not None for b in out))
+
+    def test_the_cool_stops_at_the_first_step_with_no_applicable_move(self):
+        # Nothing can change the state once no move applies, so the remaining
+        # budget is abandoned rather than spent on no-ops.
+        solver = _primed(_chain(), _chain_caps(_chain())[-1])
+        solver._calibrate_temperature = lambda: 1.0  # type: ignore[method-assign]
+        moves = ["flip", "recolor", "none", "flip"]
+        solver._choose_move = lambda: moves.pop(0)  # type: ignore[method-assign]
+        stepped = []
+        real_step = solver._step
+        solver._step = lambda name, t, cur: (  # type: ignore[method-assign]
+            stepped.append(name),
+            real_step(name, t, cur),
+        )[1]
+        solver._anneal()
+        self.assertEqual(stepped, ["flip", "recolor"])
+        self.assertEqual(moves, ["flip"])  # the budget's tail went unused
 
 
 # Snippet run in a subprocess to solve one graph (captured *or* synthetic, chosen
