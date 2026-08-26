@@ -228,7 +228,7 @@ class ScratchpadAllocator:
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
-        allocation = self._solve(solver)
+        allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
@@ -263,7 +263,7 @@ class ScratchpadAllocator:
         self._append_lx_relayout_destinations(graph, buffers)
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
 
@@ -1547,13 +1547,56 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        result = solver.plan_layout_and_core_divisions()
+        bufmap = {buf.name: buf for buf in solver.buffers}
+
+        op_features = []
+        mem_usage = mem_usage_by_buf(graph)
+        for output_name in mem_usage:
+            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
+                continue
+            if output_name not in bufmap:
+                continue
+            op_features.append(self._extract_op_features(graph, output_name, bufmap))
+
+        from torch_spyre._inductor.cost_model import predict_ops, CostParams
+
+        params = CostParams(
+            # we need a expression of both compute, mem_t
+            # whereas the default gives max(compute, mem_t)
+            # which optimizes compute only when there's a matmul
+            overlap_gamma=0.46,
+            use_bundled_cost_model=False,
+        )
+        cost_expr = sympy.sympify(predict_ops(op_features, params=params))
+        result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
         )
         return result
+
+    def _extract_op_features(self, graph, output_name, buffers):
+        """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
+
+        Same extraction as dump_cost_model.extract_op_features, but keyed off
+        each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
+        sym_core_divs) instead of concrete values, so the
+        resulting OpFeatures can be fed to predict_ops() to build a cost
+        expression over the solver's own decision variables.
+        """
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+
+        op = graph.get_buffer(output_name)
+        orig_op_it_space_splits = getattr(op, "op_it_space_splits", None)
+        try:
+            op.op_it_space_splits = buffers[output_name].sym_core_divs
+            return extract_op_features(op, buffers)
+        finally:
+            if orig_op_it_space_splits is None:
+                del op.op_it_space_splits
+            else:
+                op.op_it_space_splits = orig_op_it_space_splits
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -1684,10 +1727,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op is None or buf.chosen_division is None:
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            orig = getattr(op, "op_it_space_splits", None)
             op.op_it_space_splits = (
                 dict(cd.output_splits),
                 dict(cd.reduction_splits),
             )
+            if orig != op.op_it_space_splits:
+                logger.debug(
+                    "core division for %s changed: %s → %s",
+                    self._get_op_name(op),
+                    orig,
+                    op.op_it_space_splits,
+                )
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering

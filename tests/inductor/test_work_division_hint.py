@@ -854,7 +854,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
 
     solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
-        allocation = allocator._solve(solver)
+        allocation = allocator._solve(solver, graph)
         allocator._finalize_lx_relayout_allocation(allocation)
 
     by_name = {buffer.name: buffer for buffer in allocation}
