@@ -278,10 +278,13 @@ def op_from_dict(d: dict) -> "OpFeatures":
     unknown keys are ignored and missing ones fall back to the dataclass defaults, so an
     old dataset still loads against a newer OpFeatures/ArgTraffic definition."""
     afields = {f.name for f in dataclasses.fields(ArgTraffic)}
-    args = [
-        ArgTraffic(**{k: v for k, v in a.items() if k in afields})
-        for a in d.get("args", [])
-    ]
+    args = []
+    for a in d.get("args", []):
+        kw = {k: v for k, v in a.items() if k in afields}
+        # Datasets captured before `mem` became the derived `is_lx` carry the string.
+        if "is_lx" not in kw and "mem" in a:
+            kw["is_lx"] = str(a["mem"]).lower() == "lx"
+        args.append(ArgTraffic(**kw))
     ofields = {f.name for f in dataclasses.fields(OpFeatures)}
     kw = {k: v for k, v in d.items() if k in ofields and k != "args"}
     return OpFeatures(args=args, **kw)

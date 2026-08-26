@@ -172,7 +172,7 @@ def reconstruct_from_io(rec):
                 cm.ArgTraffic(
                     name=t["name"],
                     role=t["role"],
-                    mem=t["mem"].lower(),
+                    is_lx=t["mem"].lower() == "lx",
                     elems=elems,
                     broadcast="broadcast" in (t.get("flags") or ""),
                     loop_factor=1,

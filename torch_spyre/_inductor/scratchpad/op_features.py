@@ -31,7 +31,7 @@ extractor: every division-dependent field (``cores``, ``reduction_cores``,
 recomputed by the extractor rather than by a second, drifting copy of its
 axis-decoding rules.
 
-Residency (``ArgTraffic.mem``) is deliberately *not* resolved here. It is the
+Residency (``ArgTraffic.is_lx``) is deliberately *not* resolved here. It is the
 other half of what the co-optimizer searches over, it is a plain per-argument
 flag, and no other feature depends on it -- so features are emitted once per
 (op, division) and residency is applied at scoring time by
@@ -95,7 +95,7 @@ def features_for_menu(op, divisions) -> list[Optional[OpFeatures]]:
 
 
 def with_residency(features: OpFeatures, lx_names: AbstractSet[str]) -> OpFeatures:
-    """``features`` with each argument's ``mem`` set from ``lx_names``.
+    """``features`` with each argument's ``is_lx`` set from ``lx_names``.
 
     The cost model charges an LX-resident argument no HBM traffic, so this is
     what turns a placement decision into a cost. Returns a new object; the input
@@ -104,8 +104,5 @@ def with_residency(features: OpFeatures, lx_names: AbstractSet[str]) -> OpFeatur
     """
     return dataclasses.replace(
         features,
-        args=[
-            dataclasses.replace(a, mem=("lx" if a.name in lx_names else "hbm"))
-            for a in features.args
-        ],
+        args=[dataclasses.replace(a, is_lx=a.name in lx_names) for a in features.args],
     )
