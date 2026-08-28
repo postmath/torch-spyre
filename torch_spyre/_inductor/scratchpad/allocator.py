@@ -16,6 +16,7 @@ import functools
 import logging
 import math
 import time
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -73,9 +74,6 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
-from torch_spyre._inductor.scratchpad.passes import (
-    ScratchpadOptimizationPass,
-)
 from torch_spyre._inductor.scratchpad.utils import (
     round_up_to_alignment,
     clone_at_graph_boundaries,
@@ -169,6 +167,25 @@ LayoutSolverFactory = Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanS
 CoreDivisionSolverFactory = Callable[
     [Sequence[LifetimeBoundBuffer], int], CoreDivisionLayoutSolver
 ]
+
+
+class ScratchpadOptimizationPass(ABC):
+    """
+    Abstract class for optimization passes which are implemented to improve
+    a graph's overall scratchpad memory utilization and/or memory latency.
+    """
+
+    @abstractmethod
+    def apply_pass(self, graph: GraphLowering):
+        """
+        Accepts a candidate graph to be optimized and evaluated for scratchpad memory allocation.
+        `graph` will be mutated according in an implementation defined way. The order and
+        number of nodes in the graph may change as a result of an optimization pass.
+
+        Args:
+            graph (GraphLowering): The graph to be optimized for scratchpad memory allocation
+        """
+        pass
 
 
 class ScratchpadAllocator:
