@@ -356,7 +356,7 @@ def _price(feats, index, params) -> GroupCost | None:
         # real time as 0.0 (exactly the misleading display that motivated the
         # term). Attribute each op its own relayout cost, and split only the
         # remainder by HBM share; parts still sum to the kernel total.
-        rel_us = [relayout_ns(f, params) / 1000.0 for f in feats]
+        rel_us = [float(relayout_ns(f, params)) / 1000.0 for f in feats]
         base_us = predicted_us - sum(rel_us)
         for f, w, r in zip(feats, weights, rel_us):
             ops.append(

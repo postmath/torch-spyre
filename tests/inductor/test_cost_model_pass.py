@@ -451,6 +451,30 @@ def test_sympy_feature_sizes_do_not_reach_the_report(monkeypatch):
     assert shares == [float, float]
 
 
+def test_relayout_share_sheds_sympy_too(monkeypatch):
+    """``relayout_ns`` is called a second time in ``_price``, outside ``predict_ops``,
+    to attribute an LX relayout op its own share (see the comment above ``rel_us`` in
+    ``_price``). That call needs its own ``float()``: it is not covered by coercing
+    ``predict_ops``'s return, and ``test_sympy_feature_sizes_do_not_reach_the_report``
+    never sets ``is_lx_relayout``, so ``relayout_ns`` always short-circuited to a plain
+    ``0.0`` there and left this path unexercised.
+    """
+    ops = _ops([_feats("a")], monkeypatch)
+    f = ops[0]
+    f.is_lx_relayout = True
+    f.relayout_split = 4
+    f.out_elems = sympy.Integer(f.out_elems)
+    f.relayout_run_elems = sympy.Integer(4096)
+    for a in f.args:
+        a.elems = sympy.Integer(a.elems)
+
+    report = cmp.build_report(ops)
+
+    json.dumps(dataclasses.asdict(report))  # raises if any field is still sympy
+    assert type(report.total_us) is float
+    assert all(type(o.predicted_us) is float for g in report.groups for o in g.ops)
+
+
 def test_empty_report_formats_without_dividing_by_zero():
     assert "predicted total" in cmp.CostReport(total_us=0.0, groups=[]).format()
 
