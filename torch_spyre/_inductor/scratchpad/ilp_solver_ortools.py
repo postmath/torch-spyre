@@ -465,9 +465,26 @@ class _SympyExprToCpSat(Printer):
             ):
                 return expr
             if expr.exp == 0.25:
-                # quadratic polyfit for i**0.25 for i ∈ [1, 32]
-                # maximum 3.5% error
-                return -0.00125916 * expr.base**2 + 0.07840521 * expr.base + 1.08405439
+                # Continuous piecewise linear approximation of x^(1/4) over the interval [1, 32],
+                # pinned to return 1 at x=1 and 32^(1/4) at x=32, generated using
+                # $TORCH_SPYRE/tools/approximate-power.py. Max 1.0% deviation for four segments; we
+                # would get:
+                #   max 0.24% deviation with 8 segments;
+                #   max 0.10% deviation with 12 segments;
+                #   max 0.057% deviation with 16 segments.
+                # We return NaN outside the interval of definition, so that we're likely to notice
+                # when the result is used inappropriately.
+                return sympy.Piecewise(
+                    (math.nan, arg < 1.0),
+                    (0.19192636355874 * arg + 0.80807363644126, arg < 2.19997967667275),
+                    (
+                        0.0951655845312752 * arg + 1.02094538380071,
+                        arg < 5.6056368042293,
+                    ),
+                    (0.04718730825329 * arg + 1.28989417510806, arg < 14.2833883031386),
+                    (0.0233975556516362 * arg + 1.62969244915308, arg <= 32.0),
+                    (math.nan, True),
+                )
             if expr.exp == -1:
                 return (
                     sympy.Symbol(f"inv_{arg.name}", integer=True, nonnegative=True)
