@@ -796,6 +796,150 @@ def apply_splits(op: ComputedBuffer, splits: dict) -> None:
     commit_iteration_space_ownership(op, splits)
 
 
+@dataclasses.dataclass
+class WorkDivisionContext:
+    """Everything about ``op`` that a work-division candidate is judged against.
+
+    Derived once per operation -- the iteration space and its stick-adjusted
+    copy, symbol metadata, tensor deps, and the op's constraint result -- so
+    that judging a candidate is a pure query: :meth:`factor_domain` for one
+    axis's legal factors, :meth:`is_legal` for a whole proposed split. A caller
+    can therefore generate and test candidates one at a time;
+    :func:`enumerate_work_division_candidates` is the cross product over this
+    object and holds no logic of its own.
+
+    ``max_cores`` is ``None`` for a caller validating an already-committed
+    split rather than proposing one, and the core budget is then not applied.
+    """
+
+    op: ComputedBuffer
+    max_cores: int | None
+    # Element-valued ranges: device coordinate expressions are written in these.
+    it_space: dict[Symbol, Expr]
+    # The same ranges with stick vars counted in sticks -- the divisible axes.
+    it_space_adjusted: dict[Symbol, Expr]
+    stick_vars: dict[Symbol, int]
+    symbol_meta: SymbolMeta
+    tensor_deps: list[TensorDep]
+    # Dims absent from the output's device coordinates, i.e. reduction (K) dims.
+    reduction_vars: list[Symbol]
+    blocked: set[Symbol]
+    allowed_splits: dict[Symbol, frozenset[int]]
+    min_splits: dict[Symbol, int]
+
+    @classmethod
+    def for_op(
+        cls, op: ComputedBuffer, max_cores: int | None = None
+    ) -> "WorkDivisionContext":
+        """Build the context for ``op``, doing the candidate-invariant work once."""
+        it_space = iteration_space_from_op(op)
+        input_tds, output_td = collect_tensor_deps(
+            op,
+            _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
+        )
+        symbol_meta = _collect_symbol_metadata(it_space)
+        it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+            it_space, input_tds + [output_td], symbol_meta
+        )
+        coord_vars = {
+            v
+            for e in output_td.device_coords[:-1]
+            for v in e.free_symbols
+            if isinstance(v, Symbol)
+        }
+        reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+        constraint_result = collect_work_division_constraints(
+            WorkDivConstraintContext(
+                op=op,
+                it_space=it_space,
+                it_space_adjusted=it_space_adjusted,
+                output_td=output_td,
+                input_tds=input_tds,
+                stick_vars=stick_vars,
+                reduction_vars=reduction_vars,
+                committed_splits={},
+            )
+        )
+        return cls(
+            op=op,
+            max_cores=max_cores,
+            it_space=it_space,
+            it_space_adjusted=it_space_adjusted,
+            stick_vars=stick_vars,
+            symbol_meta=symbol_meta,
+            tensor_deps=input_tds + [output_td],
+            reduction_vars=reduction_vars,
+            blocked=constraint_result.blocked,
+            allowed_splits=constraint_result.allowed_splits,
+            min_splits=_span_min_splits(op),
+        )
+
+    @property
+    def axes(self) -> list[Symbol]:
+        """The divisible axes, in the order a candidate split is keyed by."""
+        return list(self.it_space_adjusted)
+
+    def factor_domain(self, v: Symbol) -> list[int]:
+        """Legal per-dim factors for axis ``v``, ascending and including ``1``.
+
+        Mirrors ``must_split_vars.valid_splits`` but with no ``>= current_min``
+        floor: the full set, narrowed only by the op's allowed-split domains and
+        any span floor ``span_reduction_pass`` already committed.
+        """
+        if v in self.symbol_meta:
+            basis = self.symbol_meta[v][1]  # granularity
+        elif v in self.stick_vars:
+            basis = concretize_expr(self.it_space_adjusted[v])  # stick count
+        else:
+            basis = concretize_expr(self.it_space[v])  # element count
+        return _legal_split_factors(v, basis, self.allowed_splits, self.min_splits)
+
+    def is_legal(self, splits: dict[Symbol, int]) -> bool:
+        """Whether a proposed split is permissible: within the core budget, at
+        most one split reduction dim, every tensor's per-core span within
+        ``MAX_SPAN_BYTES``, and inside the op's own split domains."""
+        if self.max_cores is not None and math.prod(splits.values()) > self.max_cores:
+            return False
+        if not self._one_reduction_split_at_most(splits):
+            return False
+        if any(
+            get_per_core_span(td, splits, self.it_space, self.symbol_meta)
+            > MAX_SPAN_BYTES
+            for td in self.tensor_deps
+        ):
+            return False
+        return self._in_split_domains(splits)
+
+    def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
+        """The subset of :meth:`is_legal` that is intrinsic to the op: at most
+        one split reduction dim, nothing split that is coordinate-masked, every
+        factor inside its allowed domain. Says nothing about cores or spans, so
+        a split committed for one core budget stays legal under another."""
+        return self._one_reduction_split_at_most(splits) and self._in_split_domains(
+            splits
+        )
+
+    def meets_span_floors(self, splits: dict[Symbol, int]) -> bool:
+        """Whether ``splits`` meets the hard span floors ``span_reduction_pass``
+        committed. Implied by :meth:`factor_domain`, so only a caller checking an
+        externally supplied split needs to ask."""
+        return all(
+            splits.get(v, 1) >= minimum for v, minimum in self.min_splits.items()
+        )
+
+    def _one_reduction_split_at_most(self, splits: dict[Symbol, int]) -> bool:
+        return sum(1 for v in self.reduction_vars if splits.get(v, 1) > 1) <= 1
+
+    def _in_split_domains(self, splits: dict[Symbol, int]) -> bool:
+        if any(  # a coordinate-masked dim cannot be split across cores
+            splits.get(v, 1) > 1 for v in self.blocked
+        ):
+            return False
+        return all(
+            splits.get(v, 1) in allowed for v, allowed in self.allowed_splits.items()
+        )
+
+
 def enumerate_work_division_candidates(
     op: ComputedBuffer,
     max_cores: int,
@@ -809,138 +953,39 @@ def enumerate_work_division_candidates(
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
-    Op-specific limits are supplied by ``collect_work_division_constraints``;
-    this planner only consumes their generic legal split domains.
+    Both halves come from :class:`WorkDivisionContext` -- the per-axis factor
+    domains and the whole-split predicate -- leaving only the cross product
+    here. A caller that would rather propose one split at a time uses the
+    context directly.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
-
-    it_space = iteration_space_from_op(op)
-
-    input_tds, output_td = collect_tensor_deps(
-        op,
-        _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
-    )
-    all_tds = input_tds + [output_td]
-
-    symbol_meta = _collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
-    )
-
-    # Reduction (K) dims are absent from output device coordinates.
-    coord_vars = {
-        v
-        for e in output_td.device_coords[:-1]
-        for v in e.free_symbols
-        if isinstance(v, Symbol)
-    }
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-
-    constraint_result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits={},
-        )
-    )
-    blocked = constraint_result.blocked
-    allowed_splits = constraint_result.allowed_splits
-
-    # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
-    # no ``>= current_min`` floor (we want the full set, including 1).
-    def factors(v: Symbol) -> list[int]:
-        if v in symbol_meta:
-            basis = symbol_meta[v][1]  # granularity
-        elif v in stick_vars:
-            basis = concretize_expr(it_space_adjusted[v])  # stick count
-        else:
-            basis = concretize_expr(it_space[v])  # element count
-        return _legal_split_factors(v, basis, allowed_splits, _span_min_splits(op))
-
-    def create_splits(axis_vars, combo):
-        return dict(zip(axis_vars, combo))
-
-    def valid_split(splits):
-        if math.prod(splits.values()) > max_cores:  # core budget
-            return False
-        if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
-            return False
-        if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
-            get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
-            for td in all_tds
-        ):
-            return False
-        if any(  # a coordinate-masked dim cannot be split across cores
-            splits.get(v, 1) > 1 for v in blocked
-        ):
-            return False
-        return all(splits.get(v, 1) in allowed for v, allowed in allowed_splits.items())
-
-    vars_ = list(it_space_adjusted.keys())
-    candidates = [
+    ctx = WorkDivisionContext.for_op(op, max_cores)
+    axes = ctx.axes
+    return [
         splits
-        for combo in itertools.product(*(factors(v) for v in vars_))
-        if valid_split(splits := create_splits(vars_, combo))
+        for combo in itertools.product(*(ctx.factor_domain(v) for v in axes))
+        if ctx.is_legal(splits := dict(zip(axes, combo)))
     ]
-
-    return candidates
 
 
 def work_division_splits_are_legal(
     op: ComputedBuffer, splits: dict[Symbol, int]
 ) -> bool:
-    """Return whether symbol-keyed splits obey this op's hard constraints."""
+    """Return whether symbol-keyed splits obey this op's hard constraints.
+
+    The op's own constraints only: unlike :meth:`WorkDivisionContext.is_legal`
+    this asks nothing about a core budget or per-core spans, because the splits
+    are already committed rather than proposed.
+    """
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
         return True
 
-    it_space = iteration_space_from_op(op)
-    rw = op_read_writes(op)
-    input_tds, output_td = collect_tensor_deps(
-        op, _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
-    )
-    symbol_meta = _collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, input_tds + [output_td], symbol_meta
-    )
-    coord_vars = {
-        v
-        for expr in output_td.device_coords[:-1]
-        for v in expr.free_symbols
-        if isinstance(v, Symbol)
-    }
-    result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=[v for v in it_space_adjusted if v not in coord_vars],
-            committed_splits={},
-        )
-    )
-    min_splits = _span_min_splits(op)
-    split_reduction_dims = [
-        v for v in it_space_adjusted if v not in coord_vars and splits.get(v, 1) > 1
-    ]
-    return (
-        len(split_reduction_dims) <= 1
-        and not any(splits.get(v, 1) > 1 for v in result.blocked)
-        and all(
-            splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
-        )
-        and all(splits.get(v, 1) >= minimum for v, minimum in min_splits.items())
-    )
+    ctx = WorkDivisionContext.for_op(op)
+    return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
 
 
 def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
