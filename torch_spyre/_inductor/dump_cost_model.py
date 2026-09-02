@@ -652,10 +652,14 @@ def extract_op_features(
     in_factor = 1 if (tiles_out_dim or is_tiled_red) else loop_trip
 
     args: list = []
-    # Output arg (device-sized).
+    # Output arg (device-sized). Named after the BUFFER written, not the operation
+    # (``get_operation_name()`` -> "op7" vs ``get_name()`` -> "buf7"), so it is
+    # spelled the way the reads are and the way every caller that reasons about
+    # residency spells a buffer. Naming it after the op silently defeated
+    # ``with_residency``, which matches arg names against a set of buffer names.
     args.append(
         ArgTraffic(
-            name=op.get_operation_name(),
+            name=op.get_name(),
             role="output",
             is_lx=is_lx,
             elems=out_elems,

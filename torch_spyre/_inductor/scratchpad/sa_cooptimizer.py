@@ -177,7 +177,14 @@ def _bundle_objective(
     bundles = [
         [op.get_name() for op in group] for group in estimate_bundles(graph.operations)
     ]
-    return BundleCostObjective([b.name for b in buffers], features, bundles)
+    # Only an intermediate's producing write is saved by residency; a graph
+    # boundary buffer's is not (see :func:`with_residency`).
+    intermediates = frozenset(
+        b.name for b in buffers if b.boundary == BufferType.Intermediate
+    )
+    return BundleCostObjective(
+        [b.name for b in buffers], features, bundles, intermediates
+    )
 
 
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):

@@ -44,7 +44,26 @@ def _graph(name="simple_attn"):
         n: [None if f is None else op_from_dict(f) for f in b["features"]]
         for n, b in g["buffers"].items()
     }
+    _name_output_args_after_their_buffer(features)
     return names, features
+
+
+def _name_output_args_after_their_buffer(features):
+    """Respell each op's output arg with the buffer it writes.
+
+    The fixture predates ``extract_op_features`` naming that arg after the buffer
+    (it carries the old ``"op7"`` for a record whose buffer is ``"buf7"``), and
+    regenerating it needs a Spyre machine. Without this the fixture-driven tests
+    below never cross the seam the naming exists for -- a resident buffer's write
+    would silently stay charged, which is the bug the naming fixed.
+    """
+    for buf, menu in features.items():
+        for feat in menu:
+            if feat is None:
+                continue
+            for arg in feat.args:
+                if arg.role == "output":
+                    arg.name = buf
 
 
 def _objective(names, features, bundles=None):
@@ -121,6 +140,61 @@ class CacheAgreesWithFullRecomputeTest(TestCase):
         a = obj.score(chosen, frozenset(names[:2]))
         obj.score([1 if i == 0 else c for i, c in enumerate(chosen)], frozenset())
         self.assertEqual(obj.score(chosen, frozenset(names[:2])), a)
+
+
+class ResidencyFreesTheProducingWriteTest(TestCase):
+    """Residency frees an intermediate's write, not just its reads.
+
+    This is the seam the rest of the module does not touch: the resident set is
+    spelled the way the *solver* spells it -- buffer names -- and an op's output
+    arg has to be spelled the same way or its write stays charged. Both
+    memory-only objectives price that write (``spill_cost``'s
+    ``+1 if is_intermediate``), so the cost objective has to as well.
+    """
+
+    def test_freeing_the_write_lowers_the_score(self):
+        names, features = _graph("softmax")
+        chosen = [0] * len(names)
+        resident = frozenset(names)
+        reads_only = BundleCostObjective(
+            names, features, [names], intermediates=frozenset()
+        ).score_from_scratch(chosen, resident)
+        both = BundleCostObjective(
+            names, features, [names], intermediates=frozenset(names)
+        ).score_from_scratch(chosen, resident)
+        self.assertLess(both, reads_only)
+
+    def test_a_boundary_buffer_keeps_its_write(self):
+        # A graph output's write-out survives residency: the clone that pins it
+        # is inserted after the solve, so nothing in the featurized graph pays
+        # for it. Excluding one buffer from ``intermediates`` must therefore
+        # cost strictly more than including it.
+        names, features = _graph("softmax")
+        chosen = [0] * len(names)
+        resident = frozenset(names)
+        boundary = names[-1]
+        with_it = BundleCostObjective(
+            names, features, [names], intermediates=frozenset(names)
+        ).score_from_scratch(chosen, resident)
+        without = BundleCostObjective(
+            names, features, [names], intermediates=frozenset(names) - {boundary}
+        ).score_from_scratch(chosen, resident)
+        self.assertGreater(without, with_it)
+
+    def test_residency_of_a_write_only_buffer_dirties_its_bundle(self):
+        # The write side only reaches the incremental path if the dirty map
+        # routes a residency change to the bundle that WRITES the buffer, which
+        # it does through the output arg's name. One bundle per buffer makes the
+        # routing observable.
+        names, features = _graph("softmax")
+        obj = BundleCostObjective(
+            names, features, [[n] for n in names], intermediates=frozenset(names)
+        )
+        chosen = [0] * len(names)
+        base = obj.score(chosen, frozenset())
+        moved = obj.score(chosen, frozenset({names[0]}))
+        self.assertNotEqual(moved, base)
+        self.assertEqual(moved, obj.score_from_scratch(chosen, frozenset({names[0]})))
 
 
 class StructureTest(TestCase):

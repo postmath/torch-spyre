@@ -63,18 +63,36 @@ from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 logger = get_inductor_logger("scratchpad.cost_objective")
 
 
-def with_residency(features: OpFeatures, lx_names: AbstractSet[str]) -> OpFeatures:
+def with_residency(
+    features: OpFeatures,
+    lx_names: AbstractSet[str],
+    write_lx_names: Optional[AbstractSet[str]] = None,
+) -> OpFeatures:
     """``features`` with each argument's ``mem`` set from ``lx_names``.
 
     The cost model charges an LX-resident argument no HBM traffic, so this is
     what turns a placement decision into a cost. Returns a new object; the input
     is left alone so one extracted menu can be scored against many candidate
     placements.
+
+    Residency frees an op's *output* arg too -- the producing write becomes an LX
+    write -- which is the ``+1 if is_intermediate`` term both memory-only
+    objectives price (``_LifetimeBufferWithCpVars.spill_cost``,
+    ``SaCoOptimizingSolver._spill_cost``). ``write_lx_names`` narrows the set that
+    applies to output args, since that saving is real only for an intermediate: a
+    resident graph output still gets written to HBM by the clone ``_apply_plan``
+    inserts *after* the solve, and no op in the featurized graph pays for it.
+    Defaults to ``lx_names``.
     """
+    writes = lx_names if write_lx_names is None else write_lx_names
     return dataclasses.replace(
         features,
         args=[
-            dataclasses.replace(a, is_lx=(a.name in lx_names)) for a in features.args
+            dataclasses.replace(
+                a,
+                is_lx=(a.name in (writes if a.role == "output" else lx_names)),
+            )
+            for a in features.args
         ],
     )
 
@@ -91,6 +109,10 @@ class BundleCostObjective:
         bundles: groups of buffer names, one per fused kernel (see
             ``fusion.estimate_bundles``). Names not in ``buffer_names`` are
             ignored, so a bundle may legitimately end up empty and is dropped.
+        intermediates: the buffers whose *producing write* residency frees --
+            the solver's ``BufferType.Intermediate`` ones. ``None`` (the
+            default) means every buffer's does; see :func:`with_residency` for
+            why a graph boundary buffer's does not.
     """
 
     def __init__(
@@ -98,10 +120,12 @@ class BundleCostObjective:
         buffer_names: Sequence[str],
         features: dict[str, list[Optional[OpFeatures]]],
         bundles: Sequence[Sequence[str]],
+        intermediates: Optional[AbstractSet[str]] = None,
     ) -> None:
         self._names = list(buffer_names)
         self._index = {name: i for i, name in enumerate(self._names)}
         self._features = features
+        self._intermediates = intermediates
         # Bundles as solver indices, dropping names this solver does not own
         # (graph inputs, constants) and any bundle left empty by that filter.
         self._bundles: list[tuple[int, ...]] = []
@@ -141,7 +165,11 @@ class BundleCostObjective:
     def _arg_names_of(self, b: int) -> set[str]:
         """Every argument name any op in bundle ``b`` touches, over all of its
         candidate divisions. Taken across the whole menu deliberately: the set
-        must not change as the search moves, or the dirty map would go stale."""
+        must not change as the search moves, or the dirty map would go stale.
+
+        This includes each member's own output buffer, so toggling a buffer's
+        residency dirties the bundle that *writes* it as well as those that read
+        it -- which is what makes the freed write visible to dirty tracking."""
         names: set[str] = set()
         for i in self._bundles[b]:
             for feat in self._features.get(self._name(i), ()) or ():
@@ -157,6 +185,9 @@ class BundleCostObjective:
     def _bundle_features(
         self, b: int, chosen: Sequence[int], resident: AbstractSet[str]
     ) -> list[OpFeatures]:
+        writes = (
+            resident if self._intermediates is None else resident & self._intermediates
+        )
         out = []
         for i in self._bundles[b]:
             menu = self._features.get(self._name(i))
@@ -164,7 +195,7 @@ class BundleCostObjective:
                 continue
             feat = menu[chosen[i]] if chosen[i] < len(menu) else None
             if feat is not None:
-                out.append(with_residency(feat, resident))
+                out.append(with_residency(feat, resident, writes))
         return out
 
     def _bundle_key(

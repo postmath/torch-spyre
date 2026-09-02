@@ -71,6 +71,13 @@ The engine builds it itself from the ambient `V.graph`, because it has to: the o
 per-division `OpFeatures` and the bundle grouping, and the allocator's `CoreDivisionSolverFactory`
 passes only `(buffers, size, alignment)`.
 
+Residency frees a buffer's reads **and its producing write**, which is the same quantity the two
+memory-only objectives price as `spill_cost`'s `+1 if is_intermediate`. Only an intermediate's
+write is freed: the clone that pins a resident graph boundary buffer is inserted after the solve,
+so nothing in the featurized graph pays for its HBM write-out. The engine therefore passes the
+solver's `BufferType.Intermediate` set as `intermediates`. Matching an arg to the resident set is
+by name, so an op's output `ArgTraffic` is named after the *buffer* it writes, not the operation.
+
 **Memory-only** is the fallback, taken when there is no live graph — the normal case for anything
 driving serialized captures, including the tests. It counts the HBM traffic a spill adds over
 residency, converted once to fixed-point microseconds. Being *differential*, a resident buffer
@@ -112,7 +119,10 @@ opt-in via `SA_COOPT_LARGE_CAPTURES=1` because they are slow.
 The cost objective needs features as well, so it is driven from
 `cooptimization_captures_regen.json` paired with `cooptimization_op_features.json`. The two must
 come from the same compile: every Inductor graph names its buffers `buf0..`, so names collide
-across unrelated graphs without lining up. Scores are **not comparable** between the two corpora
+across unrelated graphs without lining up. The features fixture predates output args being named
+after their buffer, so the test module respells them on load
+(`_name_output_args_after_their_buffer`); drop that when the fixture is next regenerated. Scores
+are **not comparable** between the two corpora
 — they were captured from different pipeline revisions. Regenerating either requires a Spyre
 machine, since the feature extractor reads live Inductor IR.
 
