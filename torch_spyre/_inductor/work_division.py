@@ -66,6 +66,7 @@ from .pass_utils import (
 )
 from .propagate_hints import get_op_hints
 from .work_division_constraints import (
+    ConstraintResult,
     WorkDivConstraintContext,
     collect_work_division_constraints,
     has_qfp8wt_tensor,
@@ -824,9 +825,14 @@ class WorkDivisionContext:
     tensor_deps: list[TensorDep]
     # Dims absent from the output's device coordinates, i.e. reduction (K) dims.
     reduction_vars: list[Symbol]
-    blocked: set[Symbol]
-    allowed_splits: dict[Symbol, frozenset[int]]
-    min_splits: dict[Symbol, int]
+    constraints: ConstraintResult
+    # Hard per-axis floors ``span_reduction_pass`` has already committed.
+    span_min_splits: dict[Symbol, int]
+    # factor_domain is asked once per axis by the enumeration and again per
+    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
+    _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @property
     def axes(self) -> list[Symbol]:
@@ -834,32 +840,39 @@ class WorkDivisionContext:
         return list(self.it_space_adjusted)
 
     def factor_domain(self, v: Symbol) -> list[int]:
-        """Legal per-dim factors for axis ``v``, ascending and including ``1``.
+        """Ascending legal per-dim factors for axis ``v``: those that divide it.
 
         Mirrors ``must_split_vars.valid_splits``, minus that helper's own
         ``>= current_min`` search floor: the full set, narrowed by the op's
         allowed-split domains and by any span floor ``span_reduction_pass``
-        committed. The committed floor is applied here.
+        committed. The committed floor is applied here, so ``1`` is absent
+        wherever a floor or an exact domain excludes it.
         """
-        if v in self.symbol_meta:
-            basis = self.symbol_meta[v][1]  # granularity
-        elif v in self.stick_vars:
-            basis = concretize_expr(self.it_space_adjusted[v])  # stick count
-        else:
-            basis = concretize_expr(self.it_space[v])  # element count
-        return _legal_split_factors(v, basis, self.allowed_splits, self.min_splits)
+        if v not in self._factor_domains:
+            if v in self.symbol_meta:
+                basis = self.symbol_meta[v][1]  # granularity
+            elif v in self.stick_vars:
+                basis = concretize_expr(self.it_space_adjusted[v])  # stick count
+            else:
+                basis = concretize_expr(self.it_space[v])  # element count
+            self._factor_domains[v] = _legal_split_factors(
+                v, basis, self.constraints.allowed_splits, self.span_min_splits
+            )
+        return self._factor_domains[v]
 
     def is_legal(self, splits: dict[Symbol, int]) -> bool:
-        """Whether a proposed split is permissible, on every count: within the
-        core budget, at most one split reduction dim, every tensor's per-core
-        span within ``MAX_SPAN_BYTES``, inside the op's own split domains, and
-        at or above the span floors already committed.
+        """Whether a proposed split is permissible, on every count: a divisor
+        of each axis it names, within the core budget, at most one split
+        reduction dim, every tensor's per-core span within ``MAX_SPAN_BYTES``,
+        inside the op's own split domains, and at or above the committed span
+        floors.
 
         Total, so that a caller proposing a split it did not enumerate gets the
         same verdict as one drawing factors from :meth:`factor_domain`.
         """
         return (
-            self._within_core_budget(splits)
+            self._factors_in_domain(splits)
+            and self._within_core_budget(splits)
             and self._one_reduction_split_at_most(splits)
             and self._spans_within_cap(splits)
             and self._in_split_domains(splits)
@@ -883,10 +896,26 @@ class WorkDivisionContext:
 
     def meets_span_floors(self, splits: dict[Symbol, int]) -> bool:
         """Whether ``splits`` meets the hard span floors ``span_reduction_pass``
-        committed. Already implied by :meth:`factor_domain`, so this only bites
-        on a split supplied from outside the per-axis domains."""
+        committed. A factor that is present is already checked against the
+        axis's :meth:`factor_domain`, which applies the floor, so this is what
+        rejects a split that omits a floored axis altogether."""
         return all(
-            splits.get(v, 1) >= minimum for v, minimum in self.min_splits.items()
+            splits.get(v, 1) >= minimum for v, minimum in self.span_min_splits.items()
+        )
+
+    def _factors_in_domain(self, splits: dict[Symbol, int]) -> bool:
+        """Whether every axis named is one of the op's and every factor is one
+        that axis's domain would have produced.
+
+        The enumeration draws its factors from :meth:`factor_domain` and so
+        cannot violate this; an externally proposed split can, and nothing else
+        in :meth:`is_legal` would notice -- :meth:`_in_split_domains` iterates
+        the op's *hard* domains, which for most axes are empty. Asked first,
+        because the span arithmetic divides by the factors.
+        """
+        return all(
+            v in self.it_space_adjusted and factor in self.factor_domain(v)
+            for v, factor in splits.items()
         )
 
     def _within_core_budget(self, splits: dict[Symbol, int]) -> bool:
@@ -904,11 +933,12 @@ class WorkDivisionContext:
 
     def _in_split_domains(self, splits: dict[Symbol, int]) -> bool:
         if any(  # a coordinate-masked dim cannot be split across cores
-            splits.get(v, 1) > 1 for v in self.blocked
+            splits.get(v, 1) > 1 for v in self.constraints.blocked
         ):
             return False
         return all(
-            splits.get(v, 1) in allowed for v, allowed in self.allowed_splits.items()
+            splits.get(v, 1) in allowed
+            for v, allowed in self.constraints.allowed_splits.items()
         )
 
 
@@ -953,9 +983,8 @@ def work_division_context_for_op(
         symbol_meta=symbol_meta,
         tensor_deps=input_tds + [output_td],
         reduction_vars=reduction_vars,
-        blocked=constraint_result.blocked,
-        allowed_splits=constraint_result.allowed_splits,
-        min_splits=_span_min_splits(op),
+        constraints=constraint_result,
+        span_min_splits=_span_min_splits(op),
     )
 
 
@@ -963,19 +992,12 @@ def enumerate_work_division_candidates(
     op: ComputedBuffer,
     max_cores: int,
 ) -> list[dict[Symbol, int]]:
-    """Return every permissible core-division split for ``op``.
-
-    A split (``dict[Symbol, int]``, same form as :func:`apply_splits`) is
-    permissible iff: each per-dim factor divides its dim's size,
-    ``prod(factors) <= max_cores``, every tensor's per-core span
-    ``<= MAX_SPAN_BYTES``, and at most one reduction (K) dim is split. A factor
-    of ``1`` means the dim is unsplit; the all-ones single-core split is
-    included when it is itself permissible.
-
-    Both halves come from :class:`WorkDivisionContext` -- the per-axis factor
-    domains and the whole-split predicate -- leaving only the cross product
-    here. A caller that would rather propose one split at a time uses the
-    context directly.
+    """Every split (``dict[Symbol, int]``, as :func:`apply_splits` takes) that
+    :meth:`WorkDivisionContext.is_legal` admits under ``max_cores``, drawn from
+    each axis's :meth:`~WorkDivisionContext.factor_domain`. A factor of ``1``
+    leaves its dim unsplit. Both halves are the context's, leaving only
+    the cross product here; a caller that would rather propose one split at a
+    time uses the context directly.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.

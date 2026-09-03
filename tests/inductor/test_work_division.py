@@ -430,6 +430,9 @@ def _candidate_cases():
                 _Probe(
                     {x: 1}, committed=False, proposed=False
                 ),  # below the committed floor of 2
+                # Omits the floored axis, so no factor is checked against a
+                # domain and only the floor itself can reject.
+                _Probe({}, committed=False, proposed=False),
                 _Probe({x: 2}, committed=True, proposed=True),
                 _Probe({x: 4}, committed=True, proposed=True),
                 _Probe(
@@ -636,6 +639,28 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
         self.assertEqual(
             seen, {(True, True), (False, False), (True, False)}, sorted(seen)
         )
+
+    def test_is_legal_rejects_splits_no_factor_domain_would_produce(self):
+        """``is_legal`` asked about malformed splits, which only a caller that
+        proposes rather than enumerates can supply. ``two_dims`` has no hard
+        allowed-split domains, so the op's own domains constrain nothing here
+        and the axis's factor domain is the only thing that can reject."""
+        case = next(c for c in _candidate_cases() if c.name == "two_dims")
+        x, y = case.axes
+        foreign = _isym("not_an_axis")
+        with case.patches():
+            ctx = work_division_context_for_op(case.op, case.max_cores)
+            self.assertEqual(ctx.constraints.allowed_splits, {})
+            for splits, legal, why in [
+                ({x: 4, y: 4}, True, "divisors of both axes"),
+                ({x: 4}, True, "an omitted axis is unsplit, not illegal"),
+                ({x: 3, y: 1}, False, "3 does not divide 8"),
+                ({x: 0, y: 1}, False, "zero would divide by zero downstream"),
+                ({x: -2, y: 1}, False, "negative factor"),
+                ({foreign: 2}, False, "axis of no iteration space"),
+            ]:
+                with self.subTest(why):
+                    self.assertEqual(ctx.is_legal(splits), legal, _by_name(splits))
 
     def test_context_answers_match_the_enumeration(self):
         """The seam itself: the context's axis order is the one a candidate is
