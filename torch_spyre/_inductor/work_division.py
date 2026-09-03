@@ -803,10 +803,8 @@ class WorkDivisionContext:
 
     Derived once per operation by :func:`work_division_context_for_op` -- the
     iteration space and its stick-adjusted copy, symbol metadata, tensor deps,
-    and the op's constraint result -- so
-    that judging a candidate is a pure query: :meth:`factor_domain` for one
-    axis's legal factors, :meth:`is_legal` for a whole proposed split. A caller
-    can therefore generate and test candidates one at a time;
+    and the op's constraint result -- so that judging a candidate is a pure
+    query. A caller can therefore generate and test candidates one at a time;
     :func:`enumerate_work_division_candidates` is the cross product over this
     object and holds no logic of its own.
 
@@ -861,14 +859,10 @@ class WorkDivisionContext:
         return self._factor_domains[v]
 
     def is_legal(self, splits: dict[Symbol, int]) -> bool:
-        """Whether a proposed split is permissible, on every count: a divisor
-        of each axis it names, within the core budget, at most one split
-        reduction dim, every tensor's per-core span within ``MAX_SPAN_BYTES``,
-        inside the op's own split domains, and at or above the committed span
-        floors.
+        """Whether a proposed split is permissible, on every count.
 
-        Total, so that a caller proposing a split it did not enumerate gets the
-        same verdict as one drawing factors from :meth:`factor_domain`.
+        Total, so a caller proposing a split it did not enumerate gets the same
+        verdict as one drawing its factors from :meth:`factor_domain`.
         """
         return (
             self._factors_in_domain(splits)
@@ -880,15 +874,14 @@ class WorkDivisionContext:
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
-        """The subset of :meth:`is_legal` that is intrinsic to the op: at most
-        one split reduction dim, nothing split that is coordinate-masked, every
-        factor inside its allowed domain.
+        """The subset of :meth:`is_legal` intrinsic to the op, dropping the
+        core budget, the ``MAX_SPAN_BYTES`` cap, the committed span floors and
+        the divisibility check -- so a split committed under one core budget
+        stays legal under another.
 
-        Drops exactly two of :meth:`is_legal`'s rules -- the core budget and
-        the ``MAX_SPAN_BYTES`` cap -- so a split committed for one core budget
-        stays legal under another. It does not drop the span floors; those are
-        :meth:`meets_span_floors`, which a caller checking a committed split
-        asks alongside this.
+        A caller checking a committed split asks :meth:`meets_span_floors`
+        alongside this. Divisibility it takes on trust, the split having come
+        from a division that was legal when it was made.
         """
         return self._one_reduction_split_at_most(splits) and self._in_split_domains(
             splits
@@ -904,14 +897,11 @@ class WorkDivisionContext:
         )
 
     def _factors_in_domain(self, splits: dict[Symbol, int]) -> bool:
-        """Whether every axis named is one of the op's and every factor is one
-        that axis's domain would have produced.
-
-        The enumeration draws its factors from :meth:`factor_domain` and so
-        cannot violate this; an externally proposed split can, and nothing else
-        in :meth:`is_legal` would notice -- :meth:`_in_split_domains` iterates
-        the op's *hard* domains, which for most axes are empty. Asked first,
-        because the span arithmetic divides by the factors.
+        """Nothing else in :meth:`is_legal` rejects a factor that simply does
+        not divide its axis: :meth:`_in_split_domains` iterates the op's *hard*
+        domains, which for most axes are empty. Only a caller proposing a split
+        rather than enumerating one can get here. Asked first, because the span
+        arithmetic divides by the factors.
         """
         return all(
             v in self.it_space_adjusted and factor in self.factor_domain(v)
