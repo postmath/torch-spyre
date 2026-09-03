@@ -465,24 +465,24 @@ class _SympyExprToCpSat(Printer):
             ):
                 return expr
             if expr.exp == 0.25:
-                # Continuous piecewise linear approximation of x^(1/4) over the interval [1, 32],
-                # pinned to return 1 at x=1 and 32^(1/4) at x=32, generated using
-                # $TORCH_SPYRE/tools/approximate-power.py. Max 1.0% deviation for four segments; we
-                # would get:
-                #   max 0.24% deviation with 8 segments;
-                #   max 0.10% deviation with 12 segments;
-                #   max 0.057% deviation with 16 segments.
+                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
+                # pinned to return 1 at x=1, generated using
+                # $TORCH_SPYRE/tools/approximate-power.py. Max 0.67% deviation for four segments;
+                # we would get:
+                #   max 1.6% deviation with 3 segments;
+                #   max 0.074% deviation with 8 segments;
+                #   max 0.019% deviation with 12 segments;
+                #   no deviation with 16 segments.
                 # We return NaN outside the interval of definition, so that we're likely to notice
-                # when the result is used inappropriately.
+                # when the result is used inappropriately. The piecewise expression is also not
+                # expected to be evaluated at non-integer values, but we can't guard against that
+                # as easily.
                 return sympy.Piecewise(
-                    (math.nan, arg < 1.0),
-                    (0.19192636355874 * arg + 0.80807363644126, arg < 2.19997967667275),
-                    (
-                        0.0951655845312752 * arg + 1.02094538380071,
-                        arg < 5.6056368042293,
-                    ),
-                    (0.04718730825329 * arg + 1.28989417510806, arg < 14.2833883031386),
-                    (0.0233975556516362 * arg + 1.62969244915308, arg <= 32.0),
+                    (math.nan, arg < 1),
+                    (0.189207115002721 * arg + 0.810792884997279, arg <= 2),
+                    (0.0834513045097036 * arg + 1.07281997200638, arg <= 6),
+                    (0.0442125945895629 * arg + 1.32622285287632, arg <= 14),
+                    (0.0243044730791246 * arg + 1.61661596519179, arg <= 32),
                     (math.nan, True),
                 )
             if expr.exp == -1:
