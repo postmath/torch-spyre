@@ -1882,11 +1882,34 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # kernel: bundle membership decides input dedup, the arity derate and the
         # underfill derate, so a graph that fuses into several kernels is
         # mispriced when scored flat.
+        # TypeError is in the set because a cost-model branch over an undecided
+        # `is_lx`/`output_split` raises "cannot determine truth value of Relational"
+        # rather than anything the model raises itself (issue #4233); every tiling
+        # surface that did so is now neutralised at `cost_model._tiled_rows`, so this
+        # only has to keep a FUTURE symbolic-hostile branch from killing a compile.
+        # Losing the expression costs the objective, not correctness -- but it costs it
+        # in BOTH engines now that #4164 has the annealer consume cost_expr: CP-SAT falls
+        # back to its lexicographic solve and `_build_score_fn` returns None, dropping
+        # the annealer to the memory-only objective. Nothing downstream reports that, so
+        # log it here -- with the traceback, since the message alone ("cannot determine
+        # truth value of Relational") names no op, bundle or term -- and honour
+        # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
+        # Without that escape hatch a TypeError from ordinary drift, say a signature
+        # change or a None in a term, is a silent objective loss no test can fail on.
         try:
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, TypeError) as e:
+            logger.warning(
+                "cost objective unavailable (%s: %s); the solver falls back to its "
+                "own objective",
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
+            if not config._cpsat_warn_on_cost_expr:
+                raise
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
