@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
 import math
 import unittest
 from collections import namedtuple
@@ -46,7 +45,6 @@ from torch_spyre._inductor.scratchpad.allocator import (
     CoreDivision,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
-from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
@@ -301,8 +299,21 @@ class TestWorkDivisionCandidates(unittest.TestCase):
         self.assertEqual(candidates, [{x: 1}, {x: 2}])
 
 
-class _ParityCase:
-    """One (op, patched context, probe splits) scenario for the parity tests."""
+def _by_name(splits):
+    """A split keyed by symbol name. sympy symbols are unorderable, so a raw
+    symbol-keyed dict makes ``assertEqual``'s diff machinery raise instead of
+    printing what differs."""
+    return {v.name: factor for v, factor in splits.items()}
+
+
+class _CandidateCase:
+    """One (op, patched context) scenario and the answers it must produce.
+
+    ``candidates`` is the whole enumeration, in ``axes`` order; ``probes``
+    pairs an externally supplied split with the legality verdict it must get.
+    Both are literals, so a rule change fails here and is re-read rather than
+    re-derived.
+    """
 
     def __init__(
         self,
@@ -311,7 +322,9 @@ class _ParityCase:
         it_space,
         output_td,
         max_cores,
-        probe_splits,
+        axes,
+        candidates,
+        probes,
         input_tds=(),
         it_space_adjusted=None,
         stick_vars=None,
@@ -323,7 +336,9 @@ class _ParityCase:
         self.it_space = it_space
         self.output_td = output_td
         self.max_cores = max_cores
-        self.probe_splits = probe_splits
+        self.axes = tuple(axes)
+        self.candidates = list(candidates)
+        self.probes = list(probes)
         self.input_tds = list(input_tds)
         self.it_space_adjusted = (
             it_space if it_space_adjusted is None else it_space_adjusted
@@ -368,130 +383,7 @@ class _ParityCase:
         return stack
 
 
-def _reference_enumerate_candidates(op, max_cores):
-    """``enumerate_work_division_candidates`` as it stood before
-    :class:`WorkDivisionContext`, frozen here so the refactor's promise --
-    element-for-element identical candidate lists -- stays checkable. Reads its
-    helpers off the module so a test's patches reach it."""
-    wd = work_division_module
-    it_space = wd.iteration_space_from_op(op)
-    input_tds, output_td = wd.collect_tensor_deps(
-        op,
-        wd._apply_input_layout_overrides(
-            op, wd.get_mem_deps_from_rw(wd.op_read_writes(op))
-        ),
-    )
-    all_tds = input_tds + [output_td]
-    symbol_meta = wd._collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = wd.adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
-    )
-    coord_vars = {
-        v
-        for e in output_td.device_coords[:-1]
-        for v in e.free_symbols
-        if isinstance(v, Symbol)
-    }
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    constraint_result = wd.collect_work_division_constraints(
-        wd.WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits={},
-        )
-    )
-    blocked = constraint_result.blocked
-    allowed_splits = constraint_result.allowed_splits
-
-    def factors(v):
-        if v in symbol_meta:
-            basis = symbol_meta[v][1]
-        elif v in stick_vars:
-            basis = wd.concretize_expr(it_space_adjusted[v])
-        else:
-            basis = wd.concretize_expr(it_space[v])
-        return wd._legal_split_factors(
-            v, basis, allowed_splits, wd._span_min_splits(op)
-        )
-
-    def valid_split(splits):
-        if math.prod(splits.values()) > max_cores:
-            return False
-        if sum(1 for v in reduction_vars if splits[v] > 1) > 1:
-            return False
-        if any(
-            wd.get_per_core_span(td, splits, it_space, symbol_meta) > wd.MAX_SPAN_BYTES
-            for td in all_tds
-        ):
-            return False
-        if any(splits.get(v, 1) > 1 for v in blocked):
-            return False
-        return all(splits.get(v, 1) in allowed for v, allowed in allowed_splits.items())
-
-    vars_ = list(it_space_adjusted.keys())
-    return [
-        splits
-        for combo in itertools.product(*(factors(v) for v in vars_))
-        if valid_split(splits := dict(zip(vars_, combo)))
-    ]
-
-
-def _reference_splits_are_legal(op, splits):
-    """``work_division_splits_are_legal`` as it stood before
-    :class:`WorkDivisionContext`, frozen for the same reason."""
-    wd = work_division_module
-    layout = op.get_layout()
-    if isinstance(layout, wd.MutationLayoutSHOULDREMOVE):
-        layout = layout.real_layout()
-    if not isinstance(layout, FixedTiledLayout):
-        return True
-    it_space = wd.iteration_space_from_op(op)
-    rw = wd.op_read_writes(op)
-    input_tds, output_td = wd.collect_tensor_deps(
-        op, wd._apply_input_layout_overrides(op, wd.get_mem_deps_from_rw(rw))
-    )
-    symbol_meta = wd._collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = wd.adjust_it_space_for_sticks(
-        it_space, input_tds + [output_td], symbol_meta
-    )
-    coord_vars = {
-        v
-        for expr in output_td.device_coords[:-1]
-        for v in expr.free_symbols
-        if isinstance(v, Symbol)
-    }
-    result = wd.collect_work_division_constraints(
-        wd.WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=[v for v in it_space_adjusted if v not in coord_vars],
-            committed_splits={},
-        )
-    )
-    min_splits = wd._span_min_splits(op)
-    split_reduction_dims = [
-        v for v in it_space_adjusted if v not in coord_vars and splits.get(v, 1) > 1
-    ]
-    return (
-        len(split_reduction_dims) <= 1
-        and not any(splits.get(v, 1) > 1 for v in result.blocked)
-        and all(
-            splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
-        )
-        and all(splits.get(v, 1) >= minimum for v, minimum in min_splits.items())
-    )
-
-
-def _parity_cases():
+def _candidate_cases():
     """A corpus exercising every branch a candidate is judged by: the three
     factor bases, the core budget, the span cap, the span floor, the
     reduction-count rule, blocked dims and hard domains."""
@@ -507,37 +399,87 @@ def _parity_cases():
     stick_out = _tensor_dep("stick_out", (4096, 65536), (x, y))
 
     return [
-        _ParityCase(
+        _CandidateCase(
             name="span_floor",
             op=floor_op,
             it_space={x: 8},
             output_td=_tensor_dep("span_floor", (8,), (x,)),
             constraints=ConstraintResult(allowed_splits={x: frozenset({1, 2, 4})}),
             max_cores=8,
-            probe_splits=[{x: 1}, {x: 2}, {x: 4}, {x: 8}],
+            axes=(x,),
+            # The floor of 2 removes the unsplit candidate; 8 is outside the
+            # allowed domain.
+            candidates=[{x: 2}, {x: 4}],
+            probes=[
+                ({x: 1}, False),
+                ({x: 2}, True),
+                ({x: 4}, True),
+                ({x: 8}, False),
+            ],
         ),
-        _ParityCase(
+        _CandidateCase(
             name="two_dims",
             op=_computed_buffer((8, 16), name="two_dims"),
             it_space={x: 8, y: 16},
             output_td=_tensor_dep("two_dims", (8, 16), (x, y)),
             max_cores=32,
-            probe_splits=[{x: 1, y: 1}, {x: 4, y: 4}, {x: 8, y: 16}],
+            axes=(x, y),
+            # The full cross product minus the corner where the product of the
+            # factors exceeds 32 cores.
+            candidates=[
+                {x: 1, y: 1},
+                {x: 1, y: 2},
+                {x: 1, y: 4},
+                {x: 1, y: 8},
+                {x: 1, y: 16},
+                {x: 2, y: 1},
+                {x: 2, y: 2},
+                {x: 2, y: 4},
+                {x: 2, y: 8},
+                {x: 2, y: 16},
+                {x: 4, y: 1},
+                {x: 4, y: 2},
+                {x: 4, y: 4},
+                {x: 4, y: 8},
+                {x: 8, y: 1},
+                {x: 8, y: 2},
+                {x: 8, y: 4},
+            ],
+            # Splits are validated without a core budget, so the 128-core
+            # {8, 16} is legal even though it is not an enumerated candidate.
+            probes=[
+                ({x: 1, y: 1}, True),
+                ({x: 4, y: 4}, True),
+                ({x: 8, y: 16}, True),
+            ],
         ),
-        _ParityCase(
+        _CandidateCase(
             name="two_reductions",
             op=_computed_buffer((8,), name="reduction_out"),
             it_space={m: 8, k0: 4, k1: 4},
             output_td=red_out,
             input_tds=[red_in],
             max_cores=32,
-            probe_splits=[
-                {m: 2, k0: 1, k1: 1},
+            axes=(m, k0, k1),
+            # At most one of k0/k1 is ever split, so the (k0, k1) plane keeps
+            # only its two axes and not their product.
+            candidates=[
+                {m: 1, k0: 1, k1: 1},
+                {m: 1, k0: 1, k1: 2},
+                {m: 1, k0: 1, k1: 4},
+                {m: 1, k0: 2, k1: 1},
                 {m: 1, k0: 4, k1: 1},
-                {m: 1, k0: 2, k1: 2},  # two split reduction dims: illegal
+                {m: 2, k0: 1, k1: 1},
+                {m: 4, k0: 1, k1: 1},
+                {m: 8, k0: 1, k1: 1},
+            ],
+            probes=[
+                ({m: 2, k0: 1, k1: 1}, True),
+                ({m: 1, k0: 4, k1: 1}, True),
+                ({m: 1, k0: 2, k1: 2}, False),  # two split reduction dims
             ],
         ),
-        _ParityCase(
+        _CandidateCase(
             name="blocked_dim",
             op=_computed_buffer((8, 16), name="blocked_out"),
             it_space={x: 8, y: 16},
@@ -546,9 +488,17 @@ def _parity_cases():
                 blocked={y}, allowed_splits={x: frozenset({1, 2, 8})}
             ),
             max_cores=32,
-            probe_splits=[{x: 2, y: 1}, {x: 2, y: 2}, {x: 4, y: 1}],
+            axes=(x, y),
+            # y is blocked, so it stays at 1 throughout; x is held to its
+            # allowed domain.
+            candidates=[{x: 1, y: 1}, {x: 2, y: 1}, {x: 8, y: 1}],
+            probes=[
+                ({x: 2, y: 1}, True),
+                ({x: 2, y: 2}, False),  # splits a blocked dim
+                ({x: 4, y: 1}, False),  # outside x's allowed domain
+            ],
         ),
-        _ParityCase(
+        _CandidateCase(
             name="stick_basis_and_span_cap",
             op=_computed_buffer((4096, 65536), name="stick_out"),
             it_space={x: 4096, y: 65536},
@@ -556,65 +506,100 @@ def _parity_cases():
             stick_vars={y: 64},
             output_td=stick_out,
             max_cores=32,
-            probe_splits=[{x: 1, y: 1}, {x: 4, y: 1}, {x: 8, y: 4}],
+            axes=(x, y),
+            # y unsplit would leave a per-core span over MAX_SPAN_BYTES, so
+            # every candidate splits it at least twice.
+            candidates=[
+                {x: 1, y: 2},
+                {x: 1, y: 4},
+                {x: 1, y: 8},
+                {x: 1, y: 16},
+                {x: 1, y: 32},
+                {x: 2, y: 2},
+                {x: 2, y: 4},
+                {x: 2, y: 8},
+                {x: 2, y: 16},
+                {x: 4, y: 2},
+                {x: 4, y: 4},
+                {x: 4, y: 8},
+                {x: 8, y: 2},
+                {x: 8, y: 4},
+                {x: 16, y: 2},
+            ],
+            # The span cap is not one of an op's own constraints, so a
+            # committed {x: 1, y: 1} stays legal despite being excluded above.
+            probes=[
+                ({x: 1, y: 1}, True),
+                ({x: 4, y: 1}, True),
+                ({x: 8, y: 4}, True),
+            ],
         ),
-        _ParityCase(
+        _CandidateCase(
             name="symbolic_granularity",
             op=_computed_buffer((1024,), name="symbolic_out"),
             it_space={x: 1024},
             output_td=_tensor_dep("symbolic_out", (1024,), (x,)),
             symbol_meta={x: (1024, 256)},
             max_cores=32,
-            probe_splits=[{x: 1}, {x: 4}, {x: 8}],
+            axes=(x,),
+            # Factors come off the granularity, capped by the core budget.
+            candidates=[{x: 1}, {x: 2}, {x: 4}, {x: 8}, {x: 16}, {x: 32}],
+            probes=[({x: 1}, True), ({x: 4}, True), ({x: 8}, True)],
         ),
     ]
 
 
-class TestWorkDivisionContextParity(unittest.TestCase):
-    """The stage-1 gate: hoisting the candidate-invariant context into
-    :class:`WorkDivisionContext` changes no answer anywhere."""
+class TestWorkDivisionContextAnswers(unittest.TestCase):
+    """What the candidate seam answers, pinned to literals: the enumeration a
+    core budget yields, the verdict an already-committed split gets, and the
+    context's agreement with both."""
 
-    def test_candidate_lists_are_element_for_element_identical(self):
+    def test_candidate_lists_are_the_expected_enumeration(self):
         rejected = []
-        for case in _parity_cases():
+        for case in _candidate_cases():
             with self.subTest(case.name):
-                with case.patches():
-                    expected = _reference_enumerate_candidates(case.op, case.max_cores)
                 with case.patches():
                     actual = enumerate_work_division_candidates(case.op, case.max_cores)
                     ctx = work_division_context_for_op(case.op, case.max_cores)
-                    domains = [ctx.factor_domain(v) for v in ctx.axes]
-                self.assertEqual(actual, expected)
-                self.assertTrue(expected, "case would prove nothing: no candidates")
-                rejected.append(len(expected) < math.prod(len(d) for d in domains))
+                    domains = [ctx.factor_domain(v) for v in case.axes]
+                self.assertEqual(
+                    [_by_name(c) for c in actual],
+                    [_by_name(c) for c in case.candidates],
+                )
+                self.assertTrue(
+                    case.candidates, "case would prove nothing: no candidates"
+                )
+                rejected.append(
+                    len(case.candidates) < math.prod(len(d) for d in domains)
+                )
         # At least one case must exercise the whole-split predicate rather than
         # riding on the per-axis domains alone.
         self.assertTrue(any(rejected))
 
-    def test_legality_verdicts_are_identical(self):
+    def test_legality_verdicts_are_the_expected_verdicts(self):
         verdicts = set()
-        for case in _parity_cases():
+        for case in _candidate_cases():
             with self.subTest(case.name):
-                for splits in case.probe_splits:
-                    with case.patches():
-                        expected = _reference_splits_are_legal(case.op, splits)
+                for splits, legal in case.probes:
                     with case.patches():
                         actual = work_division_splits_are_legal(case.op, splits)
-                    self.assertEqual(actual, expected, splits)
-                    verdicts.add(expected)
+                    self.assertEqual(actual, legal, _by_name(splits))
+                    verdicts.add(legal)
         # Agreeing on "legal" everywhere would prove nothing about the rules.
         self.assertEqual(verdicts, {True, False})
 
     def test_context_answers_match_the_enumeration(self):
-        """The seam itself: every enumerated candidate is one the context calls
-        legal and whose factors come from its own per-axis domains."""
-        for case in _parity_cases():
+        """The seam itself: the context's axis order is the one a candidate is
+        keyed by, and every enumerated candidate is one the context calls legal
+        and whose factors come from its own per-axis domains."""
+        for case in _candidate_cases():
             with self.subTest(case.name):
                 with case.patches():
                     ctx = work_division_context_for_op(case.op, case.max_cores)
                     candidates = enumerate_work_division_candidates(
                         case.op, case.max_cores
                     )
+                    self.assertEqual(ctx.axes, list(case.axes))
                     domains = {v: ctx.factor_domain(v) for v in ctx.axes}
                     self.assertTrue(all(ctx.is_legal(c) for c in candidates))
                     self.assertTrue(
@@ -1323,86 +1308,10 @@ class TestSpanReductionConstraints(unittest.TestCase):
 _FakeView = namedtuple("_FakeView", "work_slice_dims")
 
 
-def _reference_cd_parent_matches(
-    allocator,
-    consumer_op,
-    consumer_divs,
-    parent_names,
-    divisions,
-    op_by_name,
-    prep_cache,
-    residency_by_buf,
-):
-    """``CoOptimizingAllocator._cd_parent_matches`` as it stood before
-    :class:`ResidencyEdge`, frozen so the refactor's promise -- identical match
-    tables -- stays checkable. Its one departure from the original text is
-    calling ``_is_frame_changing_clone`` where it now lives, at module scope;
-    the predicate itself moved verbatim."""
-    alloc = allocator_module
-    if consumer_op is None:
-        return {}
-    matches = {}
-    consumer_reads = alloc.op_read_writes(consumer_op).reads
-    for parent in parent_names:
-        if parent not in op_by_name:
-            continue
-        if residency_by_buf.get(parent, "not in graph") is not None:
-            continue
-        parent_divs = divisions[parent]
-        parent_op = op_by_name[parent]
-        if alloc._is_frame_changing_clone(parent_op, parent):
-            continue
-        write_dep = next(
-            (
-                w
-                for w in alloc.op_read_writes(parent_op).writes
-                if w.name == parent and hasattr(w, "index")
-            ),
-            None,
-        )
-        read_dep = next(
-            (r for r in consumer_reads if r.name == parent and hasattr(r, "index")),
-            None,
-        )
-        if write_dep is None or read_dep is None:
-            continue
-
-        parent_is_matmul = alloc._is_matmul_op(parent_op)
-        prod_views = [
-            view
-            if (
-                repr_ok
-                and not partial
-                and not (parent_is_matmul and len(view.work_slice_dims) > 1)
-            )
-            else None
-            for view, partial, repr_ok in allocator._views_for_divs(
-                parent_op, write_dep, parent, parent_divs, prep_cache
-            )
-        ]
-        cons_views = [
-            view if repr_ok else None
-            for view, _partial, repr_ok in allocator._views_for_divs(
-                consumer_op, read_dep, parent, consumer_divs, prep_cache
-            )
-        ]
-        matches[parent] = [
-            (i, j)
-            for i, pv in enumerate(prod_views)
-            if pv is not None
-            for j, cv in enumerate(cons_views)
-            if cv is not None
-            and pv == cv
-            and parent_divs[i].cores_used == consumer_divs[j].cores_used
-        ]
-    return matches
-
-
-class TestResidencyEdgeParity(unittest.TestCase):
-    """The stage-1 gate on the compatibility seam: routing the match table
-    through :class:`ResidencyEdge` changes no pair anywhere, and the pairwise
-    :meth:`ResidencyEdge.compatible` a generator would call agrees with the
-    table it replaces."""
+class TestResidencyEdgeMatching(unittest.TestCase):
+    """The compatibility seam: the pairs :class:`ResidencyEdge` admits for a
+    corpus of policy cases, and the pairwise :meth:`ResidencyEdge.compatible`
+    a generator would call agreeing with the table it replaces."""
 
     def setUp(self):
         x, y = _isym("x"), _isym("y")
@@ -1415,10 +1324,23 @@ class TestResidencyEdgeParity(unittest.TestCase):
                 output_splits=dict(splits), reduction_splits=dict(reduction or {})
             )
 
-        # Consumer: a 4-core slicing, a 2-core one, and an 8-core one that
-        # slices the buffer the same way as the first (the stale-LX case).
-        self.consumer_divs = [_div({x: 4}), _div({x: 2}), _div({x: 8})]
-        self.consumer_views = [self.view_a, self.view_b, self.view_a]
+        # Consumer: a 4-core slicing, a 2-core one, an 8-core one that slices
+        # the buffer the same way as the first (the stale-LX case), and a
+        # 4-core one slicing two device dims -- the only consumer the wide
+        # parent candidate could pair with, so the matmul guard is what
+        # rejects it rather than a view mismatch.
+        self.consumer_divs = [
+            _div({x: 4}),
+            _div({x: 2}),
+            _div({x: 8}),
+            _div({x: 2, y: 2}),
+        ]
+        self.consumer_views = [
+            self.view_a,
+            self.view_b,
+            self.view_a,
+            self.view_wide,
+        ]
         # Every parent offers the same two candidates; what differs is the
         # policy each one trips.
         self.parent_divs = [_div({x: 4}), _div({x: 2})]
@@ -1531,24 +1453,16 @@ class TestResidencyEdgeParity(unittest.TestCase):
             self.residency,
         )
 
-    def test_match_table_is_identical(self):
+    def test_match_table_is_the_expected_pairs(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
-            expected = _reference_cd_parent_matches(
-                allocator,
-                self.consumer_op,
-                self.consumer_divs,
-                self.parent_names,
-                self.divisions,
-                self.op_by_name,
-                {},
-                self.residency,
-            )
             actual = self._table(allocator)
-        self.assertEqual(actual, expected)
-        # The corpus is only worth as much as what it exercises.
+        # Producers excluded outright ("spilled", "clone") get no entry at all;
+        # "plain" is the only one keeping the wide parent candidate. Consumer
+        # index 2 slices the buffer like index 0 but on 8 cores, so the
+        # cores_used guard drops it everywhere.
         self.assertEqual(
-            expected,
+            actual,
             {
                 "plain": [(0, 0), (1, 1)],
                 "partial": [(1, 1)],
