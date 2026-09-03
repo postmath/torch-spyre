@@ -16,6 +16,7 @@ import math
 import unittest
 from collections import namedtuple
 from contextlib import ExitStack
+from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import sympy
@@ -299,6 +300,21 @@ class TestWorkDivisionCandidates(unittest.TestCase):
         self.assertEqual(candidates, [{x: 1}, {x: 2}])
 
 
+class _Probe(NamedTuple):
+    """One externally supplied split and the verdict each entry point owes it.
+
+    ``committed`` is :func:`work_division_splits_are_legal` -- the op's own
+    constraints plus the committed span floors, asked of a split that is
+    already committed. ``proposed`` is :meth:`WorkDivisionContext.is_legal`,
+    which adds the case's core budget and the ``MAX_SPAN_BYTES`` cap. They
+    differ exactly where those two extra rules bite.
+    """
+
+    splits: dict
+    committed: bool
+    proposed: bool
+
+
 def _by_name(splits):
     """A split keyed by symbol name. sympy symbols are unorderable, so a raw
     symbol-keyed dict makes ``assertEqual``'s diff machinery raise instead of
@@ -309,10 +325,10 @@ def _by_name(splits):
 class _CandidateCase:
     """One (op, patched context) scenario and the answers it must produce.
 
-    ``candidates`` is the whole enumeration, in ``axes`` order; ``probes``
-    pairs an externally supplied split with the legality verdict it must get.
-    Both are literals, so a rule change fails here and is re-read rather than
-    re-derived.
+    ``candidates`` is the whole enumeration, in ``axes`` order; each entry in
+    ``probes`` is a :class:`_Probe`, a split supplied from outside the
+    enumeration. Both are literals, so a rule change fails here and is re-read
+    rather than re-derived.
     """
 
     def __init__(
@@ -411,10 +427,14 @@ def _candidate_cases():
             # allowed domain.
             candidates=[{x: 2}, {x: 4}],
             probes=[
-                ({x: 1}, False),
-                ({x: 2}, True),
-                ({x: 4}, True),
-                ({x: 8}, False),
+                _Probe(
+                    {x: 1}, committed=False, proposed=False
+                ),  # below the committed floor of 2
+                _Probe({x: 2}, committed=True, proposed=True),
+                _Probe({x: 4}, committed=True, proposed=True),
+                _Probe(
+                    {x: 8}, committed=False, proposed=False
+                ),  # outside the allowed domain
             ],
         ),
         _CandidateCase(
@@ -448,9 +468,11 @@ def _candidate_cases():
             # Splits are validated without a core budget, so the 128-core
             # {8, 16} is legal even though it is not an enumerated candidate.
             probes=[
-                ({x: 1, y: 1}, True),
-                ({x: 4, y: 4}, True),
-                ({x: 8, y: 16}, True),
+                _Probe({x: 1, y: 1}, committed=True, proposed=True),
+                _Probe({x: 4, y: 4}, committed=True, proposed=True),
+                _Probe(
+                    {x: 8, y: 16}, committed=True, proposed=False
+                ),  # 128 cores: over budget, still committable
             ],
         ),
         _CandidateCase(
@@ -474,9 +496,11 @@ def _candidate_cases():
                 {m: 8, k0: 1, k1: 1},
             ],
             probes=[
-                ({m: 2, k0: 1, k1: 1}, True),
-                ({m: 1, k0: 4, k1: 1}, True),
-                ({m: 1, k0: 2, k1: 2}, False),  # two split reduction dims
+                _Probe({m: 2, k0: 1, k1: 1}, committed=True, proposed=True),
+                _Probe({m: 1, k0: 4, k1: 1}, committed=True, proposed=True),
+                _Probe(
+                    {m: 1, k0: 2, k1: 2}, committed=False, proposed=False
+                ),  # two split reduction dims
             ],
         ),
         _CandidateCase(
@@ -493,9 +517,13 @@ def _candidate_cases():
             # allowed domain.
             candidates=[{x: 1, y: 1}, {x: 2, y: 1}, {x: 8, y: 1}],
             probes=[
-                ({x: 2, y: 1}, True),
-                ({x: 2, y: 2}, False),  # splits a blocked dim
-                ({x: 4, y: 1}, False),  # outside x's allowed domain
+                _Probe({x: 2, y: 1}, committed=True, proposed=True),
+                _Probe(
+                    {x: 2, y: 2}, committed=False, proposed=False
+                ),  # splits a blocked dim
+                _Probe(
+                    {x: 4, y: 1}, committed=False, proposed=False
+                ),  # outside x's allowed domain
             ],
         ),
         _CandidateCase(
@@ -529,9 +557,11 @@ def _candidate_cases():
             # The span cap is not one of an op's own constraints, so a
             # committed {x: 1, y: 1} stays legal despite being excluded above.
             probes=[
-                ({x: 1, y: 1}, True),
-                ({x: 4, y: 1}, True),
-                ({x: 8, y: 4}, True),
+                _Probe(
+                    {x: 1, y: 1}, committed=True, proposed=False
+                ),  # over the span cap, still committable
+                _Probe({x: 4, y: 1}, committed=True, proposed=False),  # likewise
+                _Probe({x: 8, y: 4}, committed=True, proposed=True),
             ],
         ),
         _CandidateCase(
@@ -544,7 +574,11 @@ def _candidate_cases():
             axes=(x,),
             # Factors come off the granularity, capped by the core budget.
             candidates=[{x: 1}, {x: 2}, {x: 4}, {x: 8}, {x: 16}, {x: 32}],
-            probes=[({x: 1}, True), ({x: 4}, True), ({x: 8}, True)],
+            probes=[
+                _Probe({x: 1}, committed=True, proposed=True),
+                _Probe({x: 4}, committed=True, proposed=True),
+                _Probe({x: 8}, committed=True, proposed=True),
+            ],
         ),
     ]
 
@@ -577,16 +611,31 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
         self.assertTrue(any(rejected))
 
     def test_legality_verdicts_are_the_expected_verdicts(self):
-        verdicts = set()
+        """Both entry points, on splits supplied from outside the enumeration:
+        ``is_legal`` is asked directly, so a rule it forgets cannot hide behind
+        candidates pre-filtered through :meth:`factor_domain`."""
+        seen = set()
         for case in _candidate_cases():
             with self.subTest(case.name):
-                for splits, legal in case.probes:
+                for probe in case.probes:
                     with case.patches():
-                        actual = work_division_splits_are_legal(case.op, splits)
-                    self.assertEqual(actual, legal, _by_name(splits))
-                    verdicts.add(legal)
-        # Agreeing on "legal" everywhere would prove nothing about the rules.
-        self.assertEqual(verdicts, {True, False})
+                        committed = work_division_splits_are_legal(
+                            case.op, probe.splits
+                        )
+                        proposed = work_division_context_for_op(
+                            case.op, case.max_cores
+                        ).is_legal(probe.splits)
+                    self.assertEqual(
+                        (committed, proposed),
+                        (probe.committed, probe.proposed),
+                        _by_name(probe.splits),
+                    )
+                    seen.add((probe.committed, probe.proposed))
+        # Agreeing everywhere, or agreeing with each other everywhere, would
+        # prove nothing about the rules or about the difference between them.
+        self.assertEqual(
+            seen, {(True, True), (False, False), (True, False)}, sorted(seen)
+        )
 
     def test_context_answers_match_the_enumeration(self):
         """The seam itself: the context's axis order is the one a candidate is

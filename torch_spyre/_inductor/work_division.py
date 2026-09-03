@@ -836,9 +836,10 @@ class WorkDivisionContext:
     def factor_domain(self, v: Symbol) -> list[int]:
         """Legal per-dim factors for axis ``v``, ascending and including ``1``.
 
-        Mirrors ``must_split_vars.valid_splits`` but with no ``>= current_min``
-        floor: the full set, narrowed only by the op's allowed-split domains and
-        any span floor ``span_reduction_pass`` already committed.
+        Mirrors ``must_split_vars.valid_splits``, minus that helper's own
+        ``>= current_min`` search floor: the full set, narrowed by the op's
+        allowed-split domains and by any span floor ``span_reduction_pass``
+        committed. The committed floor is applied here.
         """
         if v in self.symbol_meta:
             basis = self.symbol_meta[v][1]  # granularity
@@ -849,29 +850,41 @@ class WorkDivisionContext:
         return _legal_split_factors(v, basis, self.allowed_splits, self.min_splits)
 
     def is_legal(self, splits: dict[Symbol, int]) -> bool:
-        """Whether a proposed split is permissible: within the core budget, at
-        most one split reduction dim, every tensor's per-core span within
-        ``MAX_SPAN_BYTES``, and inside the op's own split domains."""
+        """Whether a proposed split is permissible, on every count: within the
+        core budget, at most one split reduction dim, every tensor's per-core
+        span within ``MAX_SPAN_BYTES``, inside the op's own split domains, and
+        at or above the span floors already committed.
+
+        Total, so that a caller proposing a split it did not enumerate gets the
+        same verdict as one drawing factors from :meth:`factor_domain`.
+        """
         return (
             self._within_core_budget(splits)
             and self._one_reduction_split_at_most(splits)
             and self._spans_within_cap(splits)
             and self._in_split_domains(splits)
+            and self.meets_span_floors(splits)
         )
 
     def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
         """The subset of :meth:`is_legal` that is intrinsic to the op: at most
         one split reduction dim, nothing split that is coordinate-masked, every
-        factor inside its allowed domain. Says nothing about cores or spans, so
-        a split committed for one core budget stays legal under another."""
+        factor inside its allowed domain.
+
+        Drops exactly two of :meth:`is_legal`'s rules -- the core budget and
+        the ``MAX_SPAN_BYTES`` cap -- so a split committed for one core budget
+        stays legal under another. It does not drop the span floors; those are
+        :meth:`meets_span_floors`, which a caller checking a committed split
+        asks alongside this.
+        """
         return self._one_reduction_split_at_most(splits) and self._in_split_domains(
             splits
         )
 
     def meets_span_floors(self, splits: dict[Symbol, int]) -> bool:
         """Whether ``splits`` meets the hard span floors ``span_reduction_pass``
-        committed. Implied by :meth:`factor_domain`, so only a caller checking an
-        externally supplied split needs to ask."""
+        committed. Already implied by :meth:`factor_domain`, so this only bites
+        on a split supplied from outside the per-axis domains."""
         return all(
             splits.get(v, 1) >= minimum for v, minimum in self.min_splits.items()
         )
