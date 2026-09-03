@@ -1282,9 +1282,10 @@ class ResidencyEdge:
     *geometry* -- the same per-core slicing of the buffer, compared in the
     buffer's own device-dim frame, on the same total core count -- and the
     *policy* filters that decide a candidate can host a readable residency at
-    all. Built once per edge by :meth:`build`, which returns ``None`` for an
-    edge excluded outright, so a caller that generates candidates instead of
-    enumerating them cannot apply the geometry and forget the filters.
+    all. Built once per edge by :func:`build_residency_edge`, which returns
+    ``None`` for an edge excluded outright, so a caller that generates
+    candidates instead of enumerating them cannot apply the geometry and forget
+    the filters.
 
     Excluded outright (the producer then falls back to HBM, always correct): a
     producer that can never be resident, and a frame-changing (broadcasting)
@@ -1305,45 +1306,6 @@ class ResidencyEdge:
     # ``get_ncores_for_buffers`` matmul guard for the greedy path.)
     parent_is_matmul: bool
     prep_cache: dict
-
-    @classmethod
-    def build(
-        cls,
-        buf_name: str,
-        parent_op: Operation,
-        consumer_op: Operation,
-        consumer_reads: Iterable[Dep],
-        residency_reason: Optional[str],
-        prep_cache: dict,
-    ) -> "Optional[ResidencyEdge]":
-        """The edge, or ``None`` when it can never host a residency."""
-        if residency_reason is not None:
-            return None
-        if _is_frame_changing_clone(parent_op, buf_name):
-            return None
-        write_dep = next(
-            (
-                w
-                for w in op_read_writes(parent_op).writes
-                if w.name == buf_name and hasattr(w, "index")
-            ),
-            None,
-        )
-        read_dep = next(
-            (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
-            None,
-        )
-        if write_dep is None or read_dep is None:
-            return None
-        return cls(
-            buf_name=buf_name,
-            parent_op=parent_op,
-            consumer_op=consumer_op,
-            write_dep=write_dep,
-            read_dep=read_dep,
-            parent_is_matmul=_is_matmul_op(parent_op),
-            prep_cache=prep_cache,
-        )
 
     def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
@@ -1401,6 +1363,45 @@ class ResidencyEdge:
             and parent_view == consumer_view
             and parent_divisions[i].cores_used == consumer_divisions[j].cores_used
         ]
+
+
+def build_residency_edge(
+    buf_name: str,
+    parent_op: Operation,
+    consumer_op: Operation,
+    consumer_reads: Iterable[Dep],
+    residency_reason: Optional[str],
+    prep_cache: dict,
+) -> Optional[ResidencyEdge]:
+    """The :class:`ResidencyEdge` for this producer-consumer pair, or ``None``
+    when the edge can never host a residency."""
+    if residency_reason is not None:
+        return None
+    if _is_frame_changing_clone(parent_op, buf_name):
+        return None
+    write_dep = next(
+        (
+            w
+            for w in op_read_writes(parent_op).writes
+            if w.name == buf_name and hasattr(w, "index")
+        ),
+        None,
+    )
+    read_dep = next(
+        (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
+        None,
+    )
+    if write_dep is None or read_dep is None:
+        return None
+    return ResidencyEdge(
+        buf_name=buf_name,
+        parent_op=parent_op,
+        consumer_op=consumer_op,
+        write_dep=write_dep,
+        read_dep=read_dep,
+        parent_is_matmul=_is_matmul_op(parent_op),
+        prep_cache=prep_cache,
+    )
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
@@ -2344,7 +2345,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
-            edge = ResidencyEdge.build(
+            edge = build_residency_edge(
                 parent,
                 op_by_name[parent],
                 consumer_op,

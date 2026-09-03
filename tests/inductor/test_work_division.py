@@ -48,11 +48,11 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
 from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.work_division import (
-    WorkDivisionContext,
     TensorDep,
     _cost_model_matmul_planner,
     _default_split,
     enumerate_work_division_candidates,
+    work_division_context_for_op,
     work_division_splits_are_legal,
     multi_dim_iteration_space_split,
     span_reduction_pass,
@@ -582,7 +582,7 @@ class TestWorkDivisionContextParity(unittest.TestCase):
                     expected = _reference_enumerate_candidates(case.op, case.max_cores)
                 with case.patches():
                     actual = enumerate_work_division_candidates(case.op, case.max_cores)
-                    ctx = WorkDivisionContext.for_op(case.op, case.max_cores)
+                    ctx = work_division_context_for_op(case.op, case.max_cores)
                     domains = [ctx.factor_domain(v) for v in ctx.axes]
                 self.assertEqual(actual, expected)
                 self.assertTrue(expected, "case would prove nothing: no candidates")
@@ -611,7 +611,7 @@ class TestWorkDivisionContextParity(unittest.TestCase):
         for case in _parity_cases():
             with self.subTest(case.name):
                 with case.patches():
-                    ctx = WorkDivisionContext.for_op(case.op, case.max_cores)
+                    ctx = work_division_context_for_op(case.op, case.max_cores)
                     candidates = enumerate_work_division_candidates(
                         case.op, case.max_cores
                     )
@@ -1562,7 +1562,7 @@ class TestResidencyEdgeParity(unittest.TestCase):
         with self._patches():
             table = self._table(allocator)
             for parent, pairs in table.items():
-                edge = allocator_module.ResidencyEdge.build(
+                edge = allocator_module.build_residency_edge(
                     parent,
                     self.op_by_name[parent],
                     self.consumer_op,
@@ -1585,7 +1585,7 @@ class TestResidencyEdgeParity(unittest.TestCase):
                 ("clone", "frame-changing clone"),
             ]:
                 self.assertIsNone(
-                    allocator_module.ResidencyEdge.build(
+                    allocator_module.build_residency_edge(
                         parent,
                         self.op_by_name[parent],
                         self.consumer_op,
