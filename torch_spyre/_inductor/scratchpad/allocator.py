@@ -1653,11 +1653,25 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # kernel: bundle membership decides input dedup, the arity derate and the
         # underfill derate, so a graph that fuses into several kernels is
         # mispriced when scored flat.
+        # TypeError is in the set because a cost-model branch over an undecided
+        # `is_lx`/`output_split` raises "cannot determine truth value of Relational"
+        # rather than anything the model raises itself (issue #4233); every tiling
+        # surface that did so is now neutralised at `cost_model._tiled_rows`, so this
+        # only has to keep a FUTURE symbolic-hostile branch from killing a compile.
+        # Losing the expression costs the objective, not correctness: CP-SAT falls back
+        # to its lexicographic solve and the annealer never read it -- so log it, since
+        # nothing downstream reports a missing objective.
         try:
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, TypeError) as e:
+            logger.warning(
+                "cost objective unavailable (%s: %s); the solver falls back to its "
+                "own objective",
+                type(e).__name__,
+                e,
+            )
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (

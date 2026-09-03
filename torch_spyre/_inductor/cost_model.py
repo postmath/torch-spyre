@@ -800,6 +800,35 @@ def _op_cols(o) -> float:
     return max((a.logical[-1] for a in o.args if a.logical), default=0)
 
 
+def _is_sym(*vals) -> bool:
+    """True if any value is a sympy expression rather than a number."""
+    return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
+
+
+def _tiled_rows(o) -> float:
+    """``tile_rows_per_core``, or 0.0 (= N/A, no derate) when it is SYMBOLIC.
+
+    On the co-optimizing path (``CoOptimizingAllocator._extract_op_features``) the
+    features carry the solver's undecided ``is_lx``/``output_split`` as sympy symbols, so
+    a coarse-tiled op arrives with a symbolic per-core tile height. Every tiling surface
+    keyed on it -- ``coarse_underfill_eff``, ``coarse_underfill_eff_matmul``,
+    ``_lx_spill_working_set`` -- is a piecewise power law that BRANCHES on its argument,
+    which is not decidable over a symbol (issue #4233).
+
+    Neutralising the derate is the choice for now, not a placeholder: measured against
+    the ``_SympyExprToCpSat`` on this base, a symbolic branch does not linearize, and the
+    converter then drops the cost objective ENTIRELY and falls back to the lexicographic
+    one -- worse than keeping the linear traffic terms and losing only the derate. That
+    part expires when the in-flight piecewise-linearization work lands; the reason that
+    does not is that the derate is bounded above by 1.0, so it can rank tilings against
+    one another but never above not tiling (#4233). Either route back -- a Piecewise the
+    converter can print, or a tabulated ``1/eff`` element lookup over (division index,
+    is_lx) -- has to price ``mem/eff``, a quotient of two decision-dependent expressions.
+    """
+    rpc = o.tile_rows_per_core
+    return 0.0 if _is_sym(rpc) else rpc
+
+
 def coarse_underfill_eff(
     rpc: float,
     cols: float,
@@ -827,6 +856,8 @@ def coarse_underfill_eff(
     ``_lx_spill_bw_derate``, which already carries a separate cap/exponent pair for matmul.
     """
     p = params or CostParams()
+    if _is_sym(rpc, cols):
+        return 1.0  # see _tiled_rows
     if rpc <= 0 or cols <= 0:
         return 1.0
     raw = (rpc / p.coarse_underfill_rfull) ** p.coarse_underfill_exp * (
@@ -869,6 +900,8 @@ def coarse_underfill_eff_matmul(rpc: float, params: CostParams | None = None) ->
     one scores worse there. ``rpc<=0`` (untiled/unknown) -> 1.0.
     """
     p = params or CostParams()
+    if _is_sym(rpc):
+        return 1.0  # see _tiled_rows
     if rpc <= 0:
         return 1.0
     h0, ceil_ = p.coarse_underfill_h0_matmul, p.coarse_underfill_cap_matmul
@@ -883,8 +916,9 @@ def _lx_spill_working_set(ops: list) -> float:
     each ``tile_rows_per_core * cols`` elements. 0.0 if nothing is output-tiled."""
     ws = 0.0
     for o in ops:
-        if o.tiles_output_dim and o.tile_rows_per_core > 0:
-            ws = max(ws, 2.0 * o.tile_rows_per_core * _op_cols(o) * o.dtype_bytes)
+        rpc = _tiled_rows(o)
+        if o.tiles_output_dim and rpc > 0:
+            ws = max(ws, 2.0 * rpc * _op_cols(o) * o.dtype_bytes)
     return ws
 
 
@@ -1130,11 +1164,16 @@ def _loop_reread_bytes(ops: list) -> float:
         if not (getattr(o, "is_matmul", False) and o.tiles_output_dim):
             continue
         for a in o.args:
-            if a.mem != "hbm" or a.role != "input":
+            if a.role != "input":
                 continue
             lf = getattr(a, "loop_factor", 1) or 1
             if lf > 1:
-                extra += a.elems * (lf - 1) * o.dtype_bytes
+                # `(1 - is_lx)` rather than `a.mem != "hbm"`: same value for a concrete
+                # bool, but `mem` REJECTS a symbolic `is_lx` and this term is reached
+                # unconditionally, so the co-optimizing path lost its whole cost
+                # objective on any output-tiled matmul bundle (flash attention). Same
+                # idiom as `OpFeatures.read_bytes`, and linear in the symbol.
+                extra += a.elems * (lf - 1) * o.dtype_bytes * (1 - a.is_lx)
     return extra
 
 
@@ -1604,8 +1643,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # used only by the bundled explain path.)
     eff = 1.0
     for o in ops:
-        if o.loop_trip > 1 and o.tiles_output_dim and o.tile_rows_per_core > 0:
-            eff = min(eff, coarse_underfill_eff(o.tile_rows_per_core, _op_cols(o), p))
+        rpc = _tiled_rows(o)
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc > 0:
+            eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
     # slower than the modeled rate. Bytes are already counted as HBM; here we derate the
@@ -1681,10 +1721,11 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
     eff, eff_rows = 1.0, 0.0
     for o in ops:
-        if o.loop_trip > 1 and o.tiles_output_dim and o.tile_rows_per_core > 0:
-            e = coarse_underfill_eff_matmul(o.tile_rows_per_core, p)
+        rpc = _tiled_rows(o)
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc > 0:
+            e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
-                eff, eff_rows = e, o.tile_rows_per_core
+                eff, eff_rows = e, rpc
     # Matmul compute (additive): sum the per-op compute term for any matmul ops.
     mm_us, mm_lines = 0.0, []
     for o in ops:
@@ -1880,10 +1921,11 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
     eff, eff_rows, eff_cols = 1.0, 0.0, 0.0
     for o in ops:
-        if o.loop_trip > 1 and o.tiles_output_dim and o.tile_rows_per_core > 0:
-            e = coarse_underfill_eff(o.tile_rows_per_core, _op_cols(o), p)
+        rpc = _tiled_rows(o)
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc > 0:
+            e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
-                eff, eff_rows, eff_cols = e, o.tile_rows_per_core, _op_cols(o)
+                eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
     t = predict_ops(ops, p)
     parts = "(R+W)/BW_PEAK + a*min(R,W)"
     if eff < 1.0:

@@ -30,6 +30,7 @@ fixture rather than splitting per source module.
 Regenerate with ``python3 docs/source/user_guide/examples/scratchpad/capture_op_features.py`` on a Spyre machine.
 """
 
+import dataclasses
 import json
 import math
 import os
@@ -195,6 +196,98 @@ class ResidencyTest(TestCase):
             with_residency(op, {a.name for a in op.args})
             self.assertEqual([a.mem for a in op.args], before)
             return
+
+
+class SymbolicTiledFeatureTest(TestCase):
+    """Coarse-tiled features carrying the co-optimizer's UNDECIDED symbols.
+
+    ``CoOptimizingAllocator._extract_op_features`` keys ``is_lx`` and the core
+    splits on the solver's own variables, so a coarse-tiled op reaches
+    ``predict_ops`` with a symbolic per-core tile height. Every tiling surface
+    keyed on it is a piecewise power law, and branching on a symbol raised
+    ``cannot determine truth value of Relational`` -- taking down the compile,
+    not just the objective (issue #4233).
+    """
+
+    #: What the allocator's symbols look like (see ``plan_solver.sym_is_lx`` /
+    #: ``sym_core_divs``): binary residency, positive integer split.
+    IS_LX = sympy.Symbol("is_lx_buf0", integer=True, nonnegative=True)
+    SPLIT = sympy.Symbol("output_split_buf0_d0", integer=True, positive=True)
+
+    #: Untiled row extent. A constant, not the capture's own: some captured
+    #: ``logical`` entries are NAMED dims (strings), and the tile height only has
+    #: to be symbolic in the right variables, not realistic.
+    ROWS = 1024
+
+    def _symbolize(self, op: OpFeatures, loop_trip: int = 8) -> OpFeatures:
+        """``op`` as the co-optimizing path presents it: symbolic residency on
+        every arg, and output-tiled with a symbolic per-core tile height."""
+        rows = self.ROWS
+        return dataclasses.replace(
+            op,
+            args=[dataclasses.replace(a, is_lx=self.IS_LX) for a in op.args],
+            loop_trip=loop_trip,
+            tiles_output_dim=True,
+            tile_rows_per_core=(rows / loop_trip * (1 - self.IS_LX) + rows * self.IS_LX)
+            / self.SPLIT,
+        )
+
+    def test_every_captured_op_builds_a_cost_expression_when_tiled(self):
+        checked = 0
+        for gname, bname, b in _entries():
+            for raw in b["features"][:2]:
+                if raw is None:
+                    continue
+                op = self._symbolize(op_from_dict(raw))
+                # The bug: this raised TypeError rather than returning anything.
+                expr = sympy.sympify(predict_ops([op]))
+                self.assertFalse(
+                    expr.free_symbols - {self.IS_LX},
+                    f"{gname}/{bname}: the tiling split leaked into the cost expr",
+                )
+                checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_the_tiled_cost_expression_stays_linearizable(self):
+        """``_SympyExprToCpSat`` handles Add/Mul/Min/Max and ``symbol**-1`` only.
+
+        A symbolic derate would be a ``Piecewise`` over a fractional ``Pow``,
+        which does not linearize -- CP-SAT then discards the WHOLE cost
+        objective and falls back to its lexicographic solve, so neutralising the
+        derate is what keeps the objective usable, not a shortcut around it.
+        """
+        for _, _, b in _entries():
+            raw = next((f for f in b["features"] if f is not None), None)
+            if raw is None:
+                continue
+            expr = sympy.sympify(predict_ops([self._symbolize(op_from_dict(raw))]))
+            self.assertFalse(expr.atoms(sympy.Piecewise))
+            for pow_ in expr.atoms(sympy.Pow):
+                self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
+
+    def test_a_loop_reread_arg_does_not_consult_symbolic_mem(self):
+        """``ArgTraffic.mem`` REJECTS a symbolic ``is_lx``, and
+        ``_loop_reread_bytes`` is reached unconditionally, so an output-tiled
+        matmul used to lose the whole objective to a ValueError."""
+        raw = next(
+            (
+                f
+                for _, _, b in _entries()
+                for f in b["features"]
+                if f is not None and f.get("is_matmul")
+            ),
+            None,
+        )
+        self.assertIsNotNone(raw, "fixture no longer holds a matmul")
+        op = self._symbolize(op_from_dict(raw))
+        op = dataclasses.replace(
+            op,
+            args=[
+                dataclasses.replace(a, loop_factor=4) if a.role == "input" else a
+                for a in op.args
+            ],
+        )
+        sympy.sympify(predict_ops([op]))  # ValueError before the fix
 
 
 if __name__ == "__main__":
