@@ -29,7 +29,7 @@ import math
 import os
 from typing import Mapping, Optional
 
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
 
 from .constants import BATCH_MATMUL_OP
@@ -523,6 +523,39 @@ def _relayout_features(op, out_dims):
         return zeros
 
 
+def _graph_boundary_names() -> tuple[set, set]:
+    """(graph input names, graph output names) of the graph being lowered.
+
+    Empty when there is no active ``V.graph`` (the extractor also runs from offline
+    tooling), which leaves every arg unstamped -- see ``ArgTraffic.is_boundary``.
+    """
+    try:
+        from torch._inductor.virtualized import V
+
+        return set(V.graph.graph_input_names), set(V.graph.get_output_names())
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return set(), set()
+
+
+def _writes_graph_output(op, graph_outputs: set) -> bool:
+    """Whether ``op``'s write is the externally-visible write of a graph output.
+
+    Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
+    writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
+    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
+    records.
+    """
+    try:
+        if op.get_name() in graph_outputs:
+            return True
+        layout = op.get_layout()
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            return layout.get_buffer().get_name() in graph_outputs
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        pass
+    return False
+
+
 def extract_op_features(
     op, work_slices=None, is_lx: Optional[Mapping[str, bool]] = None
 ) -> OpFeatures:
@@ -536,8 +569,14 @@ def extract_op_features(
     symbolic ``sym_is_lx``) consulted for each arg (the op's own output and
     every input read); a name absent from the map -- or an empty map -- falls
     back to the arg's committed layout.
+
+    Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
+    graph boundary, resolved against the arg's own role, so a buffer that is both a
+    graph input and a graph output (a returned view of an input; a mutated input that
+    is returned) needs no special case.
     """
     is_lx = is_lx or {}
+    graph_inputs, graph_outputs = _graph_boundary_names()
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -660,6 +699,9 @@ def extract_op_features(
             dims=list(out_dims),
             logical=list(out_size),
             loop_factor=out_factor,
+            # Against the op's BUFFER name (and its mutation target), not the
+            # operation name this arg carries.
+            is_boundary=_writes_graph_output(op, graph_outputs),
         )
     )
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
@@ -713,6 +755,7 @@ def extract_op_features(
                     if (_levels and index is not None)
                     else in_factor
                 ),
+                is_boundary=name in graph_inputs,
             )
         )
 
