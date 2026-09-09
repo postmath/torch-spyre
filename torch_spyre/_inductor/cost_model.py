@@ -146,6 +146,7 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 import dataclasses
 import math
 from collections.abc import Mapping, Sequence
+from typing import Optional
 
 import sympy
 
@@ -805,24 +806,23 @@ def _is_sym(*vals) -> bool:
     return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
 
 
-def _tiled_rows(o) -> float:
-    """``tile_rows_per_core``, or 0.0 (= N/A, no derate) when it is SYMBOLIC.
+def _tiled_rows(o) -> Optional[float]:
+    """``tile_rows_per_core``, or None (= N/A, no derate) when it is SYMBOLIC.
 
     On the co-optimizing path (``CoOptimizingAllocator._extract_op_features``) the
     features carry the solver's undecided ``is_lx``/``output_split`` as sympy symbols, so
     a coarse-tiled op arrives with a symbolic per-core tile height. Every tiling surface
     keyed on it -- ``coarse_underfill_eff``, ``coarse_underfill_eff_matmul``,
-    ``_lx_spill_working_set`` -- is a piecewise power law that BRANCHES on its argument,
-    which is not decidable over a symbol (issue #4233).
+    ``_lx_spill_working_set`` -- is a piecewise power law that *branches* on its
+    argument, which is not decidable over a symbol (issue #4233).
 
-    Neutralising the derate is the choice for now, not a placeholder, and the two
-    consumers disagree about why. CP-SAT LINEARIZES the expression: measured, a symbolic
-    branch does not linearize on this base and ``_SympyExprToCpSat`` then drops the cost
-    objective ENTIRELY for the lexicographic one -- worse than keeping the linear traffic
-    terms and losing only the derate. The annealer instead EVALUATES it
-    (``sa_cooptimizer._build_score_fn`` lambdifies over ``modules="math"``, #4164), where
-    a Piecewise and a fractional power would both be exact and free. So a symbolic derate
-    is already the better answer for one engine and still unusable for the other.
+    Neutralising the derate is the choice for now. CP-SAT *linearizes* the expression: measured, a
+    symbolic branch does not linearize on this base and ``_SympyExprToCpSat`` then drops the cost
+    objective entirely for the lexicographic one -- worse than keeping the linear traffic terms and
+    losing only the derate. The annealer instead *evaluates* it (``sa_cooptimizer._build_score_fn``
+    lambdifies over ``modules="math"``, #4164), where a Piecewise and a fractional power would both
+    be exact and free. So a symbolic derate is already the better answer for one engine and still
+    unusable for the other.
 
     What holds for both: the derate is bounded above by 1.0, so it can rank tilings
     against one another but never above not tiling (#4233) -- it was never the term that
@@ -831,7 +831,7 @@ def _tiled_rows(o) -> float:
     decision-dependent expressions, which is the part neither route prices today.
     """
     rpc = o.tile_rows_per_core
-    return 0.0 if _is_sym(rpc) else rpc
+    return None if _is_sym(rpc) else rpc
 
 
 def coarse_underfill_eff(
@@ -926,7 +926,7 @@ def _lx_spill_working_set(ops: list) -> float:
         # symbolic-aware `work_division.max`, so an unguarded symbolic `cols` propagates
         # into `ws` and only fails a frame later, at `_lx_spill_bw_derate`'s `ws <= cap`.
         cols = _op_cols(o)
-        if o.tiles_output_dim and rpc > 0 and not _is_sym(cols):
+        if o.tiles_output_dim and rpc and not _is_sym(cols):
             ws = max(ws, 2.0 * rpc * cols * o.dtype_bytes)
     return ws
 
@@ -1661,7 +1661,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     eff = 1.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc > 0:
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
             eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
@@ -1736,10 +1736,10 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     base = R / p.mm_bw_read_gbps + W / p.mm_bw_write_gbps
     turn = p.rw_turnaround_ns_per_byte * min(R, W)
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
-    eff, eff_rows = 1.0, 0.0
+    eff, eff_rows = 1.0, None
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc > 0:
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -1936,10 +1936,10 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     base = (R + W) / p.bw_peak_gbps
     turn = p.rw_turnaround_ns_per_byte * min(R, W)
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
-    eff, eff_rows, eff_cols = 1.0, 0.0, 0.0
+    eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc > 0:
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
