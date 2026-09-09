@@ -52,7 +52,8 @@ Model (per fused bundle / single-op kernel):
   pins such a buffer by CLONING it, and the clone still moves those bytes through HBM,
   so they stay charged when the buffer is LX-resident (``ArgTraffic.is_boundary``; issue
   #4271). The clone-in load is charged to the first bundle that reads the input, since
-  one clone serves the whole graph (``charge_boundary_reads_once``). Broadcast inputs
+  one clone serves the whole graph (``charge_boundary_reads_once`` clears
+  ``owns_boundary_charge`` on the rest, keeping them de-duplicable). Broadcast inputs
   are loaded ONCE and reused across the broadcast dim, so they are counted at their own
   (one-row/-col) DEVICE size -- NOT scaled up to the output size (the rung-6 runs proved
   a core does not re-read the operand per output element), but NOT dropped to zero
@@ -189,22 +190,35 @@ class ArgTraffic:
     # graph-input reads and graph-output write never collide. ``None`` = a record
     # captured before this field existed; the name heuristic below stands in.
     is_boundary: bool | None = None
+    # Whether THIS bundle pays the boundary transfer, as opposed to an earlier one
+    # that already did. Orthogonal to ``is_boundary``, which stays exactly as
+    # extraction stamped it: one clone serves the whole graph, so
+    # ``charge_boundary_reads_once`` clears this on every reader after the first
+    # while leaving the arg recognisable as a graph input -- which is also the key
+    # ``_fused_hbm_bytes`` de-duplicates on. Meaningless, and left True, on an arg
+    # that is not a boundary arg.
+    owns_boundary_charge: bool = True
 
     @property
     def is_graph_boundary(self) -> bool:
-        """Whether this arg is charged to HBM even when LX-resident (see
+        """Whether this arg's traffic crosses the graph boundary (see
         ``is_boundary``). Legacy records fall back to the graph-input naming
-        convention this model already used to de-duplicate external reads."""
+        convention this model already used to de-duplicate external reads. NOT the
+        same question as whether this bundle is charged for it -- see
+        ``owns_boundary_charge``."""
         if self.is_boundary is not None:
             return self.is_boundary
         return self.role == "input" and self.name.startswith("arg")
 
     def hbm_elems(self):
         """Device elements this arg moves through HBM, loop-scaled. Zero when the arg
-        is LX-resident -- unless it is a graph-boundary transfer, which residency
-        cannot remove. ``is_lx`` may be a solver decision variable, so the residency
-        factor stays arithmetic (``1 - is_lx``) rather than a branch."""
-        if self.is_graph_boundary:
+        is LX-resident -- unless this bundle pays a graph-boundary transfer, which
+        residency cannot remove. A boundary arg whose charge belongs to an earlier
+        bundle is priced like any other arg: the clone loaded it, so residency does
+        free this read, and without residency every bundle re-reads it from HBM.
+        ``is_lx`` may be a solver decision variable, so the residency factor stays
+        arithmetic (``1 - is_lx``) rather than a branch."""
+        if self.is_graph_boundary and self.owns_boundary_charge:
             return self.elems * self.loop_factor
         return self.elems * self.loop_factor * (1 - self.is_lx)
 
@@ -1824,10 +1838,17 @@ def charge_boundary_reads_once(bundles: list) -> list:
     the first reading bundle and clearing it in the rest prices exactly that one load, for
     any number of readers.
 
-    A no-op for an input that is not resident -- its bytes are charged by the residency
-    factor either way -- so this only redistributes the clone-in charge. Which bundle is
-    first does not depend on residency, so the rewrite is static and the objective stays
-    linear in the solver's ``sym_is_lx``.
+    What is cleared is ``owns_boundary_charge``, NOT ``is_boundary``. The latter is also
+    the key ``_fused_hbm_bytes`` de-duplicates external reads on, so un-stamping it would
+    charge a later multi-op bundle once PER READER -- the double-count that de-duplication
+    exists to prevent, and this is the shape it fires on (softmax reads its input in both
+    ``amax`` and ``sub``). Leaving the stamp intact also makes the rewrite idempotent and
+    independent of which bundle is first.
+
+    A later bundle's read is then priced like any other arg: freed by residency, because
+    the clone is what served it, and charged in full without residency, because every
+    bundle re-reads an HBM input. Which bundle is first does not depend on residency, so
+    the rewrite is static and the objective stays linear in the solver's ``sym_is_lx``.
     """
     seen: set = set()
     out = []
@@ -1843,7 +1864,7 @@ def charge_boundary_reads_once(bundles: list) -> list:
         for o in bundle:
             if any(a.role == "input" and a.name in again for a in o.args):
                 args = [
-                    dataclasses.replace(a, is_boundary=False)
+                    dataclasses.replace(a, owns_boundary_charge=False)
                     if a.role == "input" and a.name in again
                     else a
                     for a in o.args
@@ -1879,7 +1900,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         for a in o.args:
             bc = " broadcast (loaded once)" if a.broadcast else ""
             lf = f" xL={a.loop_factor}" if a.loop_factor > 1 else ""
-            bd = " graph boundary (charged despite LX)" if a.is_graph_boundary else ""
+            bd = ""
+            if a.is_graph_boundary:
+                bd = (
+                    " graph boundary (charged despite LX)"
+                    if a.owns_boundary_charge
+                    else " graph boundary (charged to an earlier bundle)"
+                )
             counted = a.hbm_elems() * o.dtype_bytes
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
