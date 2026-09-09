@@ -41,8 +41,13 @@ ELEMS, DTYPE = 1024, 2
 BYTES = ELEMS * DTYPE
 
 
-def _reader(name, out, *, input_name="arg0_1", resident=()):
-    """A pointwise op reading the graph input ``input_name`` and writing ``out``."""
+def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
+    """A pointwise op reading the graph input ``input_name`` and writing ``out``.
+
+    ``resident_expr`` puts the input's residency under a solver decision variable
+    instead of a bool, so a test can inspect the objective's slope.
+    """
+    in_is_lx = resident_expr if resident_expr is not None else input_name in resident
     return OpFeatures(
         name=name,
         is_reduction=False,
@@ -60,7 +65,7 @@ def _reader(name, out, *, input_name="arg0_1", resident=()):
             ArgTraffic(
                 name=input_name,
                 role="input",
-                is_lx=input_name in resident,
+                is_lx=in_is_lx,
                 elems=ELEMS,
                 is_boundary=True,
             ),
@@ -128,6 +133,67 @@ def test_charging_the_clone_in_once_does_not_disturb_a_non_resident_input():
     # by every bundle that reads it either way.
     bundles = [[_reader("C", "buf1")], [_reader("D", "buf2")]]
     assert _read_bytes(bundles) == 2 * BYTES
+
+
+def test_a_later_bundle_with_several_readers_still_loads_the_input_once():
+    # The regression the once-rule is easy to write wrong: clearing the boundary STAMP
+    # (rather than only the charge) would also clear the key ``_fused_hbm_bytes``
+    # de-duplicates external reads on, so a fused kernel reading the input in three ops
+    # would be charged three loads instead of one. Bundle 2 is the softmax shape --
+    # ``amax`` and ``sub`` reading the same input in one kernel.
+    bundles = [
+        [_reader("C", "buf1")],
+        [_reader("D", "buf2"), _reader("E", "buf3"), _reader("F", "buf4")],
+    ]
+    assert [_fused_hbm_bytes(b)[0] for b in charge_boundary_reads_once(bundles)] == [
+        BYTES,
+        BYTES,
+    ]
+
+
+def test_residency_frees_a_later_multi_reader_bundle_entirely():
+    # Same shape, resident: the clone pays one load in bundle 1 and every reader in
+    # bundle 2 is served from LX. The saving must be one load, not one per reader.
+    resident = {"arg0_1"}
+    bundles = [
+        [_reader("C", "buf1", resident=resident)],
+        [
+            _reader("D", "buf2", resident=resident),
+            _reader("E", "buf3", resident=resident),
+        ],
+    ]
+    assert [_fused_hbm_bytes(b)[0] for b in charge_boundary_reads_once(bundles)] == [
+        BYTES,
+        0,
+    ]
+
+
+def test_a_later_bundles_readers_stay_linear_in_symbolic_residency():
+    # The slope, not just the constant, has to be right: an over-counted later bundle
+    # over-rewards pinning the input by (readers - 1)x in the solver's objective.
+    is_lx = sympy.Symbol("is_lx")
+    bundles = [
+        [_reader("C", "buf1", resident_expr=is_lx)],
+        [
+            _reader("D", "buf2", resident_expr=is_lx),
+            _reader("E", "buf3", resident_expr=is_lx),
+        ],
+    ]
+    rewritten = charge_boundary_reads_once(bundles)
+    assert (
+        sympy.simplify(_fused_hbm_bytes(rewritten[1])[0] - (BYTES - BYTES * is_lx)) == 0
+    )
+
+
+def test_the_once_rule_is_idempotent():
+    # ``is_boundary`` survives the rewrite, so the second pass recomputes the same
+    # "already seen" set and changes nothing.
+    bundles = [[_reader("C", "buf1")], [_reader("D", "buf2"), _reader("E", "buf3")]]
+    once = charge_boundary_reads_once(bundles)
+    twice = charge_boundary_reads_once(once)
+    assert [_fused_hbm_bytes(b)[0] for b in once] == [
+        _fused_hbm_bytes(b)[0] for b in twice
+    ]
 
 
 # --------------------------------------------------------------- output side
@@ -244,8 +310,106 @@ def test_a_returned_input_has_no_output_side_write_to_charge():
     assert not dcm._writes_graph_output(_op("buf1", object()), outputs)
 
 
-def test_boundary_names_are_empty_without_a_graph():
+def test_boundary_names_are_unavailable_without_a_graph():
     """The extractor also runs from offline tooling; a missing ``V.graph`` must leave
     args unstamped rather than raise."""
-    ins, outs = dcm._graph_boundary_names()
-    assert isinstance(ins, set) and isinstance(outs, set)
+    assert dcm._graph_boundary_names() is None
+
+
+def test_no_graph_leaves_args_unstamped_rather_than_stamping_them_false():
+    """``None`` and ``False`` are NOT interchangeable here. ``False`` is authoritative,
+    so it would suppress the naming-convention fallback -- and with it the external-read
+    de-duplication in ``_fused_hbm_bytes``, which keys on the same predicate."""
+    unstamped = ArgTraffic(
+        name="arg0_1", role="input", is_lx=False, elems=ELEMS, is_boundary=None
+    )
+    stamped_false = ArgTraffic(
+        name="arg0_1", role="input", is_lx=False, elems=ELEMS, is_boundary=False
+    )
+    assert unstamped.is_graph_boundary
+    assert not stamped_false.is_graph_boundary
+
+
+# ------------------------------------------------- stamping, through the extractor
+
+
+class _StubGraph:
+    """Minimal stand-in for ``GraphLowering``. ``extract_op_features`` asks a graph for
+    the two boundary name sets and for buffers it may not resolve; everything else it
+    reaches for is on the op."""
+
+    def __init__(self, inputs, outputs):
+        self.graph_input_names = list(inputs)
+        self._outputs = list(outputs)
+
+    def get_output_names(self):
+        return list(self._outputs)
+
+    def get_buffer(self, name):
+        return None
+
+
+def _extractable_op(name, reads):
+    """An op the real extractor can walk: one HBM write and one read per name."""
+    layout = SimpleNamespace(allocation=None, device_layout=None)
+    return SimpleNamespace(
+        name=name,
+        data=None,
+        get_name=lambda: name,
+        get_operation_name=lambda: f"op_{name}",
+        get_layout=lambda: layout,
+        get_dtype=lambda: SimpleNamespace(itemsize=2),
+        get_size=lambda: [64],
+        get_read_writes=lambda: SimpleNamespace(
+            reads=[SimpleNamespace(name=r, index=None) for r in reads],
+            writes=[],
+        ),
+    )
+
+
+def _stamps(op, graph):
+    """{(role, name): is_boundary} as the real extractor stamps them under ``graph``."""
+    from torch._inductor.virtualized import V
+
+    with V.set_graph_handler(graph):
+        feats = dcm.extract_op_features(op)
+    return {(a.role, a.name): a.is_boundary for a in feats.args}
+
+
+def test_the_extractor_stamps_reads_of_graph_inputs():
+    """Covers the wiring itself: without this, the stamping line could be deleted and
+    every other test in this file would still pass."""
+    graph = _StubGraph(inputs=["arg0_1"], outputs=["buf9"])
+    stamps = _stamps(_extractable_op("buf1", ["arg0_1", "buf0"]), graph)
+    assert stamps[("input", "arg0_1")] is True
+    assert stamps[("input", "buf0")] is False
+
+
+def test_the_extractor_stamps_the_write_of_a_graph_output():
+    graph = _StubGraph(inputs=["arg0_1"], outputs=["buf1"])
+    assert _stamps(_extractable_op("buf1", ["arg0_1"]), graph)[("output", "op_buf1")]
+    graph = _StubGraph(inputs=["arg0_1"], outputs=["buf9"])
+    assert not _stamps(_extractable_op("buf1", ["arg0_1"]), graph)[
+        ("output", "op_buf1")
+    ]
+
+
+def test_a_buffer_that_is_both_input_and_output_is_stamped_per_role():
+    """``x.add_(1); return x``: the read of ``arg0_1`` and the write that returns it are
+    two distinct transfers, and resolving the stamp per (arg, role) is what keeps them
+    from colliding."""
+    graph = _StubGraph(inputs=["arg0_1"], outputs=["arg0_1", "buf1"])
+    stamps = _stamps(_extractable_op("buf1", ["arg0_1"]), graph)
+    assert stamps[("input", "arg0_1")] is True
+    assert stamps[("output", "op_buf1")] is True
+
+
+def test_the_per_arg_io_breakdown_sums_to_its_own_total():
+    """``LAST_IO`` feeds ``profile_ops.py``, whose printed lines ``parse_sweep_logs.py``
+    reads back. Its per-arg ``hbm_counted`` must use the same accounting as the total it
+    is printed beside -- a resident boundary arg is the case where the two can diverge."""
+    feats = [_reader("C", "buf1", resident={"arg0_1"})]
+    dcm._record_last_io(feats)
+    counted = sum(a["hbm_counted"] for o in dcm.LAST_IO["ops"] for a in o["args"])
+    # The clone-in load of the resident input, plus the write of the HBM output.
+    assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
