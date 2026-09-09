@@ -523,18 +523,22 @@ def _relayout_features(op, out_dims):
         return zeros
 
 
-def _graph_boundary_names() -> tuple[set, set]:
+def _graph_boundary_names() -> tuple[set, set] | None:
     """(graph input names, graph output names) of the graph being lowered.
 
-    Empty when there is no active ``V.graph`` (the extractor also runs from offline
-    tooling), which leaves every arg unstamped -- see ``ArgTraffic.is_boundary``.
+    ``None`` when there is no active ``V.graph`` (the extractor also runs from offline
+    tooling, and ``build_report`` is unit-testable without a ``GraphLowering``). The
+    callers leave every arg unstamped in that case, so ``ArgTraffic.is_boundary`` falls
+    back to the naming convention -- stamping ``False`` instead would be taken as an
+    authoritative "not a boundary arg" and would silently disable the external-input
+    de-duplication in ``_fused_hbm_bytes`` as well.
     """
     try:
         from torch._inductor.virtualized import V
 
         return set(V.graph.graph_input_names), set(V.graph.get_output_names())
     except Exception:  # noqa: BLE001 - best-effort feature extraction
-        return set(), set()
+        return None
 
 
 def _writes_graph_output(op, graph_outputs: set) -> bool:
@@ -576,7 +580,8 @@ def extract_op_features(
     is returned) needs no special case.
     """
     is_lx = is_lx or {}
-    graph_inputs, graph_outputs = _graph_boundary_names()
+    boundary = _graph_boundary_names()
+    graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -700,8 +705,13 @@ def extract_op_features(
             logical=list(out_size),
             loop_factor=out_factor,
             # Against the op's BUFFER name (and its mutation target), not the
-            # operation name this arg carries.
-            is_boundary=_writes_graph_output(op, graph_outputs),
+            # operation name this arg carries. ``None`` (no graph) means
+            # unstamped, not "not a boundary" -- see _graph_boundary_names.
+            is_boundary=(
+                None
+                if graph_outputs is None
+                else _writes_graph_output(op, graph_outputs)
+            ),
         )
     )
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
@@ -755,7 +765,7 @@ def extract_op_features(
                     if (_levels and index is not None)
                     else in_factor
                 ),
-                is_boundary=name in graph_inputs,
+                is_boundary=(None if graph_inputs is None else name in graph_inputs),
             )
         )
 
@@ -817,10 +827,12 @@ def _record_last_io(feats: list) -> None:
         args = []
         for a in o.args:
             bs = a.elems * o.dtype_bytes
-            # Every HBM arg counts at its own size x loop_factor (L for a per-tile
-            # accumulator re-accessed each loop iteration, 1 otherwise); broadcast
-            # operands carry their small one-load size (counted, not zeroed). LX ~free.
-            counted = bs * a.loop_factor if a.mem == "hbm" else 0
+            # Same accounting as ``hbm_bytes()`` below, so the per-arg breakdown sums
+            # to the total: own size x loop_factor for an HBM arg (L for a per-tile
+            # accumulator re-accessed each loop iteration, 1 otherwise), the small
+            # one-load size for a broadcast operand, ~free for LX -- except a graph
+            # boundary this bundle pays for, which stays charged despite LX.
+            counted = a.hbm_elems() * o.dtype_bytes
             args.append(
                 {
                     "name": a.name,
