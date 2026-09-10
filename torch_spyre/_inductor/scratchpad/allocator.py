@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
-from typing import Any, Callable, cast, Optional
+from typing import Any, Callable, cast, NamedTuple, Optional
 
 import sympy
 import torch
@@ -58,7 +58,9 @@ from torch_spyre._inductor.work_division import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.division_generation import (
+    OpSplitSpace,
     ResidencyEdge,
+    build_op_split_space,
     build_residency_edge,
     _core_division,
     _view_for_div,
@@ -2007,6 +2009,21 @@ def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int
     return index
 
 
+class _DivisionMap(NamedTuple):
+    """Every op's core-division candidates, and which of those lists are the
+    whole legal space.
+
+    A generated division has to be one the enumeration would have carried, so a
+    solver may only generate for an op in ``enumerated``. An op pinned to its
+    committed division (an offset-mutation component) or one whose candidates
+    came from the pruning heuristic is deliberately narrower than its legal
+    space, and is absent.
+    """
+
+    divisions: dict[str, list[CoreDivision]]
+    enumerated: set[str]
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2059,7 +2076,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
         in_place = self._determine_in_place_division_invariant(graph)
-        divisions = self._division_map(graph, allow_deferred_read_candidates=True)
+        division_map = self._division_map(graph, allow_deferred_read_candidates=True)
+        divisions = division_map.divisions
         pending = {
             op.name: op
             for op in graph.operations
@@ -2068,7 +2086,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             and divisions[op.name] != [_fixed_core_division(op)]
         }
         while True:
-            buffers = self._build_cd_bound_buffers(graph, in_place, divisions)
+            buffers = self._build_cd_bound_buffers(graph, in_place, division_map)
             if not pending:
                 return buffers
             pricing = {
@@ -2094,6 +2112,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divisions[name] = _legal_fixed_division(
                     op, [fixed], "unproved or unpriced direct read"
                 )
+                division_map.enumerated.discard(name)
             # Menus affect input clones and relayouts. Rebuild their actual
             # allocation context and recheck the remaining expanded reads.
             # Rejection is monotonic, so this terminates after at most one pin
@@ -2401,7 +2420,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
     def _division_map(
         self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
-    ) -> dict[str, list[CoreDivision]]:
+    ) -> "_DivisionMap":
         """Per-op core-division candidates for the joint-division solve.
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
@@ -2447,6 +2466,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             },
         )
         result = {}
+        enumerated = set()
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
@@ -2496,7 +2516,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, [_fixed_core_division(op)], "empty pruned candidate set"
                     )
             else:
-                divs = self._enumerate_core_divisions(op, max_cores)
+                divs, is_enumeration = self._enumerate_core_divisions(op, max_cores)
+                if is_enumeration:
+                    enumerated.add(op.name)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
             # The core budget is an invariant of the MENU, not of its consumers: both
@@ -2515,27 +2537,29 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             result[op.name] = divs
 
-        return result
+        return _DivisionMap(result, enumerated)
 
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
-    ) -> list[CoreDivision]:
-        """Enumerate and deduplicate symbol-keyed candidates for one operation.
+    ) -> tuple[list[CoreDivision], bool]:
+        """Enumerate and deduplicate symbol-keyed candidates for one operation,
+        with whether they are the *whole* legal cross product.
 
         Operations without an enumerable concrete iteration space retain their
-        committed division. Deduplication uses local symbol names only within
-        this operation; cross-operation compatibility is derived from
-        ``PerCoreView`` instead.
+        committed division, and say so: a solver may only generate divisions of
+        its own where the candidates it was handed are the entire legal space.
+        Deduplication uses local symbol names only within this operation;
+        cross-operation compatibility is derived from ``PerCoreView`` instead.
         """
         fixed = [_fixed_core_division(op)]
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
         ):
-            return fixed
+            return fixed, False
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            return _legal_fixed_division(op, fixed, str(exc))
+            return _legal_fixed_division(op, fixed, str(exc)), False
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         for candidate in candidates:
@@ -2544,7 +2568,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
-        return cds or _legal_fixed_division(op, fixed, "no enumerable candidate")
+        if cds:
+            return cds, True
+        return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
 
     def _commit_divisions(
         self,
@@ -2666,16 +2692,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self,
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
-        divisions: dict[str, list[CoreDivision]],
+        division_map: "_DivisionMap",
     ) -> list[CoreDivisionBuffer]:
         """Build the ``CoreDivisionBuffer``s handed to the solver.
 
-        Every buffer carries its candidate ``divisions`` and is sized by its
+        Every buffer carries its candidate divisions and is sized by its
         *total* device footprint plus its producer edges (``parent_proj``); the
         solver picks a division and divides by its ``output_partition``.
         Counted-loop lifetimes still filter unsafe in-place handoffs before the
         solver compares those total footprints.
+
+        Each buffer also carries the same two relations *per candidate*, for a
+        solver that generates divisions rather than indexing the list: the
+        residency edge to each divided producer, and -- where the candidates are
+        the whole legal space and the solver is one that generates (see
+        :attr:`_solver_generates_divisions`) -- its op's split space, built with
+        this buffer's own cost symbols so a generated division stays priceable.
         """
+        divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
         self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
@@ -2770,6 +2804,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
+            residency_edges = self._parent_residency_edges(
+                op, parent_proj, op_by_name, prep_cache, residency_by_buf
+            )
             cd_parent_matches = self._cd_parent_matches(
                 op,
                 buf_divisions,
@@ -2778,6 +2815,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 op_by_name,
                 prep_cache,
                 residency_by_buf,
+                edges=residency_edges,
             )
             cd_parent_relayouts = self._cd_parent_relayouts(
                 graph,
@@ -2856,27 +2894,33 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 ):
                     parents.append(clone_name)
 
-            buffers.append(
-                CoreDivisionBuffer(
-                    output_name,
-                    size,
-                    uses,
-                    # An op output is a computed buffer: ``uses[0]`` is the
-                    # producing write, as on the placement path above. (Only the
-                    # input-clone loop above sets this True.)
-                    first_use_is_read=False,
-                    in_place_parents=parents,
-                    core_divisions=buf_divisions,
-                    parents=parent_proj,
-                    cd_parent_matches=cd_parent_matches,
-                    cd_parent_relayouts=cd_parent_relayouts,
-                    residency_reason=residency_reason,
-                    lifetime_end_override=lifetime_end_overrides.get(output_name),
-                    boundary=BufferType.Output
-                    if output_name in graph_output_names
-                    else BufferType.Intermediate,
-                )
+            buffer = CoreDivisionBuffer(
+                output_name,
+                size,
+                uses,
+                # An op output is a computed buffer: ``uses[0]`` is the
+                # producing write, as on the placement path above. (Only the
+                # input-clone loop above sets this True.)
+                first_use_is_read=False,
+                in_place_parents=parents,
+                core_divisions=buf_divisions,
+                parents=parent_proj,
+                cd_parent_matches=cd_parent_matches,
+                cd_parent_relayouts=cd_parent_relayouts,
+                residency_edges=residency_edges,
+                residency_reason=residency_reason,
+                lifetime_end_override=lifetime_end_overrides.get(output_name),
+                boundary=BufferType.Output
+                if output_name in graph_output_names
+                else BufferType.Intermediate,
             )
+            if (
+                op is not None
+                and output_name in division_map.enumerated
+                and self._solver_generates_divisions
+            ):
+                buffer.division_space = self._division_space(op, buffer)
+            buffers.append(buffer)
         buffers.extend(self._relayout_copy_buffers(buffers, self.size))
         return buffers
 
@@ -2980,6 +3024,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 capacity,
             )
         return copies
+
+    @property
+    def _solver_generates_divisions(self) -> bool:
+        """Whether the solver this allocator feeds generates divisions at all.
+
+        Only :class:`SaCoOptimizingSolver` does; the CP-SAT and DFS engines read
+        ``core_divisions`` and ``cd_parent_matches`` exactly as before and would
+        never look at a space. Building one is not free -- a
+        ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
+        engine that would ignore the answer does not pay for it.
+        """
+        return self.layout_planning is SaCoOptimizingSolver
+
+    @staticmethod
+    def _division_space(
+        op: Operation, buffer: CoreDivisionBuffer
+    ) -> Optional[OpSplitSpace]:
+        """The op's split space, priced through ``buffer``'s own cost symbols.
+
+        The declaration is this buffer's ``sym_core_divs``, which is derived from
+        the candidate list -- so it is available only once the buffer exists,
+        which is why the space is attached here rather than where the candidates
+        are enumerated. A split on an axis outside it would be priced as
+        unsplit, so the space is what holds a generated division to it.
+        """
+        return build_op_split_space(op, config.sencores, buffer.sym_core_divs)
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]
@@ -3101,29 +3171,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # >=1-division invariant.
         return clone_divs, matches
 
-    def _cd_parent_matches(
-        self,
+    @staticmethod
+    def _parent_residency_edges(
         consumer_op: Optional[Operation],
-        consumer_divs: list[CoreDivision],
         parent_names: list[str],
-        divisions: dict[str, list[CoreDivision]],
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
-    ) -> dict[str, list[tuple[int, int]]]:
-        """Physical slicing-match pairs for each divided producer this op reads.
-
-        One :class:`ResidencyEdge` per producer decides both which candidate
-        pairs are compatible and which producers are excluded from matching
-        altogether; this is the pair-table materialization of it. The pairing is
-        the per-core-view comparison ``get_ncores_for_buffers`` uses -- correct
-        across reductions/reshapes, where a coeff-keyed signature would conflate
-        axes.
-        """
+    ) -> dict[str, ResidencyEdge]:
+        """One :class:`ResidencyEdge` per divided producer this op reads, which
+        decides both which candidate pairs are compatible and which producers
+        are excluded from matching altogether. A producer with no entry can host
+        no residency for this consumer at all."""
         if consumer_op is None:
             return {}
-        matches: dict[str, list[tuple[int, int]]] = {}
         consumer_reads = op_read_writes(consumer_op).reads
+        edges: dict[str, ResidencyEdge] = {}
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
@@ -3135,13 +3198,41 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 residency_by_buf.get(parent, "not in graph"),
                 prep_cache,
             )
-            if edge is None:
-                continue
-            matches[parent] = edge.match_pairs(
+            if edge is not None:
+                edges[parent] = edge
+        return edges
+
+    def _cd_parent_matches(
+        self,
+        consumer_op: Optional[Operation],
+        consumer_divs: list[CoreDivision],
+        parent_names: list[str],
+        divisions: dict[str, list[CoreDivision]],
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        residency_by_buf: dict[str, Optional[str]],
+        edges: Optional[dict[str, ResidencyEdge]] = None,
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Physical slicing-match pairs for each divided producer this op reads:
+        the pair-table materialization of :meth:`_parent_residency_edges`.
+
+        The pairing is the per-core-view comparison ``get_ncores_for_buffers``
+        uses -- correct across reductions/reshapes, where a coeff-keyed
+        signature would conflate axes. ``edges`` passes in an already-built
+        edge set; a caller that keeps the edges themselves still goes through
+        here, so this stays the one place the table is produced.
+        """
+        if edges is None:
+            edges = self._parent_residency_edges(
+                consumer_op, parent_names, op_by_name, prep_cache, residency_by_buf
+            )
+        return {
+            parent: edge.match_pairs(
                 [cd.splits for cd in divisions[parent]],
                 [cd.splits for cd in consumer_divs],
             )
-        return matches
+            for parent, edge in edges.items()
+        }
 
     @staticmethod
     def _cap_relayout_groups(

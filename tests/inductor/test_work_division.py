@@ -2182,7 +2182,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
             patch.object(allocator, "_enumerate_core_divisions") as enumerate_divs,
         ):
-            divisions = allocator._division_map(graph)
+            divisions = allocator._division_map(graph).divisions
 
         self.assertEqual(divisions[op.name], [fixed])
         enumerate_divs.assert_not_called()
@@ -2262,7 +2262,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 side_effect=lambda _op, splits: splits == safe,
             ) as is_legal,
         ):
-            divisions = allocator._division_map(graph)[op.name]
+            division_map = allocator._division_map(graph)
+            divisions = division_map.divisions[op.name]
 
         self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
         self.assertEqual(is_legal.call_args_list[0].args[1], safe)
@@ -2316,8 +2317,11 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 return_value=True,
             ),
         ):
+            # Not an enumeration, so a solver may not generate divisions for
+            # this op: the committed one is all it is allowed.
             self.assertEqual(
-                allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
+                allocator._enumerate_core_divisions(op, max_cores=32),
+                ([fixed], False),
             )
 
     def test_over_budget_candidate_menu_is_rejected(self):
