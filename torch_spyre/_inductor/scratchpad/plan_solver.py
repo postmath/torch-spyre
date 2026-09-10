@@ -326,9 +326,8 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # Empty where the allocator has not built them (they need the live ops).
     residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
     # This buffer's producing op's legal divisions as a space to move in --
-    # ``core_divisions`` without materializing it. ``None`` for a buffer whose
-    # menu is not an enumeration to begin with: an input clone, a non-pointwise
-    # op, an op pinned to its committed division.
+    # ``core_divisions`` without materializing it. ``None`` where the allocator
+    # built none (see ``allocator._DivisionMap``).
     division_space: Optional["OpSplitSpace"] = None
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
