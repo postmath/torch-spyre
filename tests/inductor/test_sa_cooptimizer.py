@@ -48,8 +48,8 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     DivisionConfig,
     SaCoOptimizingSolver,
     _canonical_key,
-    _undeclared_splits,
 )
+from torch_spyre._inductor.scratchpad.division_generation import undeclared_splits
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
 )
@@ -1340,7 +1340,9 @@ class ConfigDeclarationTest(TestCase):
                     split += bool(config.output_splits)
                     reduction += bool(config.reduction_splits)
                     self.assertEqual(
-                        _undeclared_splits(config, declared), set(), f"{case}[{gi}]"
+                        undeclared_splits(config.division, declared),
+                        set(),
+                        f"{case}[{gi}]",
                     )
         # Non-vacuity: the corpus has to hold configs that actually split, on
         # both axis kinds, or an empty-set check would pass on nothing.
@@ -1354,7 +1356,7 @@ class ConfigDeclarationTest(TestCase):
         solver._precompute_topology()
         declared = solver._sym_core_divs[0]
         stray = _config(CoreDivision(output_splits={99: 2}, reduction_splits={7: 2}))
-        self.assertEqual(_undeclared_splits(stray, declared), {99, 7})
+        self.assertEqual(undeclared_splits(stray.division, declared), {99, 7})
 
     def test_a_menu_may_carry_the_same_choice_twice(self):
         # Real menus do: a factor-1 axis is dropped from the sparse split map, so

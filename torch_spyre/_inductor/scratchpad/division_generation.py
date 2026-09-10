@@ -22,24 +22,34 @@ candidate at a time. This module holds the per-candidate side:
 * :func:`_core_division` classifies a symbol-keyed split map into the output /
   reduction split pair a :class:`CoreDivision` carries, and
   :func:`_division_splits` restores the complete map from it;
+* :class:`OpSplitSpace` answers what the enumeration is a cross product over --
+  the axes, each axis's legal factors, and whether a proposed split is legal --
+  so a caller can walk the space instead of materializing it, and
+  :meth:`OpSplitSpace.neighbours` is the move alphabet that walk proposes from;
 * :class:`ResidencyEdge` owns one producer-buffer -> consumer edge, both the
   geometry (does this pair of candidates slice the buffer identically) and the
-  policy filters that decide a candidate can host a readable residency at all.
+  policy filters that decide a candidate can host a readable residency at all;
+  :meth:`ResidencyEdge.consumer_division_for` and its mirror *construct* the
+  other end's division rather than looking it up.
 
 ``allocator.py`` materializes the edge relation as the ``cd_parent_matches``
-pair table every engine consumes today.
+pair table every engine consumes today. Nothing here decides *which* candidate
+to take: the space and the edge are pure oracles, so a search owns its own
+proposal distribution and its own randomness.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Iterable, Sequence
 from typing import Optional
 
 import sympy
 from torch._inductor.dependencies import Dep, MemoryDep
-from torch._inductor.ir import Operation
+from torch._inductor.ir import ComputedBuffer, Operation, Pointwise, Reduction
 
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
+    invert_per_core_view,
     iteration_space_from_op,
     op_read_writes,
     op_short_name,
@@ -48,6 +58,10 @@ from torch_spyre._inductor.pass_utils import (
     _prepare_per_core_view,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
+from torch_spyre._inductor.work_division import (
+    WorkDivisionContext,
+    work_division_context_for_op,
+)
 
 
 def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
@@ -88,12 +102,19 @@ def _view_for_div(
     keeps their preps distinct while a parent read by several consumers reuses
     its write-view prep.
     """
+    return _per_core_view_from_prep(
+        _prep_for(op, dep, buf_name, prep_cache),
+        _division_splits(op, division),
+        division.reduction_splits,
+    )
+
+
+def _prep_for(op: Operation, dep: MemoryDep, buf_name: str, prep_cache: dict):
+    """The candidate-invariant view prep for one ``(op, dep, buf_name)``."""
     key = (op.get_name(), dep, buf_name)
     if key not in prep_cache:
         prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
-    return _per_core_view_from_prep(
-        prep_cache[key], _division_splits(op, division), division.reduction_splits
-    )
+    return prep_cache[key]
 
 
 def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
@@ -117,6 +138,152 @@ def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
             read_syms |= set(r.index.free_symbols)
     # A write-only free symbol means the clone expands (broadcasts) that dim.
     return bool(set(write.index.free_symbols) - read_syms)
+
+
+def undeclared_splits(division: CoreDivision, sym_core_divs: tuple[dict, dict]) -> set:
+    """The split keys of ``division`` that ``sym_core_divs`` declares no symbol
+    for.
+
+    A solver prices a division through the symbols its buffer declares -- one
+    per stride coefficient seen across an enumerated menu. A split on an axis
+    outside that declaration is priced at the symbol's default of ``1`` rather
+    than rejected, so it is a wrong answer and not a failure. Empty is the
+    contract; a generator has to be held to it, which is why generation stays
+    inside the declaration rather than widening it.
+    """
+    out_syms, red_syms = sym_core_divs
+    return (set(division.output_splits) - set(out_syms)) | (
+        set(division.reduction_splits) - set(red_syms)
+    )
+
+
+@dataclass
+class OpSplitSpace:
+    """One op's legal core divisions as a space to move in, not a list.
+
+    Everything :func:`enumerate_work_division_candidates` needs, asked one
+    candidate at a time: which axes there are, what factors each admits, and
+    whether a proposed split map is legal. The enumerated menu is the cross
+    product over exactly these answers, so a division this space admits is one
+    the menu would have carried -- generation changes when a candidate is
+    materialized, not which candidates exist.
+
+    Two things narrow it beyond ``WorkDivisionContext.is_legal``: the
+    ``declaration`` (see :func:`undeclared_splits`), and the split roles. Which
+    axes are *output* axes and which are *reduction* axes is a property of the
+    op's write index rather than of a candidate, so it is derived once here and
+    :meth:`division` classifies without touching sympy again.
+    """
+
+    op: Operation
+    context: WorkDivisionContext
+    # The buffer's ``sym_core_divs``; ``None`` for a caller with no cost
+    # expression to price against, which then constrains nothing.
+    declaration: Optional[tuple[dict, dict]]
+    # Axes whose factor slices the op's output (the rest are reduction axes).
+    output_axes: frozenset
+    factor_domains: dict[sympy.Symbol, list[int]]
+    _neighbours: dict[tuple, list[CoreDivision]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    @property
+    def axes(self) -> list[sympy.Symbol]:
+        return self.context.axes
+
+    def splits(self, division: CoreDivision) -> dict[sympy.Symbol, int]:
+        """``division`` as a complete factor per axis -- what this space moves
+        in, where a :class:`CoreDivision` keeps only the factors above 1."""
+        return {
+            axis: int(
+                division.output_splits.get(axis, division.reduction_splits.get(axis, 1))
+            )
+            for axis in self.axes
+        }
+
+    def division(self, splits: dict[sympy.Symbol, int]) -> CoreDivision:
+        """``splits`` as a :class:`CoreDivision`, without re-deriving the roles
+        per call. Owes the same answer as :func:`_core_division`, which
+        ``test_work_division.py`` pins over the candidate corpus."""
+        return CoreDivision(
+            output_splits={
+                axis: int(factor)
+                for axis, factor in splits.items()
+                if factor > 1 and axis in self.output_axes
+            },
+            reduction_splits={
+                axis: int(factor)
+                for axis, factor in splits.items()
+                if factor > 1 and axis not in self.output_axes
+            },
+        )
+
+    def admits(self, splits: dict[sympy.Symbol, int]) -> bool:
+        """Whether this op may take ``splits``: legal on every count the
+        context knows, and priceable through the declaration."""
+        if not self.context.is_legal(splits):
+            return False
+        if self.declaration is None:
+            return True
+        return not undeclared_splits(self.division(splits), self.declaration)
+
+    def neighbours(self, division: CoreDivision) -> list[CoreDivision]:
+        """The divisions one axis away from ``division``: for each axis, every
+        other factor its domain admits, keeping only the legal results.
+
+        This is the move alphabet a generating search proposes from -- a short
+        list per axis (~7 factors, measured), so there is nothing to sample over
+        with a temperature-dependent scale. Ordered by axis then by factor, and
+        memoized, since a search revisits states.
+        """
+        current = self.splits(division)
+        key = tuple(current[axis] for axis in self.axes)
+        if key not in self._neighbours:
+            out = []
+            for axis in self.axes:
+                for factor in self.factor_domains[axis]:
+                    if factor == current[axis]:
+                        continue
+                    candidate = {**current, axis: factor}
+                    if self.admits(candidate):
+                        out.append(self.division(candidate))
+            self._neighbours[key] = out
+        return self._neighbours[key]
+
+
+def build_op_split_space(
+    op: Operation,
+    max_cores: int,
+    declaration: Optional[tuple[dict, dict]] = None,
+) -> Optional[OpSplitSpace]:
+    """The :class:`OpSplitSpace` for ``op``, or ``None`` when it has no
+    enumerable one.
+
+    The gate is ``_enumerate_core_divisions``': an op that is not a pointwise or
+    reduction ``ComputedBuffer``, or whose context cannot be derived, keeps its
+    committed division instead -- so exactly the ops the menu path leaves with a
+    single candidate are the ops generation has nothing to offer.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(
+        op.data, (Pointwise, Reduction)
+    ):
+        return None
+    try:
+        context = work_division_context_for_op(op, max_cores)
+    except Unsupported:
+        return None
+    rw = op_read_writes(op)
+    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write is None:
+        return None
+    axes = context.axes
+    return OpSplitSpace(
+        op=op,
+        context=context,
+        declaration=declaration,
+        output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
+        factor_domains={axis: context.factor_domain(axis) for axis in axes},
+    )
 
 
 @dataclass
@@ -189,6 +356,70 @@ class ResidencyEdge:
         return parent_view is not None and parent_view == self.consumer_view(
             consumer_division
         )
+
+    def consumer_division_for(
+        self, parent_division: CoreDivision, consumer_space: OpSplitSpace
+    ) -> Optional[CoreDivision]:
+        """The consumer division that reads this buffer exactly the way
+        ``parent_division`` writes it, or ``None`` if the consumer cannot read
+        it that way at all.
+
+        What a search propagating a division across this edge asks instead of
+        scanning the consumer's menu for a compatible entry. The inverse
+        proposes and :meth:`compatible` confirms -- on this side that is a
+        tautology, since the inverse only returns a division whose read-view is
+        the target, but it is the same call the other direction needs and it
+        keeps the policy filters in one place.
+        """
+        target = self.parent_view(parent_division)
+        if target is None:
+            return None
+        return self._inverse(
+            self.consumer_op, self.read_dep, target, consumer_space, parent_division
+        )
+
+    def parent_division_for(
+        self, consumer_division: CoreDivision, parent_space: OpSplitSpace
+    ) -> Optional[CoreDivision]:
+        """The producer division that writes this buffer the way
+        ``consumer_division`` reads it, or ``None``.
+
+        The mirror of :meth:`consumer_division_for`, for a search flooding
+        upward. Here the confirmation bites: the geometry is blind to the
+        write-side filters, so a partial-reduction or multi-dim-split-matmul
+        division can invert cleanly and still be unable to host a residency.
+        """
+        target = self.consumer_view(consumer_division)
+        if target is None:
+            return None
+        return self._inverse(
+            self.parent_op, self.write_dep, target, parent_space, consumer_division
+        )
+
+    def _inverse(
+        self,
+        op: Operation,
+        dep: MemoryDep,
+        target: PerCoreView,
+        space: OpSplitSpace,
+        other: CoreDivision,
+    ) -> Optional[CoreDivision]:
+        """Invert ``target`` on ``op``'s side of this edge, then confirm the
+        pair through :meth:`compatible`. ``space.admits`` rides along inside the
+        inversion, so a geometrically valid but illegal candidate backtracks
+        rather than losing the edge."""
+        splits = invert_per_core_view(
+            _prep_for(op, dep, self.buf_name, self.prep_cache),
+            target,
+            space.factor_domains,
+            accept=space.admits,
+        )
+        if splits is None:
+            return None
+        division = space.division(splits)
+        is_parent_side = op is self.parent_op
+        parent, consumer = (division, other) if is_parent_side else (other, division)
+        return division if self.compatible(parent, consumer) else None
 
     def match_pairs(
         self,
