@@ -366,7 +366,9 @@ class ResidencyEdge:
         if self._cores_used(parent) != self._cores_used(consumer):
             return False
         parent_view = self.parent_view(parent)
-        return parent_view is not None and parent_view == self.consumer_view(consumer)
+        return parent_view is not None and parent_view.same_partition(
+            self.consumer_view(consumer)
+        )
 
     def consumer_division_for(
         self, parent_division: CoreDivision, consumer_space: OpSplitSpace
