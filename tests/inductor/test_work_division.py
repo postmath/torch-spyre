@@ -2311,15 +2311,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return stack
 
     def _table(self, allocator):
-        return allocator._cd_parent_matches(
-            self.consumer_op,
-            self.consumer_divs,
-            self.parent_names,
-            self.divisions,
-            self.op_by_name,
-            {},
-            self.residency,
+        edges = allocator._parent_residency_edges(
+            self.consumer_op, self.parent_names, self.op_by_name, {}, self.residency
         )
+        return allocator._cd_parent_matches(edges, self.consumer_divs, self.divisions)
 
     def test_match_table_is_the_expected_pairs(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
@@ -2593,7 +2588,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 self.assertEqual(set(plans), {"plain"})
                 self.assertIs(plans["plain"].anchor_op, reader_op)
                 allocator._validated_drain_plans = plans
-                built = allocator._build_cd_bound_buffers(graph, {}, divisions)
+                built = allocator._build_cd_bound_buffers(
+                    graph, {}, allocator_module._DivisionMap(divisions, set())
+                )
                 solver = allocator.layout_planning(built, allocator.size)
                 solved = {b.name: b for b in solver.plan_layout()}
                 # _commit_divisions would record the committed ownership here.
@@ -2726,10 +2723,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
     def test_no_consumer_op_matches_nothing(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
-            self.assertEqual(
-                allocator._cd_parent_matches(None, [], [], {}, {}, {}, self.residency),
-                {},
-            )
+            edges = allocator._parent_residency_edges(None, [], {}, {}, self.residency)
+            self.assertEqual(allocator._cd_parent_matches(edges, [], {}), {})
 
 
 class TestCloneDivisionMatching(unittest.TestCase):
@@ -2831,7 +2826,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
             patch.object(allocator, "_enumerate_core_divisions") as enumerate_divs,
         ):
-            divisions = allocator._division_map(graph)
+            divisions = allocator._division_map(graph).divisions
 
         self.assertEqual(divisions[op.name], [fixed])
         enumerate_divs.assert_not_called()
@@ -2911,7 +2906,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 side_effect=lambda _op, splits: splits == safe,
             ) as is_legal,
         ):
-            divisions = allocator._division_map(graph)[op.name]
+            division_map = allocator._division_map(graph)
+            divisions = division_map.divisions[op.name]
 
         self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
         self.assertEqual(is_legal.call_args_list[0].args[1], safe)
@@ -2965,8 +2961,11 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 return_value=True,
             ),
         ):
+            # Not an enumeration, so a solver may not generate divisions for
+            # this op: the committed one is all it is allowed.
             self.assertEqual(
-                allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
+                allocator._enumerate_core_divisions(op, max_cores=32),
+                ([fixed], False),
             )
 
     def test_over_budget_candidate_menu_is_rejected(self):
