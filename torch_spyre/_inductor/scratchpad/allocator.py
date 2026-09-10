@@ -1974,6 +1974,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         work-division constraints. Otherwise LX planning raises ``Unsupported``
         rather than committing an illegal division. See
         ``utils.ops_in_offset_mutation_component``.
+
+        Whatever the path, every candidate returned is within the ``sencores`` budget
+        -- asserted here because nothing downstream re-checks it (issue #4387).
         """
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
@@ -1996,6 +1999,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = self._enumerate_core_divisions(op, max_cores)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
+            # The core budget is an invariant of the MENU, not of its consumers: both
+            # engines pin an op's split symbols to one enumerated candidate, so nothing
+            # downstream re-checks the product -- and `_matmul_split_cost`'s own budget
+            # guard no-ops on symbolic splits, scoring an over-budget division NEGATIVE.
+            # A minimizing solve then finds it maximally attractive rather than
+            # rejecting it (issue #4387). Only two of the three paths above take
+            # `max_cores` -- `_legal_split_options` asks nothing about a core budget --
+            # so check the menu itself, unconditionally: it is one product per candidate.
+            over = [d for d in divs if d.cores_used > max_cores]
+            assert not over, (
+                f"{op.name}: enumerated core divisions over the {max_cores}-core "
+                f"budget: "
+                + ", ".join(f"{d.label} ({d.cores_used} cores)" for d in over)
+            )
             result[op.name] = divs
 
         return result

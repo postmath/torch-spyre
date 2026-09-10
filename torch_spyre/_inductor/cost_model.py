@@ -809,26 +809,20 @@ def _is_sym(*vals) -> bool:
 def _tiled_rows(o) -> Optional[float]:
     """``tile_rows_per_core``, or None (= N/A, no derate) when it is SYMBOLIC.
 
-    On the co-optimizing path (``CoOptimizingAllocator._extract_op_features``) the
-    features carry the solver's undecided ``is_lx``/``output_split`` as sympy symbols, so
-    a coarse-tiled op arrives with a symbolic per-core tile height. Every tiling surface
-    keyed on it -- ``coarse_underfill_eff``, ``coarse_underfill_eff_matmul``,
-    ``_lx_spill_working_set`` -- is a piecewise power law that *branches* on its
-    argument, which is not decidable over a symbol (issue #4233).
+    The co-optimizing path (``CoOptimizingAllocator._extract_op_features``) keys
+    features on the solver's undecided ``is_lx``/``output_split``, so a coarse-tiled op
+    arrives with a symbolic per-core tile height -- and every surface keyed on it
+    (``coarse_underfill_eff``, ``coarse_underfill_eff_matmul``,
+    ``_lx_spill_working_set``) is a piecewise power law that *branches* on its argument,
+    which a symbol cannot decide (issue #4233).
 
-    Neutralising the derate is the choice for now. CP-SAT *linearizes* the expression: measured, a
-    symbolic branch does not linearize on this base and ``_SympyExprToCpSat`` then drops the cost
-    objective entirely for the lexicographic one -- worse than keeping the linear traffic terms and
-    losing only the derate. The annealer instead *evaluates* it (``sa_cooptimizer._build_score_fn``
-    lambdifies over ``modules="math"``, #4164), where a Piecewise and a fractional power would both
-    be exact and free. So a symbolic derate is already the better answer for one engine and still
-    unusable for the other.
-
-    What holds for both: the derate is bounded above by 1.0, so it can rank tilings
-    against one another but never above not tiling (#4233) -- it was never the term that
-    decides a tiling. Tabulating ``1/eff`` as an element lookup over (division index,
-    is_lx) suits both engines and sidesteps ``mem/eff``, a quotient of two
-    decision-dependent expressions, which is the part neither route prices today.
+    Dropping the derate is the cheap loss: it is bounded above by 1.0, so it orders
+    tilings against one another but never above not tiling -- it was never the term that
+    decides a tiling. Keeping it symbolic instead costs CP-SAT the whole cost objective,
+    since a branch does not linearize. The route that suits both engines -- tabulating
+    ``1/eff`` over (division index, is_lx), which also sidesteps ``mem/eff``, a quotient
+    of two decision-dependent expressions neither prices today -- is in #4233 and in
+    PR #4386, which carry the measurements behind both claims.
     """
     rpc = o.tile_rows_per_core
     return None if _is_sym(rpc) else rpc
@@ -1364,10 +1358,16 @@ def _reduction_rows(o):
     """ROWS of a reduction's input (governs its read rate), from the largest HBM input."""
     # An UNDECIDED `is_lx` counts as HBM. `a.mem` would reject it, and this is reached
     # unconditionally on the standalone-reduction branch -- exactly where the
-    # co-optimizing path lands, since `_eff_bw` returns None for symbolic args. Picking a
-    # row count cannot be scaled by `(1 - is_lx)` the way `_loop_reread_bytes`' byte count
-    # can, and HBM is the baseline the rest of the model prices against, so this keeps the
-    # governing rows non-zero rather than reporting no input at all.
+    # co-optimizing path lands, since `_eff_bw` returns None for symbolic args. Picking
+    # a row count cannot be scaled by `(1 - is_lx)` the way `_loop_reread_bytes`' bytes
+    # can, and HBM is the baseline the rest of the model prices against, so this keeps
+    # the governing rows non-zero rather than reporting no input at all.
+    #
+    # Not a *worst case*, though, and not a bias against any tiling: the pick is the
+    # argmax over `elems`, not over rows, so admitting an undecided arg lowers the rows
+    # as readily as it raises them -- and `logical` is decision-independent, so whatever
+    # it returns scales this op's memory term by a constant that no residency or
+    # division move can change.
     ins = [
         a
         for a in o.args
