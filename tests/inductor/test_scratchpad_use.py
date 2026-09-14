@@ -2531,10 +2531,7 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
                 pairs = buf.cd_parent_matches[parent]
                 parent_divisions = by_name[parent].core_divisions
                 self.assertEqual(
-                    edge.match_pairs(
-                        [cd.splits for cd in parent_divisions],
-                        [cd.splits for cd in buf.core_divisions],
-                    ),
+                    edge.match_pairs(parent_divisions, buf.core_divisions),
                     pairs,
                     f"{buf.name} <- {parent}",
                 )
