@@ -806,28 +806,6 @@ def _is_sym(*vals) -> bool:
     return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
 
 
-def _tiled_rows(o) -> Optional[float]:
-    """``tile_rows_per_core``, or None (= N/A, no derate) when it is SYMBOLIC.
-
-    The co-optimizing path (``CoOptimizingAllocator._extract_op_features``) keys
-    features on the solver's undecided ``is_lx``/``output_split``, so a coarse-tiled op
-    arrives with a symbolic per-core tile height -- and every surface keyed on it
-    (``coarse_underfill_eff``, ``coarse_underfill_eff_matmul``,
-    ``_lx_spill_working_set``) is a piecewise power law that *branches* on its argument,
-    which a symbol cannot decide (issue #4233).
-
-    Dropping the derate is the cheap loss: it is bounded above by 1.0, so it orders
-    tilings against one another but never above not tiling -- it was never the term that
-    decides a tiling. Keeping it symbolic instead costs CP-SAT the whole cost objective,
-    since a branch does not linearize. The route that suits both engines -- tabulating
-    ``1/eff`` over (division index, is_lx), which also sidesteps ``mem/eff``, a quotient
-    of two decision-dependent expressions neither prices today -- is in #4233 and in
-    PR #4386, which carry the measurements behind both claims.
-    """
-    rpc = o.tile_rows_per_core
-    return None if _is_sym(rpc) else rpc
-
-
 def coarse_underfill_eff(
     rpc: float,
     cols: float,
@@ -855,9 +833,7 @@ def coarse_underfill_eff(
     ``_lx_spill_bw_derate``, which already carries a separate cap/exponent pair for matmul.
     """
     p = params or CostParams()
-    if _is_sym(rpc, cols):
-        return 1.0  # see _tiled_rows
-    if rpc <= 0 or cols <= 0:
+    if rpc == 0.0 or cols <= 0:
         return 1.0
     raw = (rpc / p.coarse_underfill_rfull) ** p.coarse_underfill_exp * (
         cols / p.coarse_underfill_col_ref
@@ -899,15 +875,11 @@ def coarse_underfill_eff_matmul(rpc: float, params: CostParams | None = None) ->
     one scores worse there. ``rpc<=0`` (untiled/unknown) -> 1.0.
     """
     p = params or CostParams()
-    if _is_sym(rpc):
-        return 1.0  # see _tiled_rows
-    if rpc <= 0:
+    if rpc == 0.0:
         return 1.0
     h0, ceil_ = p.coarse_underfill_h0_matmul, p.coarse_underfill_cap_matmul
     r_full, exp = p.coarse_underfill_rfull_matmul, p.coarse_underfill_exp_matmul
-    if rpc >= h0:
-        return min(ceil_, (rpc / r_full) ** exp)
-    return min(ceil_, (h0 / r_full) ** exp) * (rpc / h0) ** p.coarse_underfill_gamma
+    return min(ceil_, (max(rpc, h0) / r_full) ** exp) * min(1.0, (rpc / h0) ** p.coarse_underfill_gamma)
 
 
 def _lx_spill_working_set(ops: list) -> float:
@@ -915,13 +887,9 @@ def _lx_spill_working_set(ops: list) -> float:
     each ``tile_rows_per_core * cols`` elements. 0.0 if nothing is output-tiled."""
     ws = 0.0
     for o in ops:
-        rpc = _tiled_rows(o)
-        # `cols` can be symbolic independently of `rpc`, and `max` here is the
-        # symbolic-aware `work_division.max`, so an unguarded symbolic `cols` propagates
-        # into `ws` and only fails a frame later, at `_lx_spill_bw_derate`'s `ws <= cap`.
         cols = _op_cols(o)
-        if o.tiles_output_dim and rpc and not _is_sym(cols):
-            ws = max(ws, 2.0 * rpc * cols * o.dtype_bytes)
+        if o.tiles_output_dim:
+            ws = max(ws, 2.0 * o.tile_rows_per_core * cols * o.dtype_bytes)
     return ws
 
 
@@ -935,9 +903,7 @@ def _lx_spill_bw_derate(ops: list, params: CostParams | None = None) -> float:
     _cap, _exp = p.lx_spill_cap_bytes, p.lx_spill_exp
     if any(getattr(o, "is_matmul", False) for o in ops):
         _cap, _exp = p.mm_spill_ws_cap_bytes, p.mm_spill_ws_exp
-    if ws <= _cap:
-        return 1.0
-    return (_cap / ws) ** _exp
+    return min(1.0, (_cap / ws) ** _exp)
 
 
 def _bmm_layout_pair(o) -> tuple:
@@ -1660,9 +1626,8 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # used only by the bundled explain path.)
     eff = 1.0
     for o in ops:
-        rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
-            eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
+        if o.loop_trip > 1 and o.tiles_output_dim:
+            eff = min(eff, coarse_underfill_eff(o.tile_rows_per_core, _op_cols(o), p))
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
     # slower than the modeled rate. Bytes are already counted as HBM; here we derate the
@@ -1738,8 +1703,8 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
     eff, eff_rows = 1.0, None
     for o in ops:
-        rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        rpc = o.tile_rows_per_core
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc != 0.0:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -1938,8 +1903,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
     eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
-        rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        rpc = o.tile_rows_per_core
+        if o.loop_trip > 1 and o.tiles_output_dim and rpc != 0.0:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
