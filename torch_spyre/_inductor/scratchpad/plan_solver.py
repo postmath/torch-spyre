@@ -234,12 +234,6 @@ class TileSpec:
         return math.prod(a.count for a in self.axes if not a.is_reduction)
 
     @property
-    def is_clean(self) -> bool:
-        """True when no reduction axis is tiled, so every tile of the output is
-        final rather than a partial sum."""
-        return not any(a.is_reduction for a in self.axes)
-
-    @property
     def label(self) -> str:
         if not self.axes:
             return "untiled"
