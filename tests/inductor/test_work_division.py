@@ -45,8 +45,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
-from torch_spyre._inductor.scratchpad import division_generation
-from torch_spyre._inductor.scratchpad.division_generation import undeclared_splits
+from torch_spyre._inductor import work_division as work_division_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
@@ -61,6 +60,7 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    undeclared_splits,
     _cost_model_matmul_planner,
     _default_split,
     enumerate_work_division_candidates,
@@ -1811,7 +1811,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 {"side_effect": lambda op: op.get_name() == "matmul"},
             ),
         ]:
-            for module in (allocator_module, division_generation):
+            for module in (allocator_module, work_division_module):
                 if hasattr(module, target):
                     stack.enter_context(patch.object(module, target, **kwargs))
         return stack
@@ -1889,7 +1889,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         with self._patches():
             table = self._table(allocator)
             for parent, pairs in table.items():
-                edge = division_generation.build_residency_edge(
+                edge = work_division_module.build_residency_edge(
                     parent,
                     self.op_by_name[parent],
                     self.consumer_op,
@@ -1912,7 +1912,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 ("clone", "frame-changing clone"),
             ]:
                 self.assertIsNone(
-                    division_generation.build_residency_edge(
+                    work_division_module.build_residency_edge(
                         parent,
                         self.op_by_name[parent],
                         self.consumer_op,
@@ -2058,8 +2058,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=rw,
             ),
-            # ``_core_division`` reads the write dep from its own module.
-            patch.object(division_generation, "op_read_writes", return_value=rw),
+            # ``_core_division`` reads the write dep from ``work_division``.
+            patch.object(work_division_module, "op_read_writes", return_value=rw),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
@@ -2171,7 +2171,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 return_value=rw,
             ),
             # ``_core_division`` reads the write dep from its own module.
-            patch.object(division_generation, "op_read_writes", return_value=rw),
+            patch.object(work_division_module, "op_read_writes", return_value=rw),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
@@ -2264,14 +2264,8 @@ def _division_key(division):
 @contextmanager
 def _space_for(case, declaration=None):
     """The generated split space for one candidate case, under its patches."""
-    rw = MagicMock(writes=[case.output_td.dep], reads=[td.dep for td in case.input_tds])
-    with (
-        case.patches(),
-        # The write dep decides which axes are output axes; the case's patches
-        # only reach ``work_division``'s own namespace.
-        patch.object(division_generation, "op_read_writes", return_value=rw),
-    ):
-        yield division_generation.build_op_split_space(
+    with case.patches():
+        yield work_division_module.build_op_split_space(
             case.op, case.max_cores, declaration
         )
 
@@ -2316,7 +2310,7 @@ class TestOpSplitSpace(unittest.TestCase):
             with self.subTest(case.name):
                 with _space_for(case) as space:
                     for splits in case.candidates:
-                        expected = division_generation._core_division(case.op, splits)
+                        expected = work_division_module._core_division(case.op, splits)
                         actual = space.division(splits)
                         self.assertEqual(_division_key(actual), _division_key(expected))
                         reductions += bool(expected.reduction_splits)
@@ -2375,15 +2369,15 @@ class TestOpSplitSpace(unittest.TestCase):
         other_data = MagicMock(spec=ComputedBuffer)
         other_data.data = MagicMock()
         for op in (not_a_buffer, other_data):
-            self.assertIsNone(division_generation.build_op_split_space(op, 32))
+            self.assertIsNone(work_division_module.build_op_split_space(op, 32))
         case = next(c for c in _candidate_cases() if c.name == "two_dims")
         with patch.object(
-            division_generation,
+            work_division_module,
             "work_division_context_for_op",
             side_effect=Unsupported("no iteration space"),
         ):
             self.assertIsNone(
-                division_generation.build_op_split_space(case.op, case.max_cores)
+                work_division_module.build_op_split_space(case.op, case.max_cores)
             )
 
 
@@ -2433,7 +2427,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         context = MagicMock()
         context.axes = list(domains)
         context.is_legal.side_effect = lambda splits: True
-        return division_generation.OpSplitSpace(
+        return work_division_module.OpSplitSpace(
             op=op,
             context=context,
             declaration=None,
@@ -2442,7 +2436,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         )
 
     def _edge(self, parent_is_matmul=False):
-        return division_generation.ResidencyEdge(
+        return work_division_module.ResidencyEdge(
             buf_name="p",
             parent_op=self.producer,
             consumer_op=self.consumer,
@@ -2462,7 +2456,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
                 side_effect=lambda op: self.iter_spaces[op.get_name()],
             )
         )
-        for module in (pass_utils_module, division_generation):
+        for module in (pass_utils_module, work_division_module):
             stack.enter_context(
                 patch.object(
                     module,
@@ -2548,7 +2542,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
             )
             self.assertNotEqual(restated, view)
             with patch.object(
-                division_generation.ResidencyEdge,
+                work_division_module.ResidencyEdge,
                 "consumer_view",
                 return_value=restated,
             ):
@@ -2569,7 +2563,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         rejected candidate backtracks) instead of losing the edge outright --
         which ``_ViewRelation`` would memoize for the whole solve."""
         captured: list = []
-        real = division_generation.invert_per_core_view
+        real = work_division_module.invert_per_core_view
 
         def spy(prep, target, domains, **kwargs):
             captured.append(kwargs["accept"])
@@ -2577,7 +2571,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
 
         with (
             self._geometry(),
-            patch.object(division_generation, "invert_per_core_view", spy),
+            patch.object(work_division_module, "invert_per_core_view", spy),
         ):
             edge = self._edge()
             edge.parent_division_for(CoreDivision({self.r: 4}), self.parent_space)
