@@ -34,7 +34,10 @@ from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
 from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
+from .logging_utils import get_logger, warn_once
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+
+logger = get_logger("cost_model")
 
 
 def cost_dump_enabled() -> bool:
@@ -541,13 +544,19 @@ def _graph_boundary_names() -> tuple[set, set] | None:
         return None
 
 
-def _writes_graph_output(op, graph_outputs: set) -> bool:
+def _writes_graph_output(op, graph_outputs: set) -> bool | None:
     """Whether ``op``'s write is the externally-visible write of a graph output.
 
     Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
     writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
     the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
     records.
+
+    ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
+    "interior write", and unlike the input side an output arg has no naming-convention
+    fallback to recover from a wrong one -- it would silently free the store under
+    residency, which is exactly the under-charge of #4271. Unknown is not silent
+    either: nothing downstream can tell the two apart, so this is where it is said.
     """
     try:
         if op.get_name() in graph_outputs:
@@ -555,8 +564,18 @@ def _writes_graph_output(op, graph_outputs: set) -> bool:
         layout = op.get_layout()
         if isinstance(layout, MutationLayoutSHOULDREMOVE):
             return layout.get_buffer().get_name() in graph_outputs
-    except Exception:  # noqa: BLE001 - best-effort feature extraction
-        pass
+    except Exception as exc:  # noqa: BLE001 - best-effort feature extraction
+        name = getattr(op, "name", None) or type(op).__name__
+        warn_once(
+            logger,
+            f"graph-output-stamp:{name}",
+            "cannot tell whether %s writes a graph output (%s); its store is left "
+            "unstamped and priced as interior traffic, so LX residency will free "
+            "bytes the graph boundary still moves",
+            name,
+            exc,
+        )
+        return None
     return False
 
 
@@ -705,8 +724,9 @@ def extract_op_features(
             logical=list(out_size),
             loop_factor=out_factor,
             # Against the op's BUFFER name (and its mutation target), not the
-            # operation name this arg carries. ``None`` (no graph) means
-            # unstamped, not "not a boundary" -- see _graph_boundary_names.
+            # operation name this arg carries. ``None`` means unstamped, not
+            # "not a boundary": no graph at all (see _graph_boundary_names), or
+            # an op _writes_graph_output could not read.
             is_boundary=(
                 None
                 if graph_outputs is None

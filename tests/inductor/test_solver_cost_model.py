@@ -23,6 +23,7 @@ softmax, and steered the anneal into plans 5-6% worse on flash.
 No Spyre device or backend compiler is required; features are built directly.
 """
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -286,7 +287,7 @@ class _FakeMutationLayout:
 
 
 def _op(name, layout):
-    return SimpleNamespace(get_name=lambda: name, get_layout=lambda: layout)
+    return SimpleNamespace(name=name, get_name=lambda: name, get_layout=lambda: layout)
 
 
 def test_writes_graph_output_follows_the_mutation_target(monkeypatch):
@@ -308,6 +309,25 @@ def test_a_returned_input_has_no_output_side_write_to_charge():
     outputs = {"arg0_1", "buf0"}
     assert dcm._writes_graph_output(_op("buf0", object()), outputs)  # its own write
     assert not dcm._writes_graph_output(_op("buf1", object()), outputs)
+
+
+def test_an_unreadable_op_is_unknown_not_authoritatively_interior(caplog):
+    """An op the stamp cannot be computed for yields ``None``, and says so.
+
+    ``False`` here is authoritative "interior write", and the output side has no
+    naming-convention fallback to recover from a wrong one -- residency would free a
+    store the graph boundary still performs, silently reinstating #4271. The only
+    remaining signal is the log line, so both are pinned."""
+
+    def _raises():
+        raise RuntimeError("layout is gone")
+
+    op = SimpleNamespace(
+        name="buf_unreadable", get_name=lambda: "buf7", get_layout=_raises
+    )
+    with caplog.at_level(logging.WARNING, logger="spyre.inductor.cost_model"):
+        assert dcm._writes_graph_output(op, {"arg0_1"}) is None
+    assert "buf_unreadable" in caplog.text
 
 
 def test_boundary_names_are_unavailable_without_a_graph():
@@ -392,6 +412,25 @@ def test_the_extractor_stamps_the_write_of_a_graph_output():
     assert not _stamps(_extractable_op("buf1", ["arg0_1"]), graph)[
         ("output", "op_buf1")
     ]
+
+
+def test_the_extractor_leaves_an_unreadable_write_unstamped(monkeypatch):
+    """Through the real extractor: a mutation layout whose target cannot be resolved
+    (the shape of failure that keeps ``op.get_layout()`` itself usable) must reach
+    ``ArgTraffic`` as ``None``, not ``False``."""
+
+    class _BrokenMutationLayout:
+        allocation = None
+        device_layout = None
+
+        def get_buffer(self):
+            raise RuntimeError("target buffer is gone")
+
+    op = _extractable_op("buf_broken_target", ["arg0_1"])
+    op.get_layout = lambda: _BrokenMutationLayout()
+    graph = _StubGraph(inputs=["arg0_1"], outputs=["buf9"])
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _BrokenMutationLayout)
+    assert _stamps(op, graph)[("output", "op_buf_broken_target")] is None
 
 
 def test_a_buffer_that_is_both_input_and_output_is_stamped_per_role():
