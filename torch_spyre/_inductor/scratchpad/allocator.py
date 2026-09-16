@@ -18,7 +18,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, Callable, cast, NamedTuple, Optional
 
@@ -65,6 +65,7 @@ from torch_spyre._inductor.work_division import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    ceil_div,
     cost_expr_record,
     CoreDivision,
     CoreDivisionBuffer,
@@ -72,6 +73,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
     SolveError,
+    TileSpec,
     BufferType,
     RelayoutCopyBuffer,
     build_relayout_copy,
@@ -2065,13 +2067,6 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
-# Whether anything applies a solver's chosen ``TileSpec``s to the graph. Nothing
-# does yet, and offering a tiling until then is unsafe: the search prices the
-# per-tile footprint and the packer lays LX out by it, while the untiled graph
-# writes the full extent. Delete this, not set it True, when the apply step lands.
-TILE_CHOICES_ARE_APPLIED = False
-
-
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2428,6 +2423,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
+        # Apply before commit. ``commit_iteration_space_ownership`` builds the
+        # ownership off ``iteration_space_from_op``, whose symbols come from the
+        # write dep's ranges -- which ``_divide_ranges`` invalidates. Committing
+        # afterwards derives both the split map and the core mapping against the
+        # already-divided op instead of migrating a stale object, and
+        # ``coarse_tile`` reads no ownership of its own, so the one
+        # ``_distribute_work`` left is simply overwritten.
+        tiled = self._apply_chosen_tilings(graph, allocation)
+        self._check_priced_footprints(graph, allocation, tiled)
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
@@ -2619,6 +2623,103 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return cds, True
         return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
 
+    def _apply_chosen_tilings(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+    ) -> dict[str, TileSpec]:
+        """Apply the solver's chosen coarse tilings, returning them by buffer name.
+
+        The only consumer a chosen ``TileSpec`` has. Without it the search prices
+        the *per-tile* footprint and the packer lays LX out by it while the graph
+        writes the full extent, so the reserved interval is a fraction of the
+        real one.
+
+        **The anneal's placement stands.** Applying the tiling is what makes its
+        addresses true rather than stale, so there is no second placement round:
+        re-running a placement engine here would decouple the layout from the
+        divisions and tilings it was jointly chosen with, which is the coupling
+        this allocator exists for. The companion buffers the apply mints (a
+        full-extent ``full_buf`` per op whose output escapes its tiling group)
+        were not in the joint state, so they get no LX address and stay in HBM
+        until something prices them.
+
+        **A refusal raises.** The search is supposed to propose only tilings
+        ``coarse_tile`` accepts -- ``OpSplitSpace.admits`` is meant to be
+        complete with respect to it -- so a refusal is a defect in that model
+        rather than a graph to route around, and dropping the tiling here would
+        also invalidate the addresses already spaced for it.
+        """
+        if not self._solver_chooses_tilings:
+            return {}
+        op_by_name = {op.name: op for op in graph.operations}
+        # By buffer name; ``choices`` by operation name, as ``CoarseTilingPass``
+        # takes them.
+        tiled: dict[str, TileSpec] = {}
+        choices: dict[str, TileSpec] = {}
+        for buffer in allocation:
+            if buffer.chosen_division is None:
+                continue
+            tiling = buffer.core_divisions[buffer.chosen_division].tiling
+            if tiling.is_untiled:
+                continue
+            tiled[buffer.name] = tiling
+            choices[op_by_name[buffer.name].get_operation_name()] = tiling
+        if not choices:
+            return {}
+        # Local import: ``coarse_tiling`` imports ``ScratchpadOptimizationPass``
+        # from this module, so a top-level import would be circular.
+        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+        CoarseTilingPass(choices).apply_pass(graph)
+        logger.info(
+            "applied a coarse tiling to %d op(s): %s",
+            len(choices),
+            ", ".join(f"{name}={spec.label}" for name, spec in sorted(choices.items())),
+        )
+        return tiled
+
+    def _check_priced_footprints(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: Mapping[str, TileSpec],
+    ) -> None:
+        """Every tiled buffer's applied per-core footprint is the one it was
+        placed at, or this raises.
+
+        The search divides the buffer's *total* size by
+        ``output_partition * output_tile_count``; the apply divides the op's
+        ranges per dim and rebuilds the device layout through
+        ``_resize_device_layout``. Those agree only if resizing divides the
+        device byte size exactly -- plausible, since ``build_tiling_space`` never
+        tiles the stick dim, but per-dim device padding could re-round. An
+        applied footprint *larger* than the priced one would overlap whatever
+        was packed above this buffer's LX interval.
+        """
+        for buffer in allocation:
+            tiling = tiled.get(buffer.name)
+            if tiling is None:
+                continue
+            layout = graph.get_buffer(buffer.name).layout
+            device_layout = getattr(layout, "device_layout", None)
+            if device_layout is None:
+                raise Unsupported(
+                    f"{buffer.name}: tiled as {tiling.label} but carries no device "
+                    "layout to check the applied footprint against"
+                )
+            partition = buffer.core_divisions[buffer.chosen_division].output_partition
+            applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
+            priced = ceil_div(buffer.size, partition * tiling.output_tile_count)
+            if applied != priced:
+                raise Unsupported(
+                    f"{buffer.name}: placed at a per-core footprint of {priced} "
+                    f"bytes under tiling {tiling.label} ({buffer.size} bytes over "
+                    f"{partition} cores x {tiling.output_tile_count} tiles), but "
+                    f"the applied graph gives {applied}; its LX address is spaced "
+                    "for a footprint the graph does not have"
+                )
+
     def _commit_divisions(
         self,
         graph: GraphLowering,
@@ -2644,8 +2745,27 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not cd.tiling.is_untiled:
+                # The apply ran first, so this op's iteration space has been
+                # re-derived since the division was chosen. A split naming a
+                # symbol that no longer exists would not be rejected by
+                # ``make_iteration_space_ownership`` -- it reads
+                # ``splits.get(sym, 1)`` over the *live* space, so a stale key is
+                # dropped and the axis silently commits as unsplit.
+                live = set(iteration_space_from_op(op))
+                stale = sorted(str(sym) for sym in cd.splits if sym not in live)
+                if stale:
+                    raise Unsupported(
+                        f"{op.name}: applying {cd.tiling.label} left the chosen "
+                        f"division naming iteration symbols the op no longer has "
+                        f"({', '.join(stale)}); those splits would commit as 1"
+                    )
             if not _split_option_is_legal(op, cd.splits):
-                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
+                raise Unsupported(
+                    f"{op.name}: chosen split violates hard domain "
+                    f"(division {cd.label}, tiling {cd.tiling.label}, ranges "
+                    f"{[str(r) for r in getattr(op.data, 'ranges', [])]})"
+                )
             commit_iteration_space_ownership(op, cd.splits)
 
     def _determine_in_place_division_invariant(
@@ -3140,10 +3260,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
         engine that would ignore the answer does not pay for it.
 
-        Which engine it is *is* the switch, as far as a user is concerned:
+        Which engine runs is what decides whether divisions are generated:
         ``select_allocator`` reaches this solver from exactly two settings
         (``co_optimizing_lx_planning`` plus
-        ``layout_solver = "simulated_annealing"``), and a separate flag on top
+        ``layout_solver = "simulated_annealing"``), and a separate flag for it
         could only ever disagree with them.
         """
         return self.layout_planning is SaCoOptimizingSolver
@@ -3154,10 +3274,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         Only a generated division can carry a ``TileSpec`` -- the enumeration
         has none to offer, so an engine that indexes it could not choose one if
-        it wanted to. Hence :attr:`_solver_generates_divisions`, gated on
-        ``TILE_CHOICES_ARE_APPLIED``.
+        it wanted to. Hence :attr:`_solver_generates_divisions`, and
+        ``config.auto_coarse_tiling``.
         """
-        return TILE_CHOICES_ARE_APPLIED and self._solver_generates_divisions
+        return config.auto_coarse_tiling and self._solver_generates_divisions
 
     def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
         """The op's split space.
