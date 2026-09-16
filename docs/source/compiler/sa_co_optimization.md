@@ -164,8 +164,8 @@ wrote the full extent, and the apply closes exactly that gap. Re-running a place
 would decouple the layout from the divisions and tilings it was jointly chosen with, which is the
 coupling this engine exists for. The companion buffers the apply mints — a full-extent `full_buf`
 per op whose output escapes its tiling group — were not in the joint state, so they get no LX
-address and stay in HBM until something prices them. That is the remaining known optimism: the
-search sees the per-tile shrink but not the companion.
+address and stay in HBM — which is what the search prices them as, mid-anneal, through
+`_companion_bytes` (see [the objective](#the-objective)).
 
 **A refusal raises**, after `CoarseTilingPass.plan_only` — a zero-mutation dry run — so it raises on
 an untouched graph rather than leaving a half-transformed one behind. The search is meant to propose
@@ -260,8 +260,10 @@ Three move types:
   Untiled is drawn **flat**, at `_UNTILED_ANCHOR_PROB`, rather than as a per-dim opt-out. Per-dim
   opt-outs alone leave the untiled anchor at the *product* over tileable dims (≈1/289 at two dims,
   ≈1/4913 at three), so undividing a region would vanish exactly as the search gained room to
-  over-divide it — and nothing else pushes back: the objective sees a tiling only through a monotone
-  per-core footprint, so a tiling move is score-neutral (accepted unconditionally) or score-improving.
+  over-divide it — and nothing else pushes back on depth. *Whether* to tile is priced, by the
+  companion traffic below; *how deep* is not: the objective sees depth only through a monotone
+  per-core footprint, and the companion charge depends on the buffer's size and outside readers, not
+  on the tile count, so deepening a tiling never scores worse.
   There is no loop-cost term yet; #4233 measures program bytes at `74,880 + 21,504 × total_tiles`,
   with backend compile time superlinear in tile count, and names that term as the prerequisite for
   lifting the split cap.
@@ -321,6 +323,28 @@ or a `sumcol`-style reduction) either drops that rate silently or, if the read r
 whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this
 the way `BundleCostObjective`'s concrete `predict_ops` calls had.
 :::
+
+**Companion traffic** is added to whichever of the two runs, at the HBM rate, because neither can
+express it. A coarse tiling shrinks what a buffer holds at once; it does not shrink what the
+buffer moves. For an op whose output escapes its tiling group the apply allocates a full-extent
+`full_buf`, drains one tile into it per iteration through an inserted copy op, and repoints every
+outside consumer and any graph output at it — none of which is in `op_features`, extracted from
+the untiled graph before `_post_solve` applies anything. So the search would see the per-tile
+shrink and neither the copy nor the outside consumers' HBM reads, and the error does not fall
+with the tile count. `_companion_bytes` charges the difference between the applied graph and the
+extracted one, per escaping buffer: the copy's read of the per-tile scratch, free when that
+scratch is resident; the copy's write of `full_buf`, already counted for a graph output whose
+externally visible write is charged whether or not the buffer is resident; and the outside
+consumers' full-extent reads when the buffer is resident, which residency no longer serves. An op
+whose consumers all sit inside its own run therefore costs nothing — the shape the recolor flood
+exists to build — while tiling a buffer that is not resident costs a full HBM round trip. The term
+is zero unless a buffer is tiled, so a search that takes no tiling scores as it did before it
+existed.
+
+It rides outside the compiled expression rather than inside it because `cost_expr`'s declaration
+is splits and residency: there is no symbol for a tiling to price against. Two under-corrections
+follow from what the solver holds: a consumer is counted once however many times it reads, and a
+matmul consumer's `replication` would make its read of `full_buf` cost more than one pass.
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has
