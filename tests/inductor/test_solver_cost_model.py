@@ -397,11 +397,19 @@ def test_an_explicit_stamp_survives_the_round_trip():
 
 
 class _FakeMutationLayout:
-    def __init__(self, target):
+    """Stands in for ``MutationLayoutSHOULDREMOVE``: it answers for the buffer it
+    writes into, and carries no ``device_layout`` / ``allocation`` of its own --
+    both live on ``real_layout()``, the target's layout."""
+
+    def __init__(self, target, real=None):
         self._target = target
+        self._real = real
 
     def get_buffer(self):
         return SimpleNamespace(get_name=lambda: self._target)
+
+    def real_layout(self):
+        return self._real
 
 
 def _op(name, layout):
@@ -735,3 +743,69 @@ def test_store_cost_composes_with_bundle_and_is_reported(monkeypatch):
     assert f"indirect-store core limit: +{extra / 1000:.2f} us" in cost_model.explain(
         [store]
     )
+
+
+# ------------------------------------------- sizing and placing a mutating write
+
+
+def test_the_wrapper_answers_neither_question_itself():
+    """What makes the fake above faithful, and the defect silent: the real class
+    defines neither attribute and no ``__getattr__`` to synthesize one, so reading
+    them off it returns ``None`` rather than raising."""
+    from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "device_layout")
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "allocation")
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "__getattr__")
+
+
+def test_device_dims_come_from_the_mutation_target(monkeypatch):
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    target = SimpleNamespace(device_layout=SimpleNamespace(device_size=[4, 128]))
+    assert dcm._device_dims(_FakeMutationLayout("buf1", target)) == [4, 128]
+
+
+def test_residency_comes_from_the_mutation_target(monkeypatch):
+    """The planner stamps ``allocation`` on the target's ``FixedTiledLayout``, never
+    on the wrapper -- so a write into a resident target is HBM traffic unless the
+    wrapper is resolved."""
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    resident = SimpleNamespace(allocation={"lx": 0})
+    assert dcm._mem_of_layout(_FakeMutationLayout("buf1", resident)) == "lx"
+    assert dcm._mem_of_layout(_FakeMutationLayout("buf1", SimpleNamespace())) == "hbm"
+
+
+def test_the_extractor_sizes_and_places_a_mutating_write_by_its_target(monkeypatch):
+    """End to end, on the shape where the two errors bite: a target whose last dim is
+    stick-unaligned (100 fp16 -> 128) and LX-resident. Off the wrapper the write is
+    100 elements of HBM; off the target it is 128 elements of LX."""
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    target = SimpleNamespace(
+        device_layout=SimpleNamespace(device_size=[128]), allocation={"lx": 0}
+    )
+    op = _extractable_op("buf1", ["arg0_1"])
+    op.get_size = lambda: [100]
+    op.get_layout = lambda: _FakeMutationLayout("arg0_1", target)
+
+    from torch._inductor.virtualized import V
+
+    with V.set_graph_handler(_StubGraph(inputs=["arg0_1"], outputs=["buf9"])):
+        feats = dcm.extract_op_features(op)
+
+    write = next(a for a in feats.args if a.role == "output")
+    assert (write.elems, write.dims, write.logical) == (128, [128], [100])
+    assert write.is_lx is True
+
+
+def test_an_unresolvable_target_falls_back_rather_than_raising(monkeypatch):
+    """Both helpers are best-effort: an op whose target buffer cannot be reached keeps
+    the pre-existing logical-dims / HBM answer instead of breaking extraction (the
+    extractor-level case is pinned by the unreadable-write test above)."""
+
+    class _BrokenTarget(_FakeMutationLayout):
+        def real_layout(self):
+            raise RuntimeError("target buffer is gone")
+
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _BrokenTarget)
+    assert dcm._device_dims(_BrokenTarget("buf1")) is None
+    assert dcm._mem_of_layout(_BrokenTarget("buf1")) == "hbm"
