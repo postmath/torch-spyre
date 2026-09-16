@@ -22,6 +22,7 @@ from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import sympy
+from torch._inductor.utils import sympy_index_symbol
 import torch
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
@@ -91,6 +92,8 @@ from torch_spyre._inductor.work_division import (
     span_reduction_pass,
 )
 from torch_spyre._inductor.work_division_constraints import (
+    JOINT_TILING_AND_DIVISION_ATTR,
+    coarse_tile_local_dim_split_domains,
     ConstraintResult,
     WorkDivConstraintContext,
     aligned_ownership_split_domains,
@@ -3337,3 +3340,37 @@ class TestResidencyEdgeInversion(unittest.TestCase):
             self.assertIsNotNone(
                 edge.consumer_division_for(CoreDivision({self.x: 2}), space)
             )
+
+
+class TestJointTilingAndDivisionExemption(unittest.TestCase):
+    """``coarse_tile_local_dim_split_domains`` pins a coarse-tile-local dim's
+    core split to 1 because ``work_distribution``/``span_reduction`` divide each
+    op independently. A solver that chose the tiling and the division together
+    is not in that position -- the same ground the user-hint exemption stands on
+    -- so it is exempt, and only it."""
+
+    def _tiled_op(self, marked):
+        op = MagicMock()
+        op.get_name.return_value = "buf0"
+        op.loop_info = SimpleNamespace(
+            loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]]
+        )
+        op.data = SimpleNamespace(ranges=[sympy.Integer(8)])
+        op.dim_hints = []
+        setattr(op, JOINT_TILING_AND_DIVISION_ATTR, marked)
+        return op
+
+    def _pins(self, op):
+        ctx = _make_context(
+            op,
+            output_td=MagicMock(),
+            it_space={sympy_index_symbol("d0"): sympy.Integer(8)},
+        )
+        return coarse_tile_local_dim_split_domains(ctx).allowed_splits
+
+    def test_an_unmarked_tiled_op_is_pinned_to_one(self):
+        pins = self._pins(self._tiled_op(marked=False))
+        self.assertEqual({str(k): sorted(v) for k, v in pins.items()}, {"d0": [1]})
+
+    def test_a_jointly_chosen_op_is_exempt(self):
+        self.assertEqual(self._pins(self._tiled_op(marked=True)), {})
