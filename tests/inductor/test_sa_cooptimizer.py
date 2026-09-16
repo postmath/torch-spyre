@@ -1861,19 +1861,22 @@ def _run_buffer(name, position, space=None):
     return buf
 
 
-def _run_solver(names, untiled=()):
+def _run_solver(names, untiled=(), parents=None):
     """A primed solver over ``names`` at consecutive operation positions, each
-    with a tiling space unless named in ``untiled``. A ``None`` name leaves its
-    position to an operation with no buffer."""
-    bufs = [
-        _run_buffer(
+    with a tiling space unless named in ``untiled``; ``parents`` maps a name to
+    the producers it reads. A ``None`` name leaves its position to an operation
+    with no buffer."""
+    bufs = []
+    for position, name in enumerate(names):
+        if name is None:
+            continue
+        buf = _run_buffer(
             name,
             position,
             _two_axis_space(tiling=None if name in untiled else _tiling_space()),
         )
-        for position, name in enumerate(names)
-        if name is not None
-    ]
+        buf.parents = list((parents or {}).get(name, ()))
+        bufs.append(buf)
     return _primed(bufs, 1 << 30)
 
 
@@ -2127,3 +2130,95 @@ class ApplyGroupAgreementTest(TestCase):
         relation = _primed([parent, child], 1 << 30)._relations[(0, 1)]
         self.assertFalse(relation.carries(_TILE_2))
         self.assertTrue(relation.carries(TileSpec((TileAxis(host_dim=1, count=2),))))
+
+    def test_the_companions_are_the_applied_groups(self):
+        # [KT] [S, V] [O]: KT escapes to S, S and V to O; each pays the copy's
+        # write and one full-extent read while resident. One run would pay 0.
+        solver = self._solver(_attention_ops())
+        self.assertEqual(solver._companion_bytes([0] * 4), 3 * 2 * 1024)
+
+
+class CompanionBufferPricingTest(TestCase):
+    """A tiling shrinks what a buffer holds, not what it moves. For an op whose
+    output leaves its tiling group the apply allocates a full-extent companion,
+    drains one tile into it per iteration and repoints the outside consumers at
+    it -- none of which is in features extracted from the untiled graph. Priced
+    honestly, tiling pays for an op whose consumers stay inside its own run and
+    costs a full HBM round trip for one that is not resident."""
+
+    SIZE = 1024  # ``_cdbuf``'s
+
+    @staticmethod
+    def _addresses(solver, resident):
+        return [0 if i in resident else None for i in range(len(solver._bufs))]
+
+    def test_an_untiled_state_prices_no_companions(self):
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_search_with_no_tiling_space_prices_no_companions(self):
+        solver = _run_solver("AB", parents={"B": ["A"]}, untiled="AB")
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_consumer_inside_the_run_costs_nothing(self):
+        # Nothing escapes, so the apply keeps the buffer as loop-internal
+        # scratch and allocates no companion -- the shape the recolor flood
+        # exists to build, and the only one where tiling is free.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        for idx in (0, 1):
+            solver.chosen[idx] = _tiled(solver, idx)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_resident_buffer_pays_the_copy_out_and_its_outside_readers(self):
+        # A tiled, B and C untiled and reading it: A's run is itself alone, so
+        # both readers take the full buffer from HBM, and residency of the
+        # per-tile scratch no longer serves them.
+        solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})),
+            3 * self.SIZE,  # the copy's write + two full-extent reads
+        )
+
+    def test_a_spilled_buffer_pays_the_scratch_round_trip_instead(self):
+        # Not resident, the per-tile scratch is itself in HBM: the copy reads it
+        # back and writes the full buffer, and the readers were already charged.
+        # Independent of how many readers there are.
+        solver = _run_solver("ABC", parents={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
+        )
+
+    def test_a_resident_tiled_graph_output_pays_nothing(self):
+        # The copy's write IS the externally visible write, which the model
+        # charges whether or not the buffer is resident (#4271), so it replaces
+        # a write already counted rather than adding one.
+        solver = _run_solver("A")
+        solver._bufs[0].boundary = BufferType.Output
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0})), 0)
+
+    def test_a_consumer_with_no_operation_position_counts_as_outside(self):
+        # Nothing can carry a tiling to a buffer in no run, so a group
+        # containing it is not known to be contiguous; charging is the safe
+        # direction, matching what ``_trim_tilings_to_anchor_run`` refuses.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        solver._bufs[1].op_position = None
+        solver._precompute_topology()
+        solver.chosen = solver._seed_configs()
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})), 2 * self.SIZE
+        )
+
+    def test_the_score_carries_the_companion_traffic(self):
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        before = solver._score()
+        with mock.patch.object(solver, "_companion_bytes", return_value=4096):
+            after = solver._score()
+        self.assertEqual(
+            after - before, utils.to_fixed_us(4096 / solver._hbm_bytes_per_us)
+        )
