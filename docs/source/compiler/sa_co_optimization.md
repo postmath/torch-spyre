@@ -168,6 +168,11 @@ whole expression back to the memory-only fallback. There is no per-bundle escape
 the way `BundleCostObjective`'s concrete `predict_ops` calls had.
 :::
 
+**Companion traffic** is added to whichever of the two runs, at the HBM rate: the HBM reads and
+writes of the full-extent buffer the apply mints for a tiled op whose output escapes its group,
+which features extracted from the untiled graph do not see. It rides outside `cost_expr` because
+that expression has no symbol for a tiling; see `_companion_bytes`.
+
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has
 been measured.
