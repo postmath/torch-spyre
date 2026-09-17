@@ -1230,7 +1230,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(cp_cost)
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
+                raise SolveError(
+                    f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                    f"after {solver.WallTime():.2f}s"
+                )
             return status
         except (RuntimeError, TypeError, ValueError):
             logger.warning("[CP-SAT layout solver] cannot linearize the sympy expr")
