@@ -221,12 +221,11 @@ def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
         cores=32,
     )
     _bytes, ns = _replicated_operand_reads([sym], p)
-    assert (
-        sympy.simplify(
-            ns - BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core)
-        )
-        == 0
+    expected = sympy.Piecewise(
+        (0, sympy.Eq(s_n, 1)),
+        (BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core), True),
     )
+    assert sympy.simplify(ns - expected) == 0
     expr = predict_ops([sym], p)
     at_point = sympy.lambdify([s_m, s_n, is_lx], expr, modules="math")
     assert at_point(4, 8, 0) == pytest.approx(predict_ops([num], p), rel=1e-9)
@@ -237,6 +236,19 @@ def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
         cores=32,
     )
     assert at_point(4, 8, 1) == pytest.approx(predict_ops([resident], p), rel=1e-9)
+
+    # The same symbolic menu also contains unreplicated choices. Neither those
+    # choices nor an already-substituted SymPy Integer may pay the replica rate.
+    for factor in (1, sympy.Integer(1), 2):
+        for resident in (False, True):
+            concrete = _matmul(
+                _arg(1, resident=False),
+                ArgTraffic("buf0", "input", resident, ELEMS, replication=factor),
+                cores=4 * factor,
+            )
+            assert at_point(4, factor, int(resident)) == pytest.approx(
+                float(predict_ops([concrete], p)), rel=1e-9
+            )
 
 
 # -------------------------------------------------------- extractor, on device

@@ -1462,6 +1462,40 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.Value(variables["enabled"]), 0)
         self.assertAlmostEqual(solver.ObjectiveValue(), 50.0, places=6)
 
+    def test_unreplicated_choice_in_a_product_of_splits(self):
+        from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, predict_ops
+
+        b, m = sympy.symbols("b m", integer=True, positive=True)
+
+        def price(replication):
+            return predict_ops(
+                [
+                    OpFeatures(
+                        "bmm",
+                        True,
+                        64,
+                        8,
+                        2,
+                        [
+                            ArgTraffic(
+                                "buf0", "input", False, 4096, replication=replication
+                            ),
+                            ArgTraffic("buf1", "output", False, 64),
+                        ],
+                        is_matmul=True,
+                    )
+                ]
+            )
+
+        expression = price(b * m)
+        for batch, rows in ((1, 1), (1, 2), (2, 1)):
+            solver, _ = self._optimize(
+                expression, {"b": (batch, batch), "m": (rows, rows)}, False
+            )
+            self.assertAlmostEqual(
+                solver.ObjectiveValue(), price(batch * rows), delta=1
+            )
+
     def test_conditional_minmax_operands_still_lower(self):
         x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
         conditional = sympy.Piecewise((0.5 * x, sympy.Eq(enabled, 1)), (1.5 * x, True))

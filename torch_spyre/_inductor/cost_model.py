@@ -281,9 +281,15 @@ class ArgTraffic:
         non-resident replicated operand's loads, none once it is resident. Zero when
         ``replication`` is 1 (nothing to price differently), so callers can subtract it
         from ``hbm_elems`` unconditionally."""
-        if isinstance(self.replication, int) and self.replication == 1:
+        if self.replication == 1:
             return 0
-        return self.elems * self.loop_factor * self.replication * (1 - self.is_lx)
+        loads = self.elems * self.loop_factor * self.replication * (1 - self.is_lx)
+        if isinstance(self.replication, sympy.Basic):
+            # A candidate can choose no replication. Keep that same case in the
+            # symbolic price; otherwise ordinary partitioned reads pay the much
+            # lower per-core replica rate merely because the split was undecided.
+            loads *= sympy.Piecewise((0, sympy.Eq(self.replication, 1)), (1, True))
+        return loads
 
     @property
     def mem(self) -> str:
