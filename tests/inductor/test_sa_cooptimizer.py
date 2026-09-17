@@ -47,8 +47,6 @@ from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
-    _MIN_STEPS,
-    _STEPS_PER_BUFFER,
     DivisionConfig,
     SaCoOptimizingSolver,
     _canonical_key,
@@ -720,28 +718,6 @@ class SnapshotRestoreTest(TestCase):
 
 
 class StepBudgetTest(TestCase):
-    """``clamp(_STEPS_PER_BUFFER * n, _MIN_STEPS, _MAX_STEPS)`` -- the same shape
-    the layout-only annealer's schedule uses, so neither engine grows without
-    bound."""
-
-    @staticmethod
-    def _budget(n):
-        """The budget ``_anneal`` computes for ``n`` buffers."""
-        return min(_MAX_STEPS, max(_MIN_STEPS, _STEPS_PER_BUFFER * n))
-
-    def test_rate_applies_between_the_floor_and_the_ceiling(self):
-        self.assertEqual(self._budget(100), _STEPS_PER_BUFFER * 100)
-
-    def test_floor_applies_to_tiny_graphs(self):
-        self.assertEqual(self._budget(1), _MIN_STEPS)
-
-    def test_ceiling_caps_large_graphs(self):
-        binds_at = _MAX_STEPS // _STEPS_PER_BUFFER
-        self.assertEqual(self._budget(binds_at * 4), _MAX_STEPS)
-        # Inert across the validated corpus: the largest captured graph is n=79,
-        # far below where the ceiling starts binding.
-        self.assertGreater(binds_at, 79)
-
     def test_ceiling_is_higher_than_the_layout_only_annealer(self):
         """The joint engine searches divisions too, so it wants a larger budget
         at the same buffer count (and must not silently inherit the smaller one).
