@@ -1416,6 +1416,20 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_shared_load_penalty_lowers_for_product_degrees(self):
+        from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+        x, y, resident = sympy.symbols("x y resident", integer=True)
+        expression = (
+            8192 / 150 * (_matmul_multicast_penalty(x * y) - 1) * (1 - resident)
+        )
+        for a, b, lx in ((2, 4, 0), (3, 4, 0), (4, 8, 0), (4, 8, 1)):
+            solver, _ = self._optimize(
+                expression, {"x": (a, a), "y": (b, b), "resident": (lx, lx)}, False
+            )
+            expected = 8192 / 150 * (_matmul_multicast_penalty(a * b) - 1) * (1 - lx)
+            self.assertAlmostEqual(solver.ObjectiveValue(), expected, places=5)
+
     def test_piecewise_and_or_condition_lowering(self):
         # Exercises _print_And and _print_Or as Piecewise conditions.
         x, y = sympy.symbols("x y", integer=True)

@@ -1501,6 +1501,27 @@ _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
 
 
+def _matmul_multicast_penalty(consumers):
+    """Existing bandwidth derate for cores sharing one operand load.
+
+    Symbolic degrees are integer products bounded by the configured core
+    budget. Tabulate that finite domain: fractional symbolic powers cannot
+    be passed directly to CP-SAT. Numeric callers use the same formula.
+    """
+    if isinstance(consumers, sympy.Basic) and consumers.free_symbols:
+        return sympy.Piecewise(
+            *(
+                (
+                    (degree / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT,
+                    sympy.Eq(consumers, degree),
+                )
+                for degree in range(_COHORT_LIMIT + 1, config.sencores + 1)
+            ),
+            (1.0, True),
+        )
+    return max(1.0, (consumers / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+
+
 def _matmul_execution_cost(
     b_axis: tuple[int, int],
     m_axis: tuple[int, int],
@@ -1552,9 +1573,7 @@ def _matmul_execution_cost(
         weight_batches = 1 if shared_weight else B
         bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
         fanout_split = max(m, n) if shared_weight else n
-        cohort_penalty = max(
-            1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
-        )
+        cohort_penalty = _matmul_multicast_penalty(fanout_split)
         hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
     else:
         hbm_us = 0.0

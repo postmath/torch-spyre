@@ -171,7 +171,13 @@ from typing import Optional
 
 import sympy
 
-from .work_division import _matmul_execution_cost, min, max, log2
+from .work_division import (
+    _matmul_execution_cost,
+    _matmul_multicast_penalty,
+    min,
+    max,
+    log2,
+)
 from . import config
 
 
@@ -183,7 +189,8 @@ class ArgTraffic:
     role: str  # "input" | "output"
     is_lx: bool
     elems: int  # device element count = prod(dims) (its own one-load size)
-    broadcast: bool = False  # loaded once & reused across the broadcast dim
+    # One physical load shared by `replication` consumers, or reused locally.
+    broadcast: bool = False
     # DEVICE (stick) shape, e.g. [4, 512, 64]
     dims: list = dataclasses.field(default_factory=list)
     # LOGICAL torch shape, e.g. [512, 1024] -- shown next to dims so the stickification
@@ -216,11 +223,13 @@ class ArgTraffic:
     # ``_fused_hbm_bytes`` and ``_clone_in_bytes`` de-duplicate on. Meaningless, and
     # left True, on an arg that is not a graph-input read.
     owns_boundary_charge: bool = True
-    # How many cores each read this arg's bytes from HBM: the product of the
+    # Number of consumer copies: the product of the
     # consumer's core splits on iteration dims this arg's read index does NOT
     # contain. Every such split places a full copy of the arg's slice on another
-    # core, and each core performs its own load, so the HBM bytes scale by this
-    # factor when the arg is not LX-resident. 1 for an arg indexed by every split
+    # core. Unless broadcast marks a shared load, each core performs its own
+    # load, so HBM bytes scale by this factor when non-resident. A shared load
+    # pays physical bytes once but retains this degree for delivery cost.
+    # 1 for an arg indexed by every split
     # dim (a permutation; each core reads exactly its own slice). Stamped for
     # MATMUL consumers only: the grouped-relayout sweep (2026-09-09) measured a
     # bmm reading a replicated operand at f x bytes (2.5 us + f*B at 60-67 GB/s),
@@ -249,16 +258,17 @@ class ArgTraffic:
         be a solver decision variable, so the residency factor stays arithmetic
         (``1 - is_lx``) rather than a branch.
 
-        A replicated operand (``replication`` > 1) is loaded by every core that holds
-        a copy when it comes from HBM, and residency removes all of those loads."""
+        Non-broadcast replicas each load from HBM. Broadcast replicas share one
+        physical load; residency removes either kind of direct HBM read."""
         # A bool residency next to a symbolic replication (a fixed-residency buffer
         # read under a solver-chosen split) must add as 0/1, not as a sympy Boolean.
         is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
+        replication = 1 if self.role == "input" and self.broadcast else self.replication
         if self.role == "output" and self.is_graph_boundary:
             return (
                 self.elems * self.loop_factor * (is_lx + self.replication * (1 - is_lx))
             )
-        return self.elems * self.loop_factor * self.replication * (1 - is_lx)
+        return self.elems * self.loop_factor * replication * (1 - is_lx)
 
     def clone_in_elems(self):
         """Device elements the clone of a resident graph input loads from HBM: one
@@ -281,7 +291,7 @@ class ArgTraffic:
         non-resident replicated operand's loads, none once it is resident. Zero when
         ``replication`` is 1 (nothing to price differently), so callers can subtract it
         from ``hbm_elems`` unconditionally."""
-        if self.replication == 1:
+        if self.broadcast or self.replication == 1:
             return 0
         loads = self.elems * self.loop_factor * self.replication * (1 - self.is_lx)
         if isinstance(self.replication, sympy.Basic):
@@ -1318,6 +1328,37 @@ def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
     return total_bytes, ns
 
 
+def _shared_operand_read_excess(ops: list, p: "CostParams"):
+    """Extra delivery time for a shared HBM load, beyond its one base read.
+
+    Keep physical bytes unchanged and price each operand's own consumer degree.
+    Resident operands vanish through hbm_elems; boundary clone loads stay separate.
+    """
+    total = 0
+    external = {}
+    for op in ops:
+        if not op.is_matmul:
+            continue
+        for arg in op.args:
+            if arg.role != "input" or not arg.broadcast or arg.replication == 1:
+                continue
+            excess = (
+                arg.hbm_elems()
+                * op.dtype_bytes
+                * (_matmul_multicast_penalty(arg.replication) - 1)
+                / p.bw_peak_gbps
+            )
+            if arg.is_graph_boundary:
+                external[arg.name] = (
+                    _max_traffic(external[arg.name], excess)
+                    if arg.name in external
+                    else excess
+                )
+            else:
+                total += excess
+    return total + sum(external.values())
+
+
 def _loop_reread_bytes(ops: list) -> float:
     """HBM bytes re-read because an operand is LOOP-INVARIANT under coarse tiling.
 
@@ -1625,7 +1666,11 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
         return None
     B_total = max(1.0, o.out_elems / (M * N))
     b_split = o.cores // (m_split * n_split * k_split)
-    shared_weight = any(a.role == "input" and a.broadcast for a in o.args)
+    # Match the standalone chooser: an ordinary 2D projection also has one
+    # weight batch, even though neither input needs a broadcast-view tag.
+    shared_weight = round(B_total) == 1 or any(
+        a.role == "input" and a.broadcast for a in o.args
+    )
     return (
         (round(B_total), b_split),
         (round(M), m_split),
@@ -1862,7 +1907,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     else:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
-    mem = mem + rep_ns
+    # Sharing slows delivery of these same reads; it does not add HBM bytes.
+    # Apply the same subsequent bandwidth derates as the base and replica reads.
+    mem = mem + rep_ns + _shared_operand_read_excess(ops, p)
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back
     # through HBM -- a READ-AFTER-WRITE dependency ACROSS op boundaries. That
@@ -2174,7 +2221,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                     if a.owns_boundary_charge
                     else " graph boundary (clone-in charged to an earlier bundle)"
                 )
-            rp = f" x{a.replication} replicas" if a.replication != 1 else ""
+            rp = f" x{a.replication} consumers" if a.replication != 1 else ""
             counted = (a.hbm_elems() + a.clone_in_elems()) * o.dtype_bytes
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""

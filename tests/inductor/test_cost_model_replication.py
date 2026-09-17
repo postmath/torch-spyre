@@ -109,6 +109,29 @@ def test_replication_defaults_to_one_on_legacy_records():
     assert back.args[0].replication == 4
 
 
+def test_shared_load_keeps_consumer_degree_without_reloading_each_copy():
+    from torch_spyre._inductor.cost_model import _shared_operand_read_excess
+    from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+    degree, resident = sympy.symbols("degree resident", integer=True)
+    arg = _arg(degree, resident=resident, boundary=True)
+    arg.broadcast = True
+    op, params = _op(arg), CostParams()
+    assert arg.replication == degree
+    assert arg.hbm_elems() == ELEMS * (1 - resident)
+    assert arg.replicated_hbm_elems() == 0
+    excess = _shared_operand_read_excess([op, op], params)
+    for count in (1, 8, 12, 16, 32):
+        expected = BYTES * (_matmul_multicast_penalty(count) - 1) / params.bw_peak_gbps
+        assert float(excess.subs({degree: count, resident: 0})) == pytest.approx(
+            expected
+        )
+        assert excess.subs({degree: count, resident: 1}) == 0
+    arg.broadcast = False
+    assert _shared_operand_read_excess([op], params) == 0
+    assert arg.hbm_elems() == ELEMS * degree * (1 - resident)
+
+
 # ------------------------------------------------------------------ the rule
 
 
