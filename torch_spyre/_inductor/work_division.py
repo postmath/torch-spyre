@@ -1473,8 +1473,8 @@ def piecewise(*args):
 
 _PT_ROWS = 8  # PT block rows per corelet
 
-# Constants for the matmul cost model (_matmul_split_cost). Each is either an
-# AIU hardware limit or a coefficient fit to measured device kernel times.
+# Constants shared by the execution estimate and standalone split ranking.
+# Additive ranking preferences below are not whole-program operation latencies.
 _TARGET_PT_PASSES = 5  # per-core M that keeps the PT pipeline full = this * _PT_ROWS
 _TARGET_M_TIE_PASSES = 4  # enough M lanes to keep the stationary weights fed
 _PT_EFFICIENCY_EXPONENT = 0.25
@@ -1501,7 +1501,7 @@ _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
 
 
-def _matmul_split_cost(
+def _matmul_execution_cost(
     b_axis: tuple[int, int],
     m_axis: tuple[int, int],
     n_axis: tuple[int, int],
@@ -1518,15 +1518,14 @@ def _matmul_split_cost(
     that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
     bundle memory term counts the same bytes and knows about LX residency). The
     cohort bandwidth penalty scales only that term, so it drops out with it.
+
+    Array underfill remains an efficiency factor on computation. Standalone
+    split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    # SYMBOLIC SPLITS SKIP THE BUDGET CHECK (`isinstance` is False for a sympy
-    # expression), and the fall-through cost is not merely mispriced but NEGATIVE
-    # outside the budget -- what a minimizing objective seeks. Valid only within
-    # `max_cores`, therefore, and it is the CALLER that has to hold that: the symbolic
-    # expression is built over one enumerated CoreDivision per op, which
-    # `CoOptimizingAllocator._division_map` asserts is within budget (issue #4387).
+    # Symbolic splits rely on the caller's enumerated candidate menu to enforce
+    # the core budget; a symbolic expression cannot take this Python branch.
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 
@@ -1567,8 +1566,34 @@ def _matmul_split_cost(
     output_elems_per_core = (B * M * N) / (b * m * n)
     psum_us = max(0, k - 1) * output_elems_per_core * psum_coeff
 
+    return compute_us + hbm_us + psum_us
+
+
+def _matmul_split_cost(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    max_cores: int,
+    shared_weight: bool = False,
+    include_hbm: bool = True,
+) -> float:
+    """Standalone split-ranking score: execution estimate plus preferences.
+
+    The additive preferences preserve this chooser's existing behavior. They
+    are not operation latencies for a whole-program optimizer to sum.
+    """
+    execution_us = _matmul_execution_cost(
+        b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, include_hbm
+    )
+    if execution_us == math.inf:
+        return execution_us
+    (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    cores_used = b * m * n * k
+    m_t = M // m if m else 1
+
     # Tie-break: among compute-equivalent splits prefer exposing enough M lanes
-    # to stream work over the stationary weight tile. PT efficiency above handles
+    # to stream work over the stationary weight tile. The execution estimate handles
     # the opposite case where an M split makes each per-core tile too short.
     target_m = max(
         _M_MIN,
@@ -1634,9 +1659,7 @@ def _matmul_split_cost(
     batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
 
     return (
-        compute_us
-        + hbm_us
-        + psum_us
+        execution_us
         + m_lane_underuse_us
         + m_tile_underfill_us
         + wide_n_us

@@ -91,9 +91,10 @@ for a split reduced axis was dropped as sub-noise -- provably <=~5ns on us kerne
 MATMUL (reduction_type batchmatmul) is priced by one of two independent
 implementations, switched on ``CostParams.use_bundled_cost_model``:
 
-- UPSTREAM (``use_bundled_cost_model=False``): the compute/split-shape part of
-  ``work_division._matmul_split_cost`` -- the same heuristic the work-division planner
-  uses to choose a matmul's core split, called with ``include_hbm=False``. Its own
+- UPSTREAM (``use_bundled_cost_model=False``): the computation and partial-sum part of
+  ``work_division._matmul_execution_cost``, shared with the work-division planner.
+  Standalone split-ranking preferences are excluded: they are not operation times.
+  It is called with ``include_hbm=False``. Its own
   HBM-traffic term is dropped because the bundle memory term below already charges the
   operand/output bytes, and does so LX-aware; charging both double-counts memory.
 
@@ -170,7 +171,7 @@ from typing import Optional
 
 import sympy
 
-from .work_division import _matmul_split_cost, min, max, log2
+from .work_division import _matmul_execution_cost, min, max, log2
 from . import config
 
 
@@ -591,7 +592,7 @@ class CostParams:
     # Switch between the two matmul cost implementations (see the module docstring).
     # True (default) -- matmul uses the original device-calibrated
     # compute/HBM/spill/split-shape model below (``_matmul_ns_bundled``).
-    # False -- delegates matmul entirely to ``work_division._matmul_split_cost``.
+    # False -- delegates matmul entirely to ``work_division._matmul_execution_cost``.
     use_bundled_cost_model: bool = True
     # MATMUL compute term. T_matmul = max(compute, HBM), where
     # compute = MACs/cores/(mac_peak*pt_eff). mac_peak=1140 (sustained) fit on the
@@ -1600,7 +1601,7 @@ def _reduction_bw_cores_factor(cores, p):
 
 def _matmul_axes_for_split_cost(o) -> tuple | None:
     """Recover the ``(B,b),(M,m),(N,n),(K,k)`` axis pairs, the ``shared_weight`` flag,
-    and the cores actually used -- everything ``work_division._matmul_split_cost``
+    and the cores actually used -- everything ``work_division._matmul_execution_cost``
     needs -- from one matmul :class:`OpFeatures` record.
 
     Returns ``None`` when matmul_a_bytes and matmul_b_bytes are not given
@@ -1636,6 +1637,8 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     memory term, exactly as for ``_matmul_ns_bundled`` -- the two terms count the same
     operand/output bytes, so charging both double-counts memory (and the split-cost
     version is blind to LX residency, which is what the co-optimizing planner steers).
+    Standalone chooser preferences are also excluded: a preference for using more
+    cores must not become an additive latency on every matmul in the graph.
     """
     total_us = 0.0
     for o in ops:
@@ -1649,7 +1652,7 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 "cannot price it"
             )
         b_axis, m_axis, n_axis, k_axis, shared_weight = axes
-        us = _matmul_split_cost(
+        us = _matmul_execution_cost(
             b_axis,
             m_axis,
             n_axis,
@@ -1741,7 +1744,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
     A matmul in the bundle adds a compute term from ``_matmul_ns_upstream`` (defers to
-    ``work_division._matmul_split_cost``) or, when ``CostParams.use_bundled_cost_model``
+    ``work_division._matmul_execution_cost``) or, when ``CostParams.use_bundled_cost_model``
     is set, ``_matmul_ns_bundled`` (the original device-calibrated compute/spill/
     split-shape model); see the module docstring. Either way the operand/output HBM
     bytes are charged ONCE, by the memory term below -- neither matmul model carries an
@@ -2183,11 +2186,11 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:
         return _explain_matmul_bundled(lines, ops, p)
     if any(getattr(o, "is_matmul", False) for o in ops):
-        # Matmul compute comes from work_division._matmul_split_cost (HBM excluded --
+        # Matmul compute comes from work_division._matmul_execution_cost (HBM excluded --
         # see the module docstring), and the bundle memory term supplies the traffic.
         # Report the reconstructed axes each matmul op was priced with, then R/W.
         lines.append(
-            "  -- prediction (matmul, via work_division._matmul_split_cost) --"
+            "  -- prediction (matmul, via work_division._matmul_execution_cost) --"
         )
         compute_ns = 0.0
         for o in ops:
@@ -2201,7 +2204,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                     "cannot price it"
                 )
             (B, b), (M, m), (N, n), (K, k), shared_weight = axes
-            us = _matmul_split_cost(
+            us = _matmul_execution_cost(
                 (B, b),
                 (M, m),
                 (N, n),
