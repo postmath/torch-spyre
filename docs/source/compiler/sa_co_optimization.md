@@ -34,7 +34,7 @@ The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
 buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
 identifying the choice it makes, and the menu position it came from, if any. The seed is every
 buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
-`clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
+`min(200n, 50000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
 
 ### Where the candidates come from
