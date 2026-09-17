@@ -212,8 +212,8 @@ the same inputs and the same cost model:
   `co_optimizing_lx_planning`) anneals a single joint state heuristically. The state is the pair
   `(pi, W)`: the LX layout permutation `pi` (held in a composed `PermutationBasedLayoutSolver`)
   and the division vector `W`, one candidate-menu index per buffer. It seeds every buffer at
-  menu index 0 with a FirstFit placement, then runs one geometric cool for
-  `clamp(40n, 200, 15000)` steps using three move types — **reorder** (re-place a buffer in `pi`,
+  menu index 0 with a FirstFit placement, then runs one geometric cool, a capped number of
+  steps per buffer, using three move types — **reorder** (re-place a buffer in `pi`,
   weight 0.5), **flip** (change one buffer's division, weight 0.3), and **recolor** (flood a
   coordinated division change across a connected region via the `cd_parent_matches`
   compatibility relation, weight 0.2) — and returns the best state seen, so the result is never
