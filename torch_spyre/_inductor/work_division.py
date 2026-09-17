@@ -1565,7 +1565,13 @@ def _matmul_execution_cost(
             True,
         ),
     )
+    # The peak includes both corelets. DXP's doCoreletSplitSdsc leaves an op
+    # requiring cross-core reduction on one corelet, so a K-split has half
+    # that compute throughput. This is separate from moving the partial sums.
+    # Keep the existing unsplit estimate; small/unaligned output tiles may
+    # also prevent the backend from using both corelets.
     compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
+    compute_us = piecewise((2 * compute_us, k > 1), (compute_us, True))
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared

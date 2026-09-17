@@ -69,6 +69,27 @@ def test_matmul_time_does_not_charge_unused_available_cores(shared_weight, k_spl
     )
 
 
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_split_sum_matmul_prices_one_corelet(shared_weight):
+    from torch_spyre._inductor import work_division as wd
+
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    axes = ((2, 2), (128, 2), (256, 2), (1024, split))
+    price = wd._matmul_execution_cost(
+        *axes, 32, shared_weight=shared_weight, include_hbm=False
+    )
+    coefficient = (
+        wd._PSUM_PER_CORE_ELEM_US if shared_weight else wd._BMM_PSUM_PER_CORE_ELEM_US
+    )
+    for k in (1, 2, 4):
+        compute = (2 * 128 * 256 * 1024) / (8 * k) / wd._PEAK_MACS_US_CORE
+        expected = compute * (2 if k > 1 else 1) + (k - 1) * 8192 * coefficient
+        assert float(price.subs(split, k)) == pytest.approx(expected)
+        assert wd._matmul_execution_cost(
+            *axes[:3], (1024, k), 32, shared_weight=shared_weight, include_hbm=False
+        ) == pytest.approx(expected)
+
+
 def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch):
     from torch_spyre._inductor import work_division as wd
 
