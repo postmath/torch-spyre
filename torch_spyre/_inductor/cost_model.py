@@ -1335,7 +1335,7 @@ def _shared_operand_read_excess(ops: list, p: "CostParams"):
     Resident operands vanish through hbm_elems; boundary clone loads stay separate.
     """
     total = 0
-    external = {}
+    external: dict[str, float | sympy.Expr] = {}
     for op in ops:
         if not op.is_matmul:
             continue
