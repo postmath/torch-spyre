@@ -68,7 +68,7 @@ Model (per fused bundle / single-op kernel):
   30-33us, both far below the full 3-pass add (52us). A per-core reload would have added
   ~cores*C and pushed bcast up toward add; it did not -- so the operand costs a single
   load regardless of how the work splits across cores.
-- MATMUL operands are the exception (``ArgTraffic.replication``): a bmm whose core split
+- NON-SHARED MATMUL operands are the exception (``ArgTraffic.replication``): a bmm whose core split
   lies on a dim an operand does not index (M-split -> B, N-split -> A) makes every core
   in that split load its own full copy of the operand's slice from HBM. The grouped
   LX-relayout sweep (2026-09-09, 43 gather/broadcast rows, replication 2-16) measured
@@ -78,6 +78,10 @@ Model (per fused bundle / single-op kernel):
   core and in core count, rows-per-core ladder 2026-09-10), so they are priced as
   per-core bytes over ``mm_replicated_read_gbps_per_core`` rather than at BW_PEAK.
   Residency removes all f loads; a resident graph input adds only its one clone-in load.
+  Shared matmul inputs (``broadcast``) instead count one physical HBM load plus
+  delivery time based on how many cores consume it. This accounting applies to
+  both matmul models; the bundled model's large-output-tile reread term remains
+  separate and is not refitted here.
 
 Byte counts use each arg's DEVICE layout (stick-padded ``device_size``), not the torch
 logical shape -- so a reduction's reduced input is naturally full-sized and stick
@@ -97,6 +101,7 @@ implementations, switched on ``CostParams.use_bundled_cost_model``:
   It is called with ``include_hbm=False``. Its own
   HBM-traffic term is dropped because the bundle memory term below already charges the
   operand/output bytes, and does so LX-aware; charging both double-counts memory.
+  ``predict_ops`` also charges shared-input delivery. CP-SAT uses this model.
 
 - BUNDLED (``use_bundled_cost_model=True``): the original device-calibrated model,
   kept alongside the above rather than deleted. Adds a compute term that OVERLAPS the
@@ -699,8 +704,8 @@ class CostParams:
     # these data.
     mm_bw_read_gbps: float = 150.0
     mm_bw_write_gbps: float = 150.0
-    # REPLICATED matmul operand read (``ArgTraffic.replication`` > 1): every core of the
-    # replicating split loads its own copy of the operand's slice, and it does so at a
+    # SEPARATE matmul reads (replication > 1, broadcast=False): every consumer
+    # loads its own copy of the operand's slice, and it does so at a
     # PER-CORE ceiling, not at the shared HBM peak. Rows-per-core ladder (2026-09-10,
     # 13 rungs) plus the grouped-relayout sweep (2026-09-09, 43 rows): the consumer's
     # read time is FLAT in query rows per core (1..16) and in the core count (4..32),
@@ -1666,8 +1671,9 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
         return None
     B_total = max(1.0, o.out_elems / (M * N))
     b_split = o.cores // (m_split * n_split * k_split)
-    # Match the standalone chooser: an ordinary 2D projection also has one
-    # weight batch, even though neither input needs a broadcast-view tag.
+    # Treat one batch as shared-weight, including 2D projections without a
+    # broadcast tag. For multiple batches, use the existing input tag. This
+    # feature-level rule is not the standalone chooser's dependency-based test.
     shared_weight = round(B_total) == 1 or any(
         a.role == "input" and a.broadcast for a in o.args
     )
@@ -1909,6 +1915,8 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     # Sharing slows delivery of these same reads; it does not add HBM bytes.
     # Apply the same subsequent bandwidth derates as the base and replica reads.
+    # Both matmul models use this input-delivery cost. The bundled model's
+    # separate output-tile reread estimate is unchanged, not recalibrated here.
     mem = mem + rep_ns + _shared_operand_read_excess(ops, p)
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back

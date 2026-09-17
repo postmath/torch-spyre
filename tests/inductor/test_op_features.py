@@ -538,7 +538,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
         self.assertEqual({m, n, k}, {self.M_SPLIT, self.N_SPLIT, self.K_SPLIT})
         self.assertFalse(getattr(b, "free_symbols", set()))
 
-    def test_shared_weight_classification_matches_the_standalone_chooser(self):
+    def test_single_batch_and_broadcast_inputs_use_shared_weight_cost(self):
         from torch_spyre._inductor.cost_model import _matmul_axes_for_split_cost
 
         mm = self._matmul()

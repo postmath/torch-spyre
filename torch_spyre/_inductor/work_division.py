@@ -1538,7 +1538,8 @@ def _matmul_execution_cost(
     ``include_hbm=False`` drops the operand/output HBM-traffic term for a caller
     that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
     bundle memory term counts the same bytes and knows about LX residency). The
-    cohort bandwidth penalty scales only that term, so it drops out with it.
+    sharing penalty drops out of this function with that term. ``predict_ops``
+    charges shared-input delivery separately, using each operand's consumers.
 
     Array underfill remains an efficiency factor on computation. Standalone
     split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
