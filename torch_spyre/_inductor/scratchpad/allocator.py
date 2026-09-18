@@ -1496,11 +1496,11 @@ class ResidencyEdge:
     candidates instead of enumerating them cannot apply the geometry and forget
     the filters.
 
-    A producer with a residency rejection is excluded outright. Otherwise each
-    edge checks its own buffer: an expanding clone may read from HBM while its
-    finished output matches an LX consumer. Its input residency is checked on
-    the incoming edge, not inferred from the output. Excluded per candidate:
-    see :meth:`parent_view` and :meth:`consumer_view`.
+    A producer rejected for LX is excluded outright. Otherwise, check each
+    producer-consumer edge independently. A broadcasting clone may read its
+    input from HBM and still keep its completed output in LX for a matching
+    consumer. Candidate-specific checks are in :meth:`parent_view` and
+    :meth:`consumer_view`.
     """
 
     buf_name: str
