@@ -2367,6 +2367,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         decision variables. The extractor reads each arg's symbolic residency
         from ``is_lx`` (built once by the caller over all of ``buffers``, not
         per op); ``buffers`` itself supplies this op's own candidate divisions.
+
+        The coarse tiling is the third undecided thing: ``_post_solve`` applies
+        the chosen tilings after this runs, so the op is extracted against its
+        buffer's ``sym_tile_counts`` instead.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
@@ -2375,7 +2379,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        return extract_op_features(
+            op, ws, is_lx=is_lx, tile_counts=buffer.sym_tile_counts or None
+        )
 
     def _finalize_lx_relayout_allocation(
         self,
