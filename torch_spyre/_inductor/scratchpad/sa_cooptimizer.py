@@ -490,13 +490,14 @@ class _GeneratedDivisions(_DivisionSource):
 
         *Whether* to tile is priced: :meth:`SaCoOptimizingSolver._companion_bytes`
         charges the full-extent companion an escaping op needs, so a tiling move
-        is no longer accepted unconditionally. *How deep* to tile is not. The
-        objective sees depth only through a monotone per-core footprint, and the
-        companion charge is a function of the buffer's size and its outside
-        readers rather than of the tile count, so a drawn tiling is as deep as
-        the draw made it. Hence the flat untiled draw: it is what keeps
-        undividing a region proposable at all, and recolor is the only
-        long-range move there is.
+        is no longer accepted unconditionally. *How deep* to tile is priced
+        only where the loop re-reads an operand whose index lacks the tiled
+        axis (its ``loop_factor``). Otherwise the objective sees depth only
+        through a monotone per-core footprint, and the companion charge is a
+        function of the buffer's size and its outside readers rather than of
+        the tile count, so a drawn tiling is as deep as the draw made it.
+        Hence the flat untiled draw: it is what keeps undividing a region
+        proposable at all, and recolor is the only long-range move there is.
 
         Each tileable dim then offers its legal counts plus ``None`` for "leave
         this one alone". A level the space does not admit is dropped, which
@@ -1294,8 +1295,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         :meth:`_score` adds this to either objective at the HBM rate, because
         neither can express it: the cost expression is built once from the
-        untiled graph over splits and residency, with no symbol for a tiling, and
-        the fallback's spill costs are loop-invariant by construction.
+        untiled graph, so the full buffer the apply mints is not in it (its tile
+        counts price only the loop over each op), and the fallback's spill costs
+        are loop-invariant by construction.
 
         Two known under-corrections, neither expressible from what the solver
         holds: a consumer is counted once however many times it reads, and a
