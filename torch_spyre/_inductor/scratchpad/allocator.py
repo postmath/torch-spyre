@@ -1483,29 +1483,6 @@ def _view_for_div(
     )
 
 
-def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
-    """True if ``op`` is a clone whose output ``buf_name`` has an iteration
-    dimension that none of its inputs carry -- i.e. it broadcasts a dim
-    (e.g. GQA broadcasting K/V over the query-group axis). Such a clone reads
-    its input in a different frame than it writes its output, so a per-core
-    slice of the output cannot be produced from a core-local slice of the
-    input; pinning the output mis-addresses (cf. the restickify barrier)."""
-    if op_short_name(op) != "clone":
-        return False
-    rw = op_read_writes(op)
-    write = next(
-        (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
-    )
-    if write is None:
-        return False
-    read_syms: set = set()
-    for r in rw.reads:
-        if hasattr(r, "index"):
-            read_syms |= set(r.index.free_symbols)
-    # A write-only free symbol means the clone expands (broadcasts) that dim.
-    return bool(set(write.index.free_symbols) - read_syms)
-
-
 @dataclass
 class ResidencyEdge:
     """One producer-buffer -> consumer edge, with its residency policy applied.
@@ -1519,12 +1496,11 @@ class ResidencyEdge:
     candidates instead of enumerating them cannot apply the geometry and forget
     the filters.
 
-    Excluded outright (the producer then falls back to HBM, always correct): a
-    producer that can never be resident, and a frame-changing (broadcasting)
-    clone, whose per-core slice cannot be produced core-locally at all -- the
-    single-frame view comparison misses that, and the broadcast read from HBM
-    is globally correct. Excluded per candidate: see :meth:`parent_view` and
-    :meth:`consumer_view`.
+    A producer with a residency rejection is excluded outright. Otherwise each
+    edge checks its own buffer: an expanding clone may read from HBM while its
+    finished output matches an LX consumer. Its input residency is checked on
+    the incoming edge, not inferred from the output. Excluded per candidate:
+    see :meth:`parent_view` and :meth:`consumer_view`.
     """
 
     buf_name: str
@@ -1532,24 +1508,17 @@ class ResidencyEdge:
     consumer_op: Operation
     write_dep: MemoryDep
     read_dep: MemoryDep
-    # An SDSC carries only a matmul's primary split, so a multi-dim-split matmul
-    # output cannot be coherently LX-pinned even when views match -- a consumer
-    # would read per-core LX holding only a fragment. (Mirrors #2745's
-    # ``get_ncores_for_buffers`` matmul guard for the greedy path.)
-    parent_is_matmul: bool
     prep_cache: dict
 
     def parent_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
         candidate cannot host a readable residency: a partial-reduction write
-        (output not final), an unrepresentable slicing, or a matmul output
-        split across more than one device dim."""
+        (output not final) or an unrepresentable slicing. Matching compares
+        the complete per-core views, including all split dimensions."""
         view, partial, repr_ok = _view_for_div(
             self.parent_op, self.write_dep, self.buf_name, splits, self.prep_cache
         )
         if not repr_ok or partial:
-            return None
-        if self.parent_is_matmul and len(view.work_slice_dims) > 1:
             return None
         return view
 
@@ -1599,18 +1568,16 @@ def build_residency_edge(
     when the edge can never host a residency."""
     if residency_reason is not None:
         return None
-    if _is_frame_changing_clone(parent_op, buf_name):
-        return None
     write_dep = next(
         (
             w
             for w in op_read_writes(parent_op).writes
-            if w.name == buf_name and hasattr(w, "index")
+            if w.name == buf_name and isinstance(w, MemoryDep)
         ),
         None,
     )
     read_dep = next(
-        (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
+        (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
         None,
     )
     if write_dep is None or read_dep is None:
@@ -1621,7 +1588,6 @@ def build_residency_edge(
         consumer_op=consumer_op,
         write_dep=write_dep,
         read_dep=read_dep,
-        parent_is_matmul=_is_matmul_op(parent_op),
         prep_cache=prep_cache,
     )
 
@@ -2713,15 +2679,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if record.update_name != update_op.get_name():
             return None
         storage_op = op_by_name.get(record.storage_name)
-        if storage_op is None or _is_frame_changing_clone(
-            storage_op, record.storage_name
-        ):
+        if storage_op is None:
             return None
         storage_write = next(
             (
                 dep
                 for dep in op_read_writes(storage_op).writes
-                if dep.name == record.storage_name and hasattr(dep, "index")
+                if dep.name == record.storage_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2729,7 +2693,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             (
                 dep
                 for dep in op_read_writes(update_op).writes
-                if dep.name == record.update_name and hasattr(dep, "index")
+                if dep.name == record.update_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2741,7 +2705,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_op=update_op,
             write_dep=storage_write,
             read_dep=update_write.rename({record.update_name: record.storage_name}),
-            parent_is_matmul=_is_matmul_op(storage_op),
             prep_cache=prep_cache,
         )
 
@@ -2853,10 +2816,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_divs = divisions[cname]
             rw = op_read_writes(consumer)
             read_dep = next(
-                (r for r in rw.reads if r.name == input_name and hasattr(r, "index")),
+                (
+                    r
+                    for r in rw.reads
+                    if r.name == input_name and isinstance(r, MemoryDep)
+                ),
                 None,
             )
-            write = next((w for w in rw.writes if hasattr(w, "index")), None)
+            write = next((w for w in rw.writes if isinstance(w, MemoryDep)), None)
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
@@ -3041,16 +3008,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # Same per-candidate view screens as _cd_parent_matches: the source
             # gets LX-pinned exactly like a matched producer, so the same
             # coherence bars apply (partial-reduction write, unrepresentable
-            # slicing, multi-dim-split matmul output).
-            parent_is_matmul = _is_matmul_op(parent_op)
+            # slicing). Movement is checked on the complete per-core views.
             prod_views: list[Optional[PerCoreView]] = [
-                view
-                if (
-                    repr_ok
-                    and not partial
-                    and not (parent_is_matmul and len(view.work_slice_dims) > 1)
-                )
-                else None
+                view if repr_ok and not partial else None
                 for view, partial, repr_ok in self._views_for_divs(
                     parent_op, write_dep, parent, parent_divs, prep_cache
                 )
@@ -3374,12 +3334,24 @@ def scratchpad_planning(
         allocator = select_allocator()
     try:
         allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
-    except SolveError:
-        # When a solve error arises we assume a strong excpetion guarentee
-        # meaning despite the solver failing. The allocator has not mutated
-        # the state of the graph allowing a second attempt with a
-        # greedy approach.
-        logger.debug("solve error detected. falling back to greedy solver.")
+    except SolveError as error:
+        # Strong exception guarantee: SolveError comes from the solve, before the
+        # allocator commits divisions, relayouts or addresses, and select_allocator
+        # configures no pre-passes. The graph is unchanged, so greedy placement
+        # replans it with the work divisions already committed and recollects
+        # relayout plans itself.
+        # Keep the failed allocator's post-allocation passes: select_allocator
+        # adds LxContextSwitchingPass under the same flag that lets residency skip
+        # the extern-kernel liveness guard, so dropping it would leave LX buffers
+        # unprotected across FallbackKernel calls.
+        logger.warning(
+            "LX layout solve failed with layout_solver=%s (%s); falling back to "
+            "greedy LX placement with the committed work divisions",
+            config.layout_solver,
+            error,
+        )
         ScratchpadAllocator(
-            GreedyLayoutSolver, size=_lx_planning_size()
+            GreedyLayoutSolver,
+            size=_lx_planning_size(),
+            post_optimization_passes=allocator.post_optimization_passes,
         ).plan_allocation(graph)
