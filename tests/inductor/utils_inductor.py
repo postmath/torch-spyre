@@ -1025,6 +1025,8 @@ def mock_op_split_space(
         output_axes=frozenset(output_axes),
         factor_domains=domains,
         tiling=tiling,
+        # Output host dim i is the i-th iteration axis, as it is for a real op.
+        axis_by_host_dim=dict(enumerate(domains)),
     )
     # Every tiling is judged in this one context: how a per-tile frame narrows
     # a domain is the real context's business.

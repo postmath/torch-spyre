@@ -1198,6 +1198,13 @@ class OpSplitSpace:
     # caller's to choose -- which pins every division here to untiled, and is
     # what every engine but the SA co-optimizer gets.
     tiling: Optional["TilingSpace"] = None
+    # Output host dim -> the iteration axis it cuts (:func:`_axis_by_host_dim`).
+    # ``tiling`` offers only these dims.
+    axis_by_host_dim: dict[int, sympy.Symbol] = dataclasses.field(default_factory=dict)
+    # Memoized per spec.
+    _tile_counts: dict[TileSpec, dict] = dataclasses.field(
+        default_factory=dict, repr=False, compare=False
+    )
     # Per tiling, the context of its per-tile frame, or ``None`` where it has
     # none. Built on first use: a search visits few of an op's tilings.
     _contexts: dict[TileSpec, Optional[WorkDivisionContext]] = dataclasses.field(
@@ -1228,6 +1235,17 @@ class OpSplitSpace:
             ),
             tiling=tiling,
         )
+
+    def tile_counts(self, tiling: TileSpec) -> dict[sympy.Symbol, int]:
+        """``tiling``'s split counts keyed by the iteration axis each level
+        cuts -- the extent a core split on that axis then has to divide. Only
+        for a spec :meth:`admits_tiling` accepts. Memoized per spec."""
+        if tiling not in self._tile_counts:
+            self._tile_counts[tiling] = {
+                self.axis_by_host_dim[level.host_dim]: level.count
+                for level in tiling.axes
+            }
+        return self._tile_counts[tiling]
 
     def _context(self, tiling: TileSpec) -> Optional[WorkDivisionContext]:
         """The context ``tiling``'s divisions are judged in."""
@@ -1361,8 +1379,8 @@ def build_op_split_space(
     if write is None or context is None:
         return None
     axes = context.axes
+    axis_by_host_dim: dict[int, sympy.Symbol] = {}
     if tiling is not None:
-        # Offer only the dims the lowering resolves to one of the axes.
         axis_by_host_dim = _axis_by_host_dim(op, axes)
         tiling = dataclasses.replace(
             tiling,
@@ -1376,6 +1394,7 @@ def build_op_split_space(
         output_axes=frozenset(a for a in axes if write.index.coeff(a) != 0),
         factor_domains={axis: context.factor_domain(axis) for axis in axes},
         tiling=tiling,
+        axis_by_host_dim=axis_by_host_dim,
     )
 
 

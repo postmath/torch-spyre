@@ -1263,6 +1263,38 @@ class CostExprScoringTest(TestCase):
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
         )
 
+    def test_the_tile_count_symbol_drives_the_score(self):
+        # The tiling half of the two tests above: a chosen ``TileSpec`` reaches
+        # the scorer through the per-axis symbol its buffer declares, and an
+        # axis no level cuts values at 1 rather than dropping out.
+        buf = _cdbuf("A", [], {})
+        buf.division_space = _two_axis_space(tiling=_tiling_space({0: [2, 4], 1: [2]}))
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        syms = buf.sym_tile_counts
+        # One per dim the space offers a level on, not one per axis: an axis
+        # nothing can tile carries no decision to price.
+        self.assertEqual(set(syms), {_AXIS_0, _AXIS_1})
+        cost_expr = syms[_AXIS_0] * 10 + syms[_AXIS_1] * 100
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        untiled = _config(CoreDivision(splits={_AXIS_0: 2}))
+        tiled = _config(CoreDivision(splits={_AXIS_0: 2}, tiling=_TILE_4))
+        self.assertEqual(
+            solver._score_fn([untiled], frozenset()),
+            utils.to_fixed_us((10 + 100) / 1000),
+        )
+        self.assertEqual(
+            solver._score_fn([tiled], frozenset()),
+            utils.to_fixed_us((4 * 10 + 100) / 1000),
+        )
+
+    def test_a_space_without_tilings_declares_no_tile_symbol(self):
+        # Every engine but this one, and this one with auto_coarse_tiling off.
+        plain = _cdbuf("A", [], {})
+        self.assertEqual(plain.sym_tile_counts, {})
+        plain.division_space = _two_axis_space()
+        self.assertEqual(plain.sym_tile_counts, {})
+
     def test_unrecognized_free_symbol_falls_back_to_memory_only(self):
         # A dynamic-shape symbol (or anything else the allocator's build could
         # have left in) that isn't one of these buffers' own symbols must not

@@ -810,6 +810,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
                     chosen[idx].splits.get(key, 1)
                 )
+            # An axis the chosen tiling leaves alone values at 1, the untiled
+            # binding.
+            for axis, sym in buf.sym_tile_counts.items():
+                value_of[sym] = lambda chosen, resident, idx=idx, axis=axis, space=(
+                    buf.division_space
+                ): space.tile_counts(chosen[idx].tiling).get(axis, 1)
         try:
             free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):
