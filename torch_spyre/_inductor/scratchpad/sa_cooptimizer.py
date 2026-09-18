@@ -521,11 +521,12 @@ class _GeneratedDivisions(_DivisionSource):
 
         *Whether* to tile is priced: :meth:`SaCoOptimizingSolver._companion_bytes`
         charges the full-extent companion an escaping op needs, so a tiling move
-        is no longer accepted unconditionally. *How deep* to tile is not. The
-        objective sees depth only through a monotone per-core footprint, and the
-        companion charge is a function of the buffer's size and its outside
-        readers rather than of the tile count, so a drawn tiling is as deep as
-        the draw made it. Hence the flat untiled draw: it is what keeps
+        is no longer accepted unconditionally. *How deep* to tile is priced
+        only where the loop re-reads an operand whose index lacks the tiled
+        axis (its ``loop_factor``). Otherwise the objective sees depth only
+        through a monotone per-core footprint, and the companion charge is a
+        function of the buffer's size and its outside readers rather than of
+        the tile count, so a drawn tiling is as deep as the draw made it. Hence the flat untiled draw: it is what keeps
         undividing a region proposable at all, and recolor is the only
         long-range move there is.
 
@@ -1517,10 +1518,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
         :meth:`_companion_bytes` is added to both, at the HBM rate, because
         neither can express it: the cost expression is built once from the
-        untiled graph over splits and residency, with no symbol for a tiling, and
-        the fallback's spill costs are loop-invariant by construction. It is zero
-        unless a buffer is tiled, so a run that chooses no tiling scores exactly
-        as it did before this term existed.
+        untiled graph, so the full buffer the apply mints is not in it (its tile
+        counts price only the loop over each op), and the fallback's spill costs
+        are loop-invariant by construction. It is zero unless a buffer is tiled,
+        so a run that chooses no tiling scores exactly as it did before this term
+        existed.
         """
         addresses = self.packer.addresses
         companions = utils.to_fixed_us(
