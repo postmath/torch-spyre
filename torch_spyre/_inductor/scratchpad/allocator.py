@@ -2694,6 +2694,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             name: capture_iteration_frame(cast(ComputedBuffer, op_by_name[name]))
             for name in tiled
         }
+        # Read copies stay off until something can place the copy. Measured:
+        # the copy this route builds is minted in ``_post_solve``, after the
+        # addresses are final, so it lands in HBM -- and a staged HBM tile
+        # replaces a source read with a write plus a read of the same size.
+        # It pays only once the copy itself can be LX-resident, which is what
+        # makes ``CoarseTilingPass``'s switch a parameter rather than a
+        # constant.
         CoarseTilingPass(choices).apply_pass(graph)
         self._remap_tiled_symbols(graph, frames)
         # See ``JOINT_TILING_AND_DIVISION_ATTR``.

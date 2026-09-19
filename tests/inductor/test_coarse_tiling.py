@@ -129,6 +129,7 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_stride,
 )
 from utils_inductor import (
+    fixed_tiled_layout,
     ir_computed_buffer,
     ir_input_loader,
     patch_row_major_out_coords,
@@ -6210,6 +6211,76 @@ class TestPlanReadCopies(unittest.TestCase):
         )
         self.assertEqual(entries_by_name["only_a_buf"].consumer_op_names, ("op_a",))
         self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
+
+
+class TestPostStickifyReadCopySizing(unittest.TestCase):
+    """``_read_copy_can_be_sized`` and the planner's use of it."""
+
+    def setUp(self):
+        self.enterContext(
+            V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None)))
+        )
+
+    def _fixture(self, layout=None):
+        """The shared-read fixture with the source's committed layout swapped
+        in. Rank stays 2 throughout: the readers load through the source's own
+        indexer, which asserts on a rank it was not built against, so a
+        rank-changing swap would fail there rather than at the predicate under
+        test. Unit dims give the same mismatch at equal rank, and are one of
+        the three shapes the sizing walk names."""
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        if layout is not None:
+            full_buf.layout = layout
+        return op_a, op_b, full_buf, operations
+
+    def _only_dep(self, op):
+        from torch_spyre._inductor.wsr.coarse_tile import _full_buffer_read_deps
+
+        deps = list(_full_buffer_read_deps(op))
+        self.assertEqual(len(deps), 1)
+        return deps[0]
+
+    def test_a_committed_layout_of_matching_rank_is_sizable(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture(fixed_tiled_layout([64, 128], torch.float32))
+        dep = self._only_dep(op_a)
+        self.assertEqual(len(dep.size), 2)
+        self.assertTrue(_read_copy_can_be_sized(dep))
+
+    def test_a_committed_layout_of_fewer_non_unit_dims_than_extents_is_not(self):
+        # A read whose loop carries more variables than the buffer has real
+        # dimensions -- the broadcast-operand shape, and the same count a
+        # matmul operand fails on. Unit dims do not count: they are squeezed
+        # out of the dep and reinserted by the sizing walk.
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture(fixed_tiled_layout([1, 128], torch.float32))
+        self.assertFalse(_read_copy_can_be_sized(self._only_dep(op_a)))
+
+    def test_the_planner_drops_an_unsizable_read_rather_than_raising(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, _, operations = self._fixture(
+            fixed_tiled_layout([1, 128], torch.float32)
+        )
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+        self.assertEqual(
+            [entry for plan in plans.values() for entry in plan.entries], []
+        )
+
+    def test_the_planner_keeps_a_sizable_read(self):
+        # Non-vacuity for the test above: the same fixture, same call, one
+        # entry -- so an empty plan there is the predicate and not the fixture.
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, _, operations = self._fixture(
+            fixed_tiled_layout([64, 128], torch.float32)
+        )
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+        self.assertEqual(
+            len([entry for plan in plans.values() for entry in plan.entries]), 1
+        )
 
 
 class TestReadCopyPlanDataclasses(unittest.TestCase):

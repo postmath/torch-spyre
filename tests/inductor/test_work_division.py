@@ -29,7 +29,6 @@ from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
-    FlexibleLayout,
     Pointwise,
     Reduction,
 )
@@ -45,7 +44,6 @@ from torch_spyre._C import (
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import work_division_constraints
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
@@ -110,7 +108,7 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
-from utils_inductor import mock_op_split_space
+from utils_inductor import fixed_tiled_layout, mock_op_split_space
 
 
 def _isym(name):
@@ -120,22 +118,9 @@ def _isym(name):
     return Symbol(name, integer=True, positive=True)
 
 
-def _fixed_tiled_layout(shape, dtype=torch.float16, element_arrangement=None):
-    """Build the same kind of physical layout used by real Spyre lowering."""
-    size = list(shape)
-    stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
-    within_stick_dim = len(size) - 1
-    dim_order = [i for i in range(len(size)) if i != within_stick_dim]
-    dim_order.append(within_stick_dim)
-    device_layout = SpyreTensorLayout(size, stride, dtype, dim_order)
-    if element_arrangement is not None:
-        device_layout = device_layout.with_element_arrangement(element_arrangement)
-    return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
-
-
 def _tensor_dep(name, shape, symbols, element_arrangement=None, dtype=torch.float16):
     """Build a real TensorDep for a contiguous access over ``symbols``."""
-    layout = _fixed_tiled_layout(
+    layout = fixed_tiled_layout(
         shape, dtype=dtype, element_arrangement=element_arrangement
     )
     index = sympy.Integer(0)
@@ -153,7 +138,7 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     else:
         data = MagicMock(spec=Pointwise)
     data.ranges = list(shape)
-    layout = _fixed_tiled_layout(shape)
+    layout = fixed_tiled_layout(shape)
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
@@ -319,9 +304,9 @@ class TestEmptyLxEligibility(unittest.TestCase):
         quantized to FP8 rescales to zero FP8 sticks) is not an empty tensor.
         """
 
-        empty = _fixed_tiled_layout((0, 64))
-        nonempty = _fixed_tiled_layout((64, 64))
-        zero_extent = _fixed_tiled_layout((64, 64))
+        empty = fixed_tiled_layout((0, 64))
+        nonempty = fixed_tiled_layout((64, 64))
+        zero_extent = fixed_tiled_layout((64, 64))
         zero_extent.device_layout = SpyreTensorLayout(
             [1, 0, 64],
             [64, 64, 1],
@@ -396,7 +381,7 @@ class TestAlignedOwnershipSplitDomains(unittest.TestCase):
         output_td = _tensor_dep("repeat", (6, 128), (rows, cols))
         source = TensorDep(
             dep=MemoryDep("x", source_index(rows, cols), (rows, cols), (6, 128)),
-            layout=_fixed_tiled_layout(source_shape),
+            layout=fixed_tiled_layout(source_shape),
         )
         ctx = _make_context(
             op,
@@ -442,7 +427,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
             (96, frozenset({1})),
         ):
             with self.subTest(feature_extent=feature_extent):
-                source_layout = _fixed_tiled_layout((2, 8192, feature_extent))
+                source_layout = fixed_tiled_layout((2, 8192, feature_extent))
                 source_dep = MemoryDep(
                     "source",
                     8192 * feature_extent * head + feature + feature_extent * key,
@@ -472,7 +457,7 @@ class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
             loop_tiled_dims=[[]],
         )
         output_td = _tensor_dep("output", (2, 128, 64), (head, feature, key))
-        source_layout = _fixed_tiled_layout((2, 128, 128))
+        source_layout = fixed_tiled_layout((2, 128, 128))
         source_dep = MemoryDep(
             "source",
             128 * 128 * head + feature + 128 * key,
@@ -1046,7 +1031,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         )
         lhs = TensorDep(
             MemoryDep("lhs", 64 * rows + k, (rows, k), (8, 64)),
-            _fixed_tiled_layout(
+            fixed_tiled_layout(
                 (2, 4, 64), element_arrangement=ElementArrangement.FP32_TO_DL16
             ),
         )
@@ -1068,7 +1053,7 @@ class TestMatmulRowOrderSplitDomains(unittest.TestCase):
         # Matching physical row order must not ban a one-core matmul.
         ctx.output_td = TensorDep(
             MemoryDep("out", 64 * rows + n, (rows, n), (8, 64)),
-            _fixed_tiled_layout((2, 4, 64)),
+            fixed_tiled_layout((2, 4, 64)),
         )
         self.assertEqual(
             aligned_ownership_split_domains(ctx).allowed_splits[rows],
@@ -1177,11 +1162,11 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
                 MemoryDep(
                     "override_input", b * 1024 + m * 128 + n, (b, m, n), (4, 8, 128)
                 ),
-                _fixed_tiled_layout((4, 8, 128)),
+                fixed_tiled_layout((4, 8, 128)),
             ),
-            SchedNodeArg(kernel_dep, _fixed_tiled_layout((4, 128, 8))),
+            SchedNodeArg(kernel_dep, fixed_tiled_layout((4, 128, 8))),
         ]
-        override_layout = _fixed_tiled_layout(
+        override_layout = fixed_tiled_layout(
             (4, 128, 8), element_arrangement=ElementArrangement.QFP8WT
         )
         constrained_var = next(
@@ -3250,7 +3235,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         shape = (8, 128)  # 128 fp16 elements = 2 sticks, so both dims can split
         self.producer = _computed_buffer(shape, name="p")
         self.consumer = _computed_buffer(shape, name="cons")
-        layout = _fixed_tiled_layout(shape)
+        layout = fixed_tiled_layout(shape)
         self.write_dep = MemoryDep("p", 128 * self.x + self.y, (self.x, self.y), shape)
         self.read_dep = MemoryDep("p", 128 * self.r + self.c, (self.r, self.c), shape)
         consumer_write = MemoryDep(
