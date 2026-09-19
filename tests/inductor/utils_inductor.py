@@ -1034,6 +1034,31 @@ def mock_op_split_space(
     return space
 
 
+def fixed_tiled_layout(
+    shape: Iterable[int],
+    dtype: torch.dtype = torch.float16,
+    element_arrangement: Any = None,
+) -> Any:
+    """A ``FixedTiledLayout`` over ``shape``: contiguous host strides, the last
+    dim within the stick -- the physical layout real Spyre lowering builds."""
+    from torch._inductor.ir import FlexibleLayout
+
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    size = list(shape)
+    stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
+    if not size:
+        device_layout = SpyreTensorLayout([], dtype)
+    else:
+        device_layout = SpyreTensorLayout(
+            [int(s) for s in size], stride, dtype, list(range(len(size)))
+        )
+    if element_arrangement is not None:
+        device_layout = device_layout.with_element_arrangement(element_arrangement)
+    return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
+
+
 def ir_input_loader(name: str, size: list[int]) -> Callable:
     """A loader over a float32 CPU ``InputBuffer`` registered with the active
     graph handler."""
