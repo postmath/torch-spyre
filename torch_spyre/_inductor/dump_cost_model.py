@@ -147,9 +147,18 @@ def _real_layout(layout):
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         try:
             return layout.real_layout()
-        except Exception:  # noqa: BLE001 - target unresolvable: keep the old fallback
-            # (logical dims / HBM) rather than break extraction. The same op's
-            # _writes_graph_output resolves the same target and logs when it cannot.
+        except Exception as exc:  # noqa: BLE001 - best-effort feature extraction
+            target = getattr(layout, "target", None)
+            name = getattr(target, "name", None) or type(target).__name__
+            warn_once(
+                logger,
+                f"mutation-target:{name}",
+                "cannot resolve the buffer a mutating op writes into (%s: %s); its "
+                "write keeps the logical-dims / HBM answer, so the target's stick "
+                "padding goes under-counted and its LX residency ignored",
+                name,
+                exc,
+            )
             return layout
     return layout
 

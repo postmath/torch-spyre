@@ -33,7 +33,7 @@ import pytest
 import sympy
 
 import torch_spyre._inductor.dump_cost_model as dcm
-from torch_spyre._inductor import cost_model
+from torch_spyre._inductor import cost_model, logging_utils
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
     CostParams,
@@ -797,15 +797,24 @@ def test_the_extractor_sizes_and_places_a_mutating_write_by_its_target(monkeypat
     assert write.is_lx is True
 
 
-def test_an_unresolvable_target_falls_back_rather_than_raising(monkeypatch):
+def test_an_unresolvable_target_falls_back_rather_than_raising(monkeypatch, caplog):
     """Both helpers are best-effort: an op whose target buffer cannot be reached keeps
     the pre-existing logical-dims / HBM answer instead of breaking extraction (the
-    extractor-level case is pinned by the unreadable-write test above)."""
+    extractor-level case is pinned by the unreadable-write test above). Degraded
+    numbers are indistinguishable downstream from correct ones, so the log line is
+    the only signal that they are degraded -- as on the graph-output side."""
 
     class _BrokenTarget(_FakeMutationLayout):
+        target = SimpleNamespace(name="buf_gone")
+
         def real_layout(self):
             raise RuntimeError("target buffer is gone")
 
     monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _BrokenTarget)
-    assert dcm._device_dims(_BrokenTarget("buf1")) is None
-    assert dcm._mem_of_layout(_BrokenTarget("buf1")) == "hbm"
+    logging_utils._warned_once.discard((dcm.logger.name, "mutation-target:buf_gone"))
+    with caplog.at_level(logging.WARNING, logger="spyre.inductor.cost_model"):
+        assert dcm._device_dims(_BrokenTarget("buf1")) is None
+        assert dcm._mem_of_layout(_BrokenTarget("buf1")) == "hbm"
+    assert "buf_gone" in caplog.text
+    # Keyed on the target, so the second helper's identical failure stays quiet.
+    assert len(caplog.records) == 1
