@@ -30,7 +30,8 @@ ops that share a spec.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from typing import Optional
 
 import sympy
 
@@ -300,10 +301,18 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     """
 
     def __init__(
-        self, choices: Mapping[str, TileSpec], read_copies: bool = False
+        self,
+        choices: Mapping[str, TileSpec],
+        staged_reads: Optional[Mapping[tuple[str, str], Collection[str]]] = None,
     ) -> None:
         self._choices = dict(choices)
-        self._read_copies = read_copies
+        # ``(source, sizing op)`` pairs a planner placed a staging copy for,
+        # each mapped to the readers that copy may serve.
+        # ``None`` runs no read copies at all: an unplaced copy lands in HBM,
+        # where it costs a write and a read to save nothing.
+        self._staged_reads = staged_reads
+        # Copy name -> the pair it was staged for, once ``apply_pass`` ran.
+        self.staged_copies: dict[str, tuple[str, str]] = {}
 
     def _stamped_groups(self, graph: GraphLowering) -> list[tuple]:
         """Derive the groups and stamp each member's ``dim_hints``.
@@ -373,9 +382,10 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # what is in LX: the copy is tile-sized with fresh contiguous strides,
         # which is the cheapest thing a tiled op could hold resident, against an
         # operand the loop otherwise re-reads from HBM every iteration.
-        coarse_tile_post_stickify(
+        self.staged_copies = coarse_tile_post_stickify(
             graph,
             groups=groups,
             group_idx_offset=group_idx_offset,
-            run_read_copies=self._read_copies,
+            run_read_copies=self._staged_reads is not None,
+            staged_reads=self._staged_reads,
         )

@@ -65,6 +65,7 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import SolverToPermutation
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
+    CoarseTileReadCopyBuffer,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
@@ -936,7 +937,66 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         bufs = self._bufs
         self._name_to_idx = {b.name: i for i, b in enumerate(bufs)}
         n = len(bufs)
+        self._build_operation_positions()
         self._parents_idx: list[set[int]] = [set() for _ in range(n)]
+        # buffer idx -> the predicted read copies whose size or existence ITS
+        # config can change (see ``_staged_reads`` for why these). Not a
+        # parent/child edge: nothing reads a copy in the pre-apply graph, and an
+        # edge would put it through the slicing-match gates, which is not what
+        # couples them (see CoarseTileReadCopyBuffer).
+        self._read_copies_of: list[list[int]] = [[] for _ in range(n)]
+        # reader idx -> its copies, the only ones its config resizes.
+        self._read_copies_sized_by: list[list[int]] = [[] for _ in range(n)]
+        # copy idx -> (source idx or None, the readers with an operation
+        # position, their positions, the conflicting ones).
+        self._read_copy_topology: dict[
+            int,
+            tuple[Optional[int], tuple[int, ...], tuple[int, ...], frozenset[int]],
+        ] = {}
+        # copy idx -> the positions its run numbering spans: its readers', back
+        # to the earliest op any position between them reads (:meth:`_breaks_at`).
+        self._read_copy_span: dict[int, tuple[int, int]] = {}
+        at_position = {
+            b.op_position: i for i, b in enumerate(bufs) if b.op_position is not None
+        }
+        for idx, buf in enumerate(bufs):
+            if not isinstance(buf, CoarseTileReadCopyBuffer):
+                continue
+            source_idx = self._name_to_idx.get(buf.source)
+            placed = [
+                (r, at)
+                for name in buf.readers
+                if (at := bufs[r := self._name_to_idx[name]].op_position) is not None
+            ]
+            readers = tuple(r for r, _ in placed)
+            positions = tuple(at for _, at in placed)
+            conflicting = frozenset(self._name_to_idx[name] for name in buf.conflicting)
+            self._read_copy_topology[idx] = (
+                source_idx,
+                readers,
+                positions,
+                conflicting,
+            )
+            first, last = (positions[0], positions[-1]) if positions else (0, -1)
+            if positions:
+                first = min(
+                    [first]
+                    + [
+                        producer
+                        for at in range(first, last + 1)
+                        for producer, _ in self._tile_reads.get(at, ())
+                    ]
+                )
+                self._read_copy_span[idx] = (first, last)
+            watched = {buf.reader_index, *readers}
+            watched.update(
+                at_position[at] for at in range(first, last + 1) if at in at_position
+            )
+            if source_idx is not None:
+                watched.add(source_idx)
+            for watcher in sorted(watched):
+                self._read_copies_of[watcher].append(idx)
+            self._read_copies_sized_by[buf.reader_index].append(idx)
         # parent_idx -> list of (child_idx, the p->c relation)
         self._children: list[list[tuple[int, _EdgeRelation]]] = [[] for _ in range(n)]
         foreign_parents = 0
@@ -974,7 +1034,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # undividing to atomic flips. Static; what a given step can actually
         # draw is :meth:`_DivisionSource.anchor`.
         self._anchor_candidates = [i for i in range(n) if self._sources[i].can_split()]
-        self._build_operation_positions()
         # Whether any buffer can carry a tiling at all, so the companion term
         # costs one bool per score where it cannot -- which is every graph with
         # ``auto_coarse_tiling`` off, and the parity gate's whole corpus.
@@ -1293,15 +1352,29 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
         *placeable* at zero footprint is
         :meth:`_assert_unsized_buffers_are_pinned`."""
+        buf = self._bufs[idx]
+        if isinstance(buf, CoarseTileReadCopyBuffer):
+            # Sized against the READER's config, not its own: the copy holds one
+            # core's share of one of the reader's tiles, and its own division is
+            # a pinned no-op that decides nothing. Zero when the reader is
+            # untiled, which is also when the apply mints nothing -- so the slot
+            # is present and free, the shape stage 5 settled on for an absent
+            # companion (``resize(i, 0)`` plus ``set_eligible(i, False)``).
+            reader = self.chosen[buf.reader_index]
+            if reader.tiling.is_untiled:
+                return 0
+            divisor = reader.output_partition * reader.output_tile_count
+            return max(0, ceil_div(buf.size, divisor))
         divisor = config.output_partition * config.output_tile_count
-        return max(0, ceil_div(self._bufs[idx].size, divisor))
+        return max(0, ceil_div(buf.size, divisor))
 
-    def _eligible(self, idx: int) -> bool:
+    def _eligible(self, idx: int, runs: Optional[tuple[int, list[int]]] = None) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``
         (the three division-dependent gates, mirroring
         ``DfsLayoutSolver._evaluate``): the fixed residency pin, a per-core
         footprint that fits at all, and a division every child edge's
-        :class:`_EdgeRelation` calls compatible.
+        :class:`_EdgeRelation` calls compatible. ``runs`` is
+        :meth:`_runs_over`'s, where a ripple built it once for its copies.
 
         That relation is per-core-view based, not ``is_clean`` based: a reduction
         split can appear on the *consumer* side (a K-split reading a clean parent
@@ -1313,6 +1386,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # limit`` test, which is division-dependent and is the next gate down.
         if b.residency_reason is not None:
             return False
+        if isinstance(b, CoarseTileReadCopyBuffer):
+            # It exists only while the apply would mint it. Nothing else
+            # applies -- it has no children, and its own division decides
+            # nothing.
+            if not self._staged_reads(idx, runs):
+                return False
+            return self._per_core_size(idx, self.chosen[idx]) <= self.limit
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
         parent = self.chosen[idx]
@@ -1360,7 +1440,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         What this costs is the residency of every cross-boundary operand, which
         is real -- and is what a staged tile-local read copy exists to give back
         (``coarse_tile._plan_read_copies``): the copy does not advance, so it can
-        be resident where its source cannot. Nothing places one yet.
+        be resident where its source cannot. The solve places it as a
+        :class:`CoarseTileReadCopyBuffer`.
         """
         if not self._tilings_are_possible or not parent.tiling.is_untiled:
             return False
@@ -1550,6 +1631,102 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             total += copy_read + copy_write + outside_reads
         return total
 
+    def _staged_reads(
+        self, idx: int, runs: Optional[tuple[int, list[int]]] = None
+    ) -> int:
+        """How many ops read through predicted copy ``idx`` under the current
+        state, or 0 where the apply would not mint exactly this copy.
+
+        The apply mints one copy per distinct read of a source in a group, on
+        its first reader (``_plan_read_copies``). So this copy exists only while
+        its reader is tiled and first among the group's readers of the source,
+        while every one of them makes that same one read, and while the source
+        is untiled: a source in the reader's group is loop-internal and staged
+        by nobody, and one tiled in another run is repointed at its ``full_buf``
+        by Pass 3. Refusing that last case outright is what keeps the
+        prediction to reads whose source the apply leaves alone.
+
+        The group is the reader's run, which is the apply's group
+        (:meth:`_run_bounds`). Only the runs over the copy's span
+        (``_read_copy_span``) matter, so that span and the source are all a
+        copy depends on -- what ``_read_copies_of`` ripples it from.
+        """
+        buf = self._bufs[idx]
+        reader = buf.reader_index
+        if self.chosen[reader].tiling.is_untiled:
+            return 0
+        source_idx, readers, positions, conflicting = self._read_copy_topology[idx]
+        if reader not in readers:
+            return 0
+        if source_idx is not None and not self.chosen[source_idx].tiling.is_untiled:
+            return 0
+        if runs is None:
+            runs = self._runs_over([idx])
+        base, run_of = runs
+        run = run_of[self._position_of[reader] - base]
+        in_group = [r for r, at in zip(readers, positions) if run_of[at - base] == run]
+        if not in_group or in_group[0] != reader or conflicting.intersection(in_group):
+            return 0
+        # One read gains nothing: the copy op itself makes it.
+        return len(in_group) if len(in_group) > 1 else 0
+
+    def _runs_over(self, copies: Iterable[int]) -> tuple[int, list[int]]:
+        """``(base, run)``: ``run[p - base]`` numbers the tiling run holding
+        position ``p``, over the spans of ``copies`` -- all
+        :meth:`_staged_reads` compares, so a ripple builds it once.
+
+        Exact between readers although the scan may start mid-stretch: a
+        break there tests only reads of positions the span reaches back to.
+        """
+        spans = [self._read_copy_span[c] for c in copies if c in self._read_copy_span]
+        if not spans:
+            return 0, []
+        lo, hi = min(span[0] for span in spans), max(span[1] for span in spans)
+        run_of = []
+        run, spec, stretch = 0, self._tiling_at(lo), lo
+        for position in range(lo, hi + 1):
+            at = self._tiling_at(position)
+            if at != spec:
+                run, spec, stretch = run + 1, at, position
+            elif self._breaks_at(position, stretch, spec):
+                run += 1
+            run_of.append(run)
+        return lo, run_of
+
+    def _read_copy_savings(self, addresses: Sequence[Optional[int]]) -> int:
+        """HBM bytes a resident staged read copy saves, under the current state.
+
+        A tiled op reading a buffer produced outside its run pays one HBM pass
+        over that source per read, and cannot hold the source resident to avoid
+        it -- the address moves and LX addresses cannot
+        (:meth:`_read_across_a_tiling_boundary`). Staging the read into a
+        tile-local copy that IS resident replaces ``r`` of those passes with one:
+        the copy op reads the source once and the ``r`` readers then read LX.
+
+        So the saving is ``(r - 1) * size``, and only while the copy holds an
+        address. Not resident, the apply is told not to stage the read at all
+        (``_apply_chosen_tilings`` hands it the placed pairs), so the graph is
+        the one the expression already priced and this is correctly zero -- which
+        also means an HBM staging tile, which would cost a write and a read to
+        save nothing, is never built.
+
+        Deliberately not netted against the copy op's own read of the source:
+        that pass is one of the ``r`` the expression already charges, so counting
+        the saving over ``r - 1`` has already paid for it. A read copy for a
+        single read (``r == 1``) therefore saves nothing and is never worth
+        placing, which is the arithmetic and not a special case.
+        """
+        if not self._tilings_are_possible:
+            return 0
+        total = 0
+        for idx, buf in enumerate(self._bufs):
+            if not isinstance(buf, CoarseTileReadCopyBuffer):
+                continue
+            if addresses[idx] is None:
+                continue
+            total += max(0, buf.size) * max(0, self._staged_reads(idx) - 1)
+        return total
+
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
         time units. A buffer with a packer address is LX-resident (its address is
@@ -1564,17 +1741,18 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         and only spilled ones are summed, the same shape as the CP-SAT engine's
         ``spill_cost() * (1 - in_buffer)``.
 
-        :meth:`_companion_bytes` is added to both, at the HBM rate, because
-        neither can express it: the cost expression is built once from the
-        untiled graph, so the full buffer the apply mints is not in it (its tile
-        counts price only the loop over each op), and the fallback's spill costs
-        are loop-invariant by construction. It is zero unless a buffer is tiled,
-        so a run that chooses no tiling scores exactly as it did before this term
-        existed.
+        :meth:`_companion_bytes` and :meth:`_read_copy_savings` are added to both,
+        at the HBM rate, because neither objective can express them: the cost
+        expression is built once from the untiled graph (its tile counts price
+        only the loop over each op), and neither the full buffer the apply mints
+        nor the staged tile it reads through is in it. Both are zero unless a
+        buffer is tiled, so a run that chooses no tiling scores exactly as it did
+        before they existed.
         """
         addresses = self.packer.addresses
         companions = utils.to_fixed_us(
-            self._companion_bytes(addresses) / self._hbm_bytes_per_us
+            (self._companion_bytes(addresses) - self._read_copy_savings(addresses))
+            / self._hbm_bytes_per_us
         )
         if self._score_fn is not None:
             resident = frozenset(
@@ -1604,14 +1782,23 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Change buffer ``idx``'s division to ``config`` and ripple: resize its
         per-core footprint, then refresh eligibility for ``idx`` and its parents.
         Those are the only buffers a flip can change, since eligibility depends on
-        an op's own division and its children's."""
-        affected = sorted({idx} | self._parents_idx[idx])
-        before = sum(self._eligible(x) for x in affected)
+        an op's own division and its children's -- plus the staged read copies
+        whose existence or size this buffer's config enters
+        (``_read_copies_of``)."""
+        copies = self._read_copies_of[idx]
+        affected = sorted({idx} | self._parents_idx[idx] | set(copies))
+        runs = self._runs_over(copies)
+        before = sum(self._eligible(x, runs) for x in affected)
         self.chosen[idx] = config
         self.packer.resize(idx, self._per_core_size(idx, config))
+        for copy_idx in self._read_copies_sized_by[idx]:
+            self.packer.resize(
+                copy_idx, self._per_core_size(copy_idx, self.chosen[copy_idx])
+            )
+        runs = self._runs_over(copies)
         after = 0
         for x in affected:
-            flag = self._eligible(x)
+            flag = self._eligible(x, runs)
             after += flag
             self.packer.set_eligible(x, flag)
         self._n_eligible += after - before
@@ -1786,15 +1973,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         affected = set(assignment)
         for op in assignment:
             affected |= self._parents_idx[op]
+            affected.update(self._read_copies_of[op])
         affected_sorted = sorted(affected)
-        before = sum(self._eligible(x) for x in affected_sorted)
+        copies = {c for op in assignment for c in self._read_copies_of[op]}
+        runs = self._runs_over(copies)
+        before = sum(self._eligible(x, runs) for x in affected_sorted)
         for op, config in assignment.items():
             self.chosen[op] = config
-        for op in sorted(assignment):
+        sized = {c for op in assignment for c in self._read_copies_sized_by[op]}
+        for op in sorted(set(assignment) | sized):
             self.packer.resize(op, self._per_core_size(op, self.chosen[op]))
+        runs = self._runs_over(copies)
         after = 0
         for x in affected_sorted:
-            flag = self._eligible(x)
+            flag = self._eligible(x, runs)
             after += flag
             self.packer.set_eligible(x, flag)
         self._n_eligible += after - before
@@ -2041,7 +2233,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _anneal(self) -> None:
         """One geometric cool over the clamped step budget, at fixed proposal
         weights, publishing the best state seen."""
-        n = len(self._bufs)
+        # The budget is per *decision*, not per slot. A predicted read copy
+        # carries a residency bit and nothing else -- it is pinned to one no-op
+        # division, so it appears in neither ``_flippable`` nor
+        # ``_anchor_candidates`` -- and buying `_STEPS_PER_BUFFER` more steps
+        # for it would pay for a search that did not get harder, while pushing
+        # a large graph over the `_MAX_STEPS` ceiling the 2026-09-17 retune
+        # deliberately left inert.
+        n = sum(not isinstance(b, CoarseTileReadCopyBuffer) for b in self._bufs)
         steps = min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
         if _STEPS_PER_BUFFER * n > _MAX_STEPS:
             logger.debug(

@@ -2399,6 +2399,7 @@ class _SqueezingTilingPass:
 
     def __init__(self, choices, **_):
         self.choices = choices
+        self.staged_copies = {}
 
     def plan_only(self, graph):
         pass
@@ -2517,6 +2518,60 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
             [32, 1024], TileSpec((TileAxis(host_dim=0, count=32),)), {1: 4}
         ) as applied:
             self.assertEqual(self._committed(applied), {1024: 4})
+
+    @staticmethod
+    def _minted(name, sizes, source):
+        """A copy op the apply would mint, over ``sizes``, reading ``source``."""
+        from torch._inductor.virtualized import ops
+
+        strides = [math.prod(sizes[i + 1 :]) for i in range(len(sizes))]
+        copy = ComputedBuffer(
+            name=name,
+            layout=FixedLayout(torch.device("cpu"), torch.float16, sizes),
+            data=Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                inner_fn=lambda index: ops.load(
+                    source, sum(s * i for s, i in zip(strides, index))
+                ),
+                ranges=[sympy.Integer(s) for s in sizes],
+            ),
+        )
+        copy.operation_name = copy.name
+        return copy
+
+    def test_a_staged_read_copy_takes_its_readers_live_splits(self):
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoarseTileReadCopyBuffer,
+        )
+
+        with self._applied(
+            [4, 64, 256, 128], TileSpec((TileAxis(host_dim=0, count=4),)), {1: 16}
+        ) as applied:
+            copy = self._minted("coarse_tile_read_copy_x", [1, 64, 256, 128], "x")
+            applied.allocation.append(
+                CoarseTileReadCopyBuffer(
+                    name="staged",
+                    size=1,
+                    uses=[0],
+                    core_divisions=[CoreDivision()],
+                    chosen_division=0,
+                    address=0,
+                    source="x",
+                    reader="tiled",
+                )
+            )
+            applied.graph.get_buffer.return_value = applied.op
+            with patch.object(
+                CoOptimizingAllocator,
+                "_staged_read_copies",
+                return_value=[(copy, ("x", "tiled"), {"tiled"})],
+            ):
+                applied.allocator._commit_staged_read_copy_divisions(
+                    applied.graph, applied.allocation
+                )
+            (committed,) = [c.args[1] for c in applied.commit.call_args_list]
+            self.assertEqual(self._by_extent(copy, committed), {64: 16})
 
 
 class TestTopKConstraints(unittest.TestCase):

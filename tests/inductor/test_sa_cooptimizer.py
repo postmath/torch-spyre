@@ -78,6 +78,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
 from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
+    CoarseTileReadCopyBuffer,
     CoreDivision,
     CoreDivisionBuffer,
     TileAxis,
@@ -1408,6 +1409,470 @@ class ConfigStateTest(TestCase):
                     config.division,
                     f"{case}[{gi}] {buf.name}",
                 )
+
+
+def _read_copy(
+    source, reader, reader_index, readers=None, conflicting=(), size=1024, uses=(0, 1)
+):
+    readers = tuple(readers or (reader,))
+    return CoarseTileReadCopyBuffer(
+        name=f"__spyre_coarse_tile__:read:{source}:{reader}",
+        size=size,
+        uses=list(uses),
+        first_use_is_read=False,
+        in_place_parents=[],
+        residency_reason=None,
+        core_divisions=[CoreDivision()],
+        parents=[],
+        cd_parent_matches={},
+        boundary=BufferType.Intermediate,
+        source=source,
+        reader=reader,
+        reader_index=reader_index,
+        readers=readers,
+        conflicting=tuple(conflicting),
+    )
+
+
+def _staging_solver(
+    readers, copies_for, source_position=None, conflicting=(), ops=None, misreads=None
+):
+    """Tileable ``ops`` (default ``readers``) at positions 0.., source ``S``
+    (tileable where it has a position), and one predicted copy per name in
+    ``copies_for``, read by ``readers``. ``misreads`` maps an op to the ops it
+    reads along no tiled dim as written."""
+    bufs = []
+    ops = readers if ops is None else ops
+    for at, name in enumerate(ops):
+        buf = _two_axis_buffer(name=name)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        buf.op_position = at
+        buf.tile_aligned_parents = dict.fromkeys((misreads or {}).get(name, ()))
+        bufs.append(buf)
+    source = _two_axis_buffer(name="S")
+    if source_position is not None:
+        source.division_space = _two_axis_space(tiling=_tiling_space())
+        source.op_position = source_position
+    bufs.append(source)
+    for name in copies_for:
+        bufs.append(
+            _read_copy(
+                "S",
+                name,
+                reader_index=ops.index(name),
+                readers=readers,
+                conflicting=conflicting,
+            )
+        )
+    return _primed_topology(bufs)
+
+
+def _tile(solver, names, spec):
+    for name in names:
+        solver.chosen[solver._name_to_idx[name]] = _config(
+            CoreDivision({_AXIS_0: 2}, tiling=spec)
+        )
+
+
+class StagedReadCopyTest(TestCase):
+    """A predicted staging copy is a buffer the solver places, sized and gated
+    on its READER's config rather than its own.
+
+    It exists because the source it stands in for may not be resident while a
+    tiled op reads it (:meth:`_read_across_a_tiling_boundary`) -- the address
+    moves and an LX address cannot. The copy holds one tile at a fixed address,
+    so it can be, and the residency it wins back is the whole point of it.
+
+    It exists only in the states where the apply would mint exactly it, so what
+    the search places and credits is what the apply builds.
+    """
+
+    def _solver(self, readers=("R", "B")):
+        return _staging_solver(readers, copies_for=readers[:1])
+
+    def _copy(self, solver, reader):
+        return solver._name_to_idx[f"__spyre_coarse_tile__:read:S:{reader}"]
+
+    def test_it_is_sized_against_the_readers_tiling(self):
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_4))
+        # 1024 bytes over the reader's 2 cores and 4 tiles.
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 128)
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 256)
+
+    def test_an_untiled_reader_leaves_it_absent(self):
+        # Nothing to stage, so the slot is held at zero and ineligible -- the
+        # shape stage 5 settled on for a companion that does not exist.
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}))
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 0)
+        self.assertFalse(solver._eligible(3))
+
+    def test_a_tiled_group_makes_it_eligible(self):
+        solver = self._solver()
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertTrue(solver._eligible(3))
+
+    def test_the_saving_is_over_the_reads_it_replaces_beyond_the_first(self):
+        """The copy op makes one HBM pass over the source whatever happens, so
+        ``r`` reads become one pass plus ``r`` LX reads -- a saving of
+        ``(r - 1) * size``, and only while the copy holds an address."""
+        solver = self._solver(readers=("R", "B", "C"))
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        self.assertEqual(solver._read_copy_savings([None] * 4 + [0]), 2 * 1024)
+        self.assertEqual(solver._read_copy_savings([None] * 5), 0)
+
+    def test_it_carries_no_division_decision(self):
+        # Pinned to one no-op division, so it is in neither move set -- which is
+        # also why it must not buy the anneal more steps.
+        solver = self._solver()
+        self.assertNotIn(3, solver._flippable())
+        self.assertNotIn(3, solver._anchor_candidates)
+
+    def test_the_step_budget_counts_decisions_not_slots(self):
+        solver = self._solver()
+        self.assertEqual(
+            sum(not isinstance(b, CoarseTileReadCopyBuffer) for b in solver._bufs),
+            3,
+        )
+        self.assertEqual(len(solver._bufs), 4)
+
+    def test_a_flip_resizes_and_regates_the_readers_copies(self):
+        """The copy's size and existence follow the reader's config, so a move
+        on the reader has to ripple to it -- it is in no parent/child edge, so
+        the ordinary ripple would miss it."""
+        solver = self._solver()
+        _tile(solver, ["R", "B"], _TILE_2)
+        solver.packer.resize(3, solver._per_core_size(3, solver.chosen[3]))
+        solver.packer.set_eligible(3, True)
+        self.assertIn(3, solver._read_copies_of[0])
+        solver._atomic_flip(0, _config(CoreDivision({_AXIS_0: 2})))
+        self.assertEqual(solver._per_core_size(3, solver.chosen[3]), 0)
+        self.assertFalse(solver._eligible(3))
+
+    def test_a_flip_on_a_later_reader_regates_the_copy(self):
+        # Splitting the group off before B leaves R the only reader, which
+        # saves nothing: the ripple has to reach the copy from B too.
+        solver = self._solver()
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertIn(3, solver._read_copies_of[1])
+        solver._atomic_flip(1, _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_4)))
+        self.assertFalse(solver._eligible(3))
+
+    def test_a_flip_between_the_readers_regates_the_copy(self):
+        # M reads nothing, but splitting the run at M splits R from B.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), ops=("R", "M", "B"))
+        copy_ = self._copy(solver, "R")
+        _tile(solver, ["R", "M", "B"], _TILE_2)
+        solver.packer.set_eligible(copy_, True)
+        solver._n_eligible = sum(solver._eligible(i) for i in range(len(solver._bufs)))
+        solver._atomic_flip(1, _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_4)))
+        self.assertFalse(solver._eligible(copy_))
+        self.assertEqual(
+            solver._n_eligible,
+            sum(solver._eligible(i) for i in range(len(solver._bufs))),
+        )
+
+    def test_a_source_tiled_in_another_run_has_no_copy(self):
+        """Pass 3 repoints the copy at such a source's ``full_buf``, which no
+        placed pair names; it is not predicted rather than followed."""
+        solver = _staging_solver(("R", "B"), copies_for=("R",), source_position=3)
+        _tile(solver, ["R", "B"], _TILE_2)
+        _tile(solver, ["S"], _TILE_4)
+        self.assertEqual(solver._staged_reads(3), 0)
+        self.assertFalse(solver._eligible(3))
+        self.assertEqual(solver._read_copy_savings([None] * 3 + [0]), 0)
+
+    def test_a_source_in_the_readers_own_run_has_no_copy(self):
+        # Loop-internal scratch: the apply stages nothing, so nothing is owed.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), source_position=2)
+        _tile(solver, ["R", "B", "S"], _TILE_2)
+        self.assertFalse(solver._eligible(3))
+        self.assertEqual(solver._read_copy_savings([None] * 3 + [0]), 0)
+
+    def test_only_the_groups_first_reader_has_a_copy(self):
+        """The apply mints one copy per read in a group, sized on its first
+        reader, so a later reader's prediction is dead while the group holds
+        an earlier one -- and live once a boundary makes it first."""
+        solver = _staging_solver(("R", "B", "C"), copies_for=("R", "B"))
+        first, second = self._copy(solver, "R"), self._copy(solver, "B")
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        self.assertEqual(solver._staged_reads(first), 3)
+        self.assertFalse(solver._eligible(second))
+        _tile(solver, ["R"], _TILE_4)
+        self.assertFalse(solver._eligible(first))
+        self.assertEqual(solver._staged_reads(second), 2)
+
+    def test_reads_are_counted_over_the_group_not_the_run(self):
+        solver = _staging_solver(("R", "B", "C"), copies_for=("R",))
+        _tile(solver, ["R", "B"], _TILE_2)
+        _tile(solver, ["C"], _TILE_4)
+        placed = [None] * 4 + [0]
+        self.assertEqual(solver._read_copy_savings(placed), 1024)
+
+    def test_reads_are_counted_over_the_applied_group(self):
+        # B misreads R, so the apply puts them in two groups: R reads alone.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), misreads={"B": ["R"]})
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertEqual(solver._staged_reads(3), 0)
+
+    def test_a_flip_before_the_readers_regates_the_copy(self):
+        # B misreads X: while X shares the stretch B starts a group, and
+        # untiling X joins R and B, so X's flip has to reach the copy.
+        solver = _staging_solver(
+            ("R", "B"), copies_for=("R",), ops=("X", "R", "B"), misreads={"B": ["X"]}
+        )
+        copy_ = self._copy(solver, "R")
+        _tile(solver, ["X", "R", "B"], _TILE_2)
+        solver._n_eligible = sum(solver._eligible(i) for i in range(len(solver._bufs)))
+        self.assertFalse(solver._eligible(copy_))
+        solver._atomic_flip(0, _config(CoreDivision({_AXIS_0: 2})))
+        self.assertEqual(solver._staged_reads(copy_), 2)
+        self.assertEqual(
+            solver._n_eligible,
+            sum(solver._eligible(i) for i in range(len(solver._bufs))),
+        )
+
+    def test_a_group_reading_the_source_another_way_has_no_copy(self):
+        # The apply would stage B's other read as a second copy.
+        solver = _staging_solver(("R", "B"), copies_for=("R",), conflicting=("B",))
+        _tile(solver, ["R", "B"], _TILE_2)
+        self.assertFalse(solver._eligible(3))
+        _tile(solver, ["B"], _TILE_4)
+        self.assertFalse(solver._eligible(3))  # R alone saves nothing
+
+    def test_a_placed_copy_matches_a_from_scratch_packer(self):
+        """Every buffer a copy's existence depends on ripples to it -- readers,
+        a non-reader between them, the source -- through both a flip and a
+        multi-op assignment, so the incremental packer stays equal to one
+        rebuilt from the state."""
+        specs = [None, _TILE_2, _TILE_4]
+
+        def config(spec):
+            if spec is None:
+                return _config(CoreDivision({_AXIS_0: 2}))
+            return _config(CoreDivision({_AXIS_0: 2}, tiling=spec))
+
+        for seed in range(20):
+            rng = rnd.Random(seed)
+            s = _staging_solver(
+                ("R", "B", "C"),
+                copies_for=("R", "B"),
+                source_position=4,
+                conflicting=("C",) if seed % 3 == 0 else (),
+                ops=("R", "M", "B", "C"),
+                misreads={"C": ["M"]} if seed % 2 else None,
+            )
+            n = len(s._bufs)
+            positional = [s._name_to_idx[name] for name in ("R", "M", "B", "C", "S")]
+            for step in range(15):
+                if rng.random() < 0.5:
+                    s._atomic_flip(rng.choice(positional), config(rng.choice(specs)))
+                else:
+                    ops = rng.sample(positional, rng.randint(1, 3))
+                    s._apply_assignment({op: config(rng.choice(specs)) for op in ops})
+                eligible = [s._eligible(i) for i in range(n)]
+                tag = f"seed={seed} step={step}"
+                self.assertEqual(s._n_eligible, sum(eligible), tag)
+                fresh = make_permutation_packer(
+                    s._lifetime_buffers(
+                        [s._per_core_size(i, s.chosen[i]) for i in range(n)]
+                    ),
+                    list(s.packer.permutation),
+                    s.limit,
+                    s.alignment,
+                    eligible=eligible,
+                )
+                self.assertEqual(list(fresh.addresses), list(s.packer.addresses), tag)
+
+
+def _staging_graph(reads):
+    """A graph whose op ``name`` reads source ``S`` at each offset in
+    ``reads[name]``, in the dict's order, and ``T`` where that list is empty;
+    plus a tileable solver buffer per op at its position and one for ``S``."""
+    import torch
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, InputBuffer
+    from torch._inductor.ir import Pointwise
+    from torch._inductor.virtualized import V, ops
+
+    device = torch.device("cpu")
+    for name in ("S", "T"):
+        V.graph.name_to_buffer[name] = InputBuffer(
+            name=name, layout=FixedLayout(device, torch.float16, [65])
+        )
+
+    def reader(name, offsets):
+        def inner_fn(index):
+            (i,) = index
+            loads = [ops.load("S", i + off) for off in offsets] or [ops.load("T", i)]
+            out = loads[0]
+            for load in loads[1:]:
+                out = out + load
+            return out
+
+        op = ComputedBuffer(
+            name=name,
+            layout=FixedLayout(device, torch.float16, [64]),
+            data=Pointwise(
+                device=device,
+                dtype=torch.float16,
+                inner_fn=inner_fn,
+                ranges=[sympy.Integer(64)],
+            ),
+        )
+        op.operation_name = name
+        return op
+
+    operations = [reader(name, offsets) for name, offsets in reads.items()]
+    buffers = []
+    for at, op in enumerate(operations):
+        buf = _two_axis_buffer(name=op.get_name())
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        buf.op_position = at
+        buf.uses = [at, at + 1]
+        buffers.append(buf)
+    buffers.append(_two_axis_buffer(name="S"))
+    return SimpleNamespace(operations=operations), buffers
+
+
+class StagedReadCopyPredictionTest(TestCase):
+    """``_coarse_tile_read_copies`` predicts, per (source, reader), the copies
+    ``_plan_read_copies`` could mint, keyed on the same read key."""
+
+    def setUp(self):
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        self._graph_ctx = V.set_graph_handler(
+            GraphLowering(fx.symbolic_trace(lambda: None))
+        )
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _predict(self, reads):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        graph, buffers = _staging_graph(reads)
+        allocator = SimpleNamespace(_solver_chooses_tilings=True)
+        return CoOptimizingAllocator._coarse_tile_read_copies(allocator, graph, buffers)
+
+    def test_every_reader_but_the_last_is_predicted_once(self):
+        copies = self._predict({"A": [0], "B": [0], "C": [0]})
+        self.assertEqual([c.reader for c in copies], ["A", "B"])
+        for copy_ in copies:
+            self.assertEqual(copy_.readers, ("A", "B", "C"))
+
+    def test_a_reader_with_two_reads_of_the_source_is_not_predicted(self):
+        # x[1:] + x[:-1]: two copies would share one reservation.
+        self.assertEqual(self._predict({"A": [0, 1], "B": [0]}), [])
+
+    def test_a_reader_reading_it_another_way_is_conflicting(self):
+        (copy_,) = self._predict({"A": [0], "B": [1]})
+        self.assertEqual(copy_.conflicting, ("B",))
+
+    def test_it_lives_until_the_runs_last_reader(self):
+        """The copy is read by every group op reading the source, not just
+        the first, so its interval runs to the last of them."""
+        (copy_,) = self._predict({"A": [0], "M": [], "B": [0]})
+        self.assertEqual((copy_.uses[0], copy_.uses[-1]), (0, 2))
+
+
+class StagedReadCopyJoinTest(TestCase):
+    """The apply's copies are joined to the solve's reservations by the pair
+    ``CoarseTilingPass`` reports, and a copy one reservation cannot hold alone
+    is left in HBM rather than stamped."""
+
+    def _allocator(self, staged):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        allocator = CoOptimizingAllocator.__new__(CoOptimizingAllocator)
+        allocator._staged_copies = dict(staged)
+        allocator._tiling_symbol_remaps = {}
+        allocator._set_one_allocation = mock.Mock()
+        return allocator
+
+    @staticmethod
+    def _op(name, reads=()):
+        from torch._inductor.dependencies import MemoryDep
+
+        d0 = sympy.Symbol("d0")
+        deps = [MemoryDep(source, d0, (d0,), (64,)) for source in reads]
+        return SimpleNamespace(
+            name=name, get_read_writes=lambda: SimpleNamespace(reads=deps)
+        )
+
+    def _setup(self, operations, readers=("R", "B")):
+        reader = _two_axis_buffer(name="R", divisions=[CoreDivision()])
+        reader.chosen_division = 0
+        copy_ = _read_copy("S", "R", reader_index=0, readers=readers)
+        copy_.address = 256
+        graph = mock.Mock(operations=operations)
+        graph.get_buffer.return_value.get_layout.return_value = SimpleNamespace()
+        return graph, [reader, copy_]
+
+    def test_a_hint_route_copy_is_left_alone(self):
+        """The hint pass mints copies under the same name prefix before the
+        solve, and nothing predicted them."""
+        ops = [
+            self._op("coarse_tile_read_copy_0_x_0", ["x"]),
+            self._op("H", ["coarse_tile_read_copy_0_x_0"]),
+            self._op("coarse_tile_read_copy_1_S_0", ["S"]),
+            self._op("R", ["coarse_tile_read_copy_1_S_0"]),
+            self._op("B", ["coarse_tile_read_copy_1_S_0"]),
+        ]
+        graph, allocation = self._setup(ops)
+        allocator = self._allocator({"coarse_tile_read_copy_1_S_0": ("S", "R")})
+        allocator._stamp_staged_read_copies(graph, allocation, {})
+        (call,) = allocator._set_one_allocation.call_args_list
+        self.assertEqual(call.args[1], 256)
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.iteration_space_from_op",
+                return_value={},
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "commit_iteration_space_ownership"
+            ) as commit,
+        ):
+            allocator._commit_staged_read_copy_divisions(graph, allocation)
+        self.assertEqual(
+            [c.args[0].name for c in commit.call_args_list],
+            ["coarse_tile_read_copy_1_S_0"],
+        )
+
+    def test_two_copies_for_one_pair_are_not_stamped_at_one_address(self):
+        ops = [
+            self._op("coarse_tile_read_copy_1_S_0", ["S"]),
+            self._op("coarse_tile_read_copy_1_S_1", ["S"]),
+            self._op(
+                "R", ["coarse_tile_read_copy_1_S_0", "coarse_tile_read_copy_1_S_1"]
+            ),
+        ]
+        graph, allocation = self._setup(ops)
+        allocator = self._allocator(
+            {
+                "coarse_tile_read_copy_1_S_0": ("S", "R"),
+                "coarse_tile_read_copy_1_S_1": ("S", "R"),
+            }
+        )
+        allocator._stamp_staged_read_copies(graph, allocation, {})
+        self.assertEqual(len(allocator._set_one_allocation.call_args_list), 1)
+
+    def test_a_reader_past_the_reservations_lifetime_keeps_it_in_hbm(self):
+        ops = [
+            self._op("coarse_tile_read_copy_1_S_0", ["S"]),
+            self._op("R", ["coarse_tile_read_copy_1_S_0"]),
+            self._op("Z", ["coarse_tile_read_copy_1_S_0"]),
+        ]
+        graph, allocation = self._setup(ops)
+        allocator = self._allocator({"coarse_tile_read_copy_1_S_0": ("S", "R")})
+        allocator._stamp_staged_read_copies(graph, allocation, {})
+        allocator._set_one_allocation.assert_not_called()
 
 
 class ConfigDeclarationTest(TestCase):
