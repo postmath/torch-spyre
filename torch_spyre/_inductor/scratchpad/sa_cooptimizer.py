@@ -1159,9 +1159,38 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
         parent = self.chosen[idx]
+        if self._read_across_a_tiling_boundary(idx, parent):
+            return False
         return all(
             relation.compatible(parent, self.chosen[c_idx])
             for c_idx, relation in self._children[idx]
+        )
+
+    def _read_across_a_tiling_boundary(self, idx: int, parent: DivisionConfig) -> bool:
+        """Whether buffer ``idx`` is read by a coarse-tiled consumer at an
+        address that advances with the consumer's loop -- which its residency
+        would have to express and cannot.
+
+        LX addresses cannot advance: an LX start address is never registered as
+        a symbol in the SDSC JSON, so ``affine.apply`` has nothing to target.
+        ``compute_ops`` raises "Tiled (advancing) lx-allocated tensors are not
+        yet supported" only where it recognizes the advance, and elsewhere the
+        compiled graph returns wrong data -- so this is a correctness gate.
+
+        The rule is "this buffer is untiled and some consumer is not". A tiled
+        producer is never read across the boundary: in its consumer's run it is
+        loop-internal scratch at a fixed address, and outside it the apply
+        repoints the consumer at an HBM ``full_buf``. A clone is always untiled.
+
+        A staged tile-local read copy would give the residency back: it does
+        not advance, so it can be resident where its source cannot. Nothing
+        places one yet.
+        """
+        if not self._tilings_are_possible or not parent.tiling.is_untiled:
+            return False
+        return any(
+            not self.chosen[child_idx].tiling.is_untiled
+            for child_idx, _relation in self._children[idx]
         )
 
     def _all_eligible_resident(self) -> bool:
