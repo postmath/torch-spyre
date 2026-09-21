@@ -106,9 +106,9 @@ The predicate's second conjunct is `config.auto_coarse_tiling`, off by default. 
 this engine's behaviour it really is a user setting rather than a consequence of which engine runs,
 for two reasons that are not about the machinery working. A refusal from the apply round raises
 rather than falling back, so any gap between what `OpSplitSpace.admits` believes it may tile and
-what `coarse_tile` accepts is a compile failure. And nothing yet prices the loop cost above the
-split cap, so the search has no downward pressure on the tiling axis and takes as much of it as the
-divisor lattice offers.
+what `coarse_tile` accepts is a compile failure. And the tiling price the search sees is partial:
+`predict_ops` charges a real tiling 4.7–5.2x the measured device slope on a decoder block, and what
+reaches the search is only part of that (below), so neither figure is a calibrated brake yet.
 
 `CoOptimizingAllocator._apply_chosen_tilings` is what runs `CoarseTilingPass` over the chosen specs,
 in `_post_solve` and **before** the divisions are committed — see *The apply round* below.
@@ -134,13 +134,69 @@ bigger core split legal. Two things block doing it here — the span arithmetic 
 op's tensor deps, and the floor is already *committed* to the op by `apply_splits` rather than being
 a filter to relax.
 
-The payoff is not a cost term. Every tiling-sensitive term in the cost model is a derate bounded by
-1.0 and an untiled op has a working set of 0 by definition, so the objective can rank tilings
-against each other but never above not tiling. What a tiling does is divide `_per_core_size` by
-`output_tile_count` as well as `output_partition`, which can bring a buffer under the capacity gate
-in `_eligible` — an engine threshold, not a cost — and be repaid in the HBM traffic residency then
-frees. `sym_core_divs` carries symbols for the splits only, so the `TileSpec` itself is invisible to
-`cost_expr`.
+The payoff is not a derate. Every tiling-sensitive derate in the cost model is bounded by 1.0 and an
+untiled op has a working set of 0 by definition, so those can rank tilings against each other but
+never above not tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as well
+as `output_partition`, which can bring a buffer under the capacity gate in `_eligible` — an engine
+threshold, not a cost — and be repaid in the HBM traffic residency then frees.
+
+### What the tiling costs, as an objective symbol
+
+`CoreDivisionBuffer.sym_tile_counts` declares one symbol per *iteration axis* the buffer's tiling
+space offers a level on, beside `sym_core_divs`' one per stride coefficient. Keyed by axis because a
+tile count divides an extent exactly as a core split does, and because which of an op's args a level
+makes loop-invariant is decided by whether that axis's symbol appears in their index — a static
+fact. So only the count is unknown, and a candidate leaving an axis untiled binds its symbol to 1.
+`_build_sources` freezes the declaration and `undeclared_tile_axes` holds generated configs to it,
+the way `undeclared_splits` does for the split half.
+
+`CoOptimizingAllocator._extract_op_features` passes a `ProspectiveTiling` — those axes and their
+symbols — to the extractor, which stamps the two features linear in it: `loop_trip`, and each arg's
+`loop_factor`, the multiplier on an operand the loop re-reads once per iteration. That is the whole
+channel. `tiles_output_dim` is deliberately **not** set: it gates Python branches (a matmul's
+`pt_eff`, the standalone-row-reduction rate) that would move for every *tileable* op whether or not
+the search tiles it, so substituting the counts at 1 would no longer reproduce the untiled price.
+Nothing is lost by that — everything else it gates keys on `tile_rows_per_core`, which is symbolic
+here, and `_tiled_rows` already withholds those derates for a symbolic tile height.
+
+### Residency across a tiling boundary, and the copy that restores it
+
+The backend cannot advance an LX start address: it is never registered as a symbol in the SDSC JSON,
+so `affine.apply` has nothing to target. A coarse-tiled op reading a buffer produced *outside* its
+run reads it at an address that moves once per tile, so that buffer may not be resident —
+`_read_across_a_tiling_boundary` refuses it. The rule is stated on two configs (this buffer untiled,
+some consumer not) and that is sufficient: a tiled producer in another run escapes into an HBM
+`full_buf` its consumers are repointed at, and one in the same run is loop-internal scratch at a
+fixed address. Left ungated it is not a clean refusal but wrong data — 32 cores compiles it and
+returns the first tile every trip.
+
+`CoarseTileReadCopyBuffer` gives that residency back. It is the tile-local staging copy
+`coarse_tile`'s Pass 1 builds, predicted in `_build_cd_bound_buffers` so the anneal places it —
+minted by the apply it could only ever be HBM, where it would cost a write and a read to save
+nothing. It is sized on its *reader's* config (one core's share of one tile), carries no division
+decision, and is excluded from the step budget, which counts decisions rather than slots.
+
+The apply mints one copy per distinct read key of a source in a group, on the group's first reader
+of it. So a copy is predicted per (source, reader) for each reader of the source in its run of
+tileable ops, on the same filters and key (`stageable_read_keys`), except the run's last reader and
+a reader reading the source at more than one key. The search lets a prediction exist only where the
+apply would mint exactly it — roughly, its reader is first among its tiled run's readers of an
+untiled source that they all read the same way (`_staged_reads` states it exactly). Its lifetime
+runs to the last reader of the source in the run.
+`_read_copy_savings` prices it at `(r - 1) * size` while resident, with `r` those readers: the copy
+op makes one HBM pass and the `r` readers then read LX. The run bounds the apply's group from above
+(`derive_tiling_groups` can break it further), so `r` is an upper bound.
+
+The apply is handed the pairs that were placed, each with the readers its reservation covers, and
+stages exactly those, so the residency decision and the decision to stage are one decision. A read
+one reservation cannot hold alone — a second entry for the same pair, or a reader past the
+reservation's lifetime — is read directly instead of staged. The apply reports each copy it staged
+with its pair (`CoarseTilingPass.staged_copies`), which is what the allocator joins on. Its reach is
+bounded by
+`_read_copy_can_be_sized`, which refuses a read whose iteration extents do not map one to one onto
+the source's committed dims — every broadcast and every matmul operand
+(`TODO(span-overflow-read-copy)`). Those reads are dropped rather than refused, so the op keeps
+reading the full buffer; it simply cannot be resident while doing so.
 
 ## The apply round
 
@@ -261,9 +317,10 @@ Three move types:
   opt-outs alone leave the untiled anchor at the *product* over tileable dims (≈1/289 at two dims,
   ≈1/4913 at three), so undividing a region would vanish exactly as the search gained room to
   over-divide it — and nothing else pushes back on depth. *Whether* to tile is priced, by the
-  companion traffic below; *how deep* is not: the objective sees depth only through a monotone
-  per-core footprint, and the companion charge depends on the buffer's size and outside readers, not
-  on the tile count, so deepening a tiling never scores worse.
+  companion traffic below; *how deep* is priced only where the loop re-reads an operand whose index
+  lacks the tiled axis (`loop_factor`, above). Otherwise the objective sees depth only through a
+  monotone per-core footprint, and the companion charge depends on the buffer's size and outside
+  readers, not on the tile count, so deepening such a tiling never scores worse.
   There is no loop-cost term yet; #4233 measures program bytes at `74,880 + 21,504 × total_tiles`,
   with backend compile time superlinear in tile count, and names that term as the prerequisite for
   lifting the split cap.
@@ -341,8 +398,9 @@ exists to build — while tiling a buffer that is not resident costs a full HBM 
 is zero unless a buffer is tiled, so a search that takes no tiling scores as it did before it
 existed.
 
-It rides outside the compiled expression rather than inside it because `cost_expr`'s declaration
-is splits and residency: there is no symbol for a tiling to price against. Two under-corrections
+It rides outside the compiled expression rather than inside it because `op_features` is extracted
+from the untiled graph: the tile-count symbols price the loop over each op, but `full_buf`, its
+drain copy and the repointed reads exist only once the apply has run. Two under-corrections
 follow from what the solver holds: a consumer is counted once however many times it reads, and a
 matmul consumer's `replication` would make its read of `full_buf` cost more than one pass.
 
