@@ -250,9 +250,9 @@ enable_reduction_tiling: bool = (
 # Off by default, for two reasons that are not about the machinery working.
 # Anything the apply refuses raises rather than falling back, so any gap
 # between what the search believes it may tile and what ``coarse_tile``
-# accepts is a compile failure. And nothing yet prices the loop cost above the
-# split cap, so the search has no downward pressure on the tiling axis and
-# takes as much of it as the divisor lattice offers.
+# accepts is a compile failure. And the loop cost the search sees is only part
+# of what ``predict_ops`` charges a real tiling, so it is not yet a calibrated
+# brake on the tiling axis.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
