@@ -1482,6 +1482,44 @@ _TILE_2 = TileSpec((TileAxis(host_dim=0, count=2),))
 _TILE_4 = TileSpec((TileAxis(host_dim=0, count=4),))
 
 
+class TilingBoundaryResidencyTest(TestCase):
+    """``SaCoOptimizingSolver._read_across_a_tiling_boundary``."""
+
+    def _pair(self, parent_tiling=TileSpec(), child_tiling=TileSpec()):
+        parent = _cdbuf("P", [], {}, divisions=_TWO_AXIS_MENU)
+        child = _cdbuf("C", ["P"], {"P": [(0, 0)]}, divisions=_TWO_AXIS_MENU)
+        for buf in (parent, child):
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([parent, child], 1 << 30)
+        solver.chosen[0] = _config(CoreDivision(tiling=parent_tiling))
+        solver.chosen[1] = _config(CoreDivision(tiling=child_tiling))
+        return solver
+
+    def test_an_untiled_producer_read_by_a_tiled_consumer_is_refused(self):
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertTrue(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertFalse(solver._eligible(0))
+
+    def test_an_untiled_pair_is_untouched(self):
+        solver = self._pair()
+        self.assertFalse(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertTrue(solver._eligible(0))
+
+    def test_a_tiled_producer_keeps_its_residency(self):
+        for child_tiling in (_TILE_2, _TILE_4, TileSpec()):
+            solver = self._pair(parent_tiling=_TILE_2, child_tiling=child_tiling)
+            self.assertFalse(
+                solver._read_across_a_tiling_boundary(0, solver.chosen[0]),
+                child_tiling.label,
+            )
+
+    def test_the_consumer_side_is_not_refused(self):
+        # The gate is about being *read* across the boundary, not about reading
+        # across it: the tiled consumer's own output is per-tile scratch.
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertFalse(solver._read_across_a_tiling_boundary(1, solver.chosen[1]))
+
+
 def _menu_seed():
     """The seed config a menu source hands over -- unsplit and untiled, which
     is where every search starts."""
