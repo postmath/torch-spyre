@@ -691,6 +691,72 @@ def cost_expr_record(
     return record
 
 
+COARSE_TILE_READ_COPY_PREFIX = "__spyre_coarse_tile__:read:"
+
+
+def coarse_tile_read_copy_name(source: str, reader: str) -> str:
+    """Name of the predicted staging copy of ``reader``'s read of ``source``.
+
+    Synthetic, and prefixed so every "not a graph buffer" gate in the allocator
+    (nothing to push, nothing to commit, no operation to tile) applies to it the
+    way it applies to a relayout copy. The real buffer the apply mints is named
+    by Inductor and is matched back to this one by the (source, reader) pair
+    the apply reports it staged for -- see
+    ``CoOptimizingAllocator._staged_read_copies``.
+    """
+    return f"{COARSE_TILE_READ_COPY_PREFIX}{source}:{reader}"
+
+
+@dataclass
+class CoarseTileReadCopyBuffer(CoreDivisionBuffer):
+    """One tile-local staging copy of a cross-boundary read, as a buffer the
+    solver places -- the same trick :class:`RelayoutCopyBuffer` plays for a
+    shuffle.
+
+    **What it exists for is residency, not traffic.** A coarse-tiled op reading
+    a buffer produced outside its run reads it at an address that advances once
+    per tile, so that source may not be resident
+    (``SaCoOptimizingSolver._read_across_a_tiling_boundary``). A copy sized to
+    one tile gives the same operand a fixed address, which can be. Resident, the
+    ``r`` readers pay one HBM pass over the source between them instead of
+    ``r``; in HBM, a staging tile costs a write and a read to save nothing. So
+    the apply stages exactly the copies the solve placed, and it mints them in
+    ``_post_solve``, after addresses are final -- which is why the copy is
+    predicted here, before the solve, rather than left to the apply.
+
+    It exists only in the states where the apply would mint exactly it
+    (``SaCoOptimizingSolver._staged_reads``), and its price is charged outside
+    the expression (``SaCoOptimizingSolver._read_copy_credit``).
+
+    ``size`` is the SOURCE's total size, so the per-core footprint the engine
+    derives divides by the *reader's* partition and tile count -- the copy holds
+    one core's share of one tile. ``parents`` is deliberately empty: nothing
+    reads this buffer in the pre-apply graph, and listing the source would make
+    the residency gates treat it as a slicing edge it is not.
+    """
+
+    source: str = ""
+    reader: str = ""
+    # The ops of ``reader``'s maximal run of tileable ops (a superset of the
+    # group the apply forms) reading ``source`` through a read Pass 1 could
+    # stage, in operation order, ``reader`` among them.
+    readers: tuple[str, ...] = ()
+    # The ``readers`` whose stageable reads of ``source`` are not exactly
+    # ``reader``'s one read: the apply would stage those under another key,
+    # so a group holding one is not predicted.
+    conflicting: tuple[str, ...] = ()
+
+    @property
+    def pair(self) -> tuple[str, str]:
+        return (self.source, self.reader)
+
+    @property
+    def served(self) -> tuple[str, ...]:
+        """The readers this copy's reservation covers: ``reader`` and the
+        ``readers`` after it."""
+        return self.readers[self.readers.index(self.reader) :]
+
+
 RELAYOUT_COPY_PREFIX = "__spyre_lx_relayout__:copy:"
 
 

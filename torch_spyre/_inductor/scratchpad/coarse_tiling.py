@@ -31,7 +31,8 @@ ops that share a spec.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from typing import Optional
 
 import sympy
 
@@ -486,10 +487,18 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     """
 
     def __init__(
-        self, choices: Mapping[str, TileSpec], read_copies: bool = False
+        self,
+        choices: Mapping[str, TileSpec],
+        staged_reads: Optional[Mapping[tuple[str, str], Collection[str]]] = None,
     ) -> None:
         self._choices = dict(choices)
-        self._read_copies = read_copies
+        # ``(source, sizing op)`` pairs a planner placed a staging copy for,
+        # each mapped to the readers that copy may serve. ``None`` runs no read
+        # copies at all: an HBM staging tile costs a write and a read to save
+        # nothing (``CoarseTileReadCopyBuffer``).
+        self._staged_reads = staged_reads
+        # Copy name -> the pair it was staged for, once ``apply_pass`` ran.
+        self.staged_copies: dict[str, tuple[str, str]] = {}
 
     def apply_pass(self, graph: GraphLowering) -> None:
         groups_specs = derive_tiling_groups(graph, self._choices)
@@ -535,17 +544,11 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
         # every op already carries a committed FixedTiledLayout, and the
-        # post-stickify entry point is the right one.
-        #
-        # Read copies run here where the span-overflow caller leaves them off.
-        # Its reason -- nothing minted this late can be in LX, so the copy is
-        # HBM-to-HBM -- does not hold for a caller whose whole job is to decide
-        # what is in LX: the copy is tile-sized with fresh contiguous strides,
-        # which is the cheapest thing a tiled op could hold resident, against an
-        # operand the loop otherwise re-reads from HBM every iteration.
-        coarse_tile_post_stickify(
+        # post-stickify entry point is the right one. Unlike the span-overflow
+        # caller it stages reads: the solve placed the copies it names.
+        self.staged_copies = coarse_tile_post_stickify(
             graph,
             groups=groups,
             group_idx_offset=group_idx_offset,
-            run_read_copies=self._read_copies,
+            staged_reads=self._staged_reads,
         )
