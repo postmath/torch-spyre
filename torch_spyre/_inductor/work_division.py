@@ -1215,6 +1215,10 @@ class OpSplitSpace:
     def axes(self) -> list[sympy.Symbol]:
         return self.context.axes
 
+    def can_tile(self) -> bool:
+        """Whether any coarse tiling but untiled is on offer."""
+        return self.tiling is not None and not self.tiling.is_empty
+
     def splits(self, division: CoreDivision) -> dict[sympy.Symbol, int]:
         """``division`` as a complete factor per axis -- what this space moves
         in, where a :class:`CoreDivision` keeps only the factors above 1."""
