@@ -2729,7 +2729,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # coarse-tile-local dim -- see ``coarse_tile_local_dim_split_domains``.
         # Marked here and nowhere broader: an op the hint pass tiled carries
         # ``loop_info`` before the menu is enumerated, so its candidates already
-        # respect the pin and must keep doing so.
+        # respect the pin and must keep doing so. Looked up afresh: the apply
+        # replaces an op it redirects to a companion's full buffer
+        # (``replace_computed_buffer_body``), so a pre-apply object is stale.
+        op_by_name = {op.name: op for op in graph.operations}
         for name in tiled:
             setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
         logger.info(
