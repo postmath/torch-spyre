@@ -386,10 +386,13 @@ def build_tiling_space(
     """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
     be coarse-tiled at all, which is not an error -- untiled is always legal.
 
-    An op that already carries ``dim_hints`` is one of those: the hint pass and
-    the span-overflow pass both leave that marker set, and ``CoarseTilingPass``
-    stamps ``op.dim_hints`` wholesale, so offering such an op a tiling here
-    would silently clobber the group it is already part of.
+    An op already in a loop group is one of those: ``CoarseTilingPass`` stamps
+    ``op.dim_hints`` wholesale, so offering it a tiling here would silently
+    clobber that group. The hint and span-overflow passes leave ``dim_hints``
+    set on the ops they tiled, but not on the members ``coarse_tile`` adds
+    around them -- a group's copy-out, which writes through a
+    ``MutationLayoutSHOULDREMOVE`` rather than a tiled layout, or a restickify
+    of a tiled read -- so ``loop_info`` is checked as well.
 
     ``include_reductions`` derives the reduction half, which costs a
     stick-alignment analysis per input dep x host coord x candidate divisor.
@@ -399,7 +402,11 @@ def build_tiling_space(
     """
     output_counts: dict[int, list[int]] = {}
     reduction_counts: dict[int, list[int]] = {}
-    if isinstance(op, ComputedBuffer) and not getattr(op, "dim_hints", []):
+    if (
+        isinstance(op, ComputedBuffer)
+        and not getattr(op, "dim_hints", [])
+        and getattr(op, "loop_info", None) is None
+    ):
         stick_dim = _output_stick_host_dim(op)
         n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
         for host_dim in range(n_out):
