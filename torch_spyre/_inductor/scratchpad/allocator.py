@@ -2467,6 +2467,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # division and it would be judged against its reader's as a mismatch.
         staged = self._staged_read_copies(graph)
         self._commit_staged_read_copy_divisions(graph, allocation, staged)
+        # Likewise for the copy-outs the apply mints.
+        self._commit_copy_out_divisions(graph, allocation, tiled)
         # A solver-fired relayout source stays resident under ITS committed view
         # while the consumer it feeds will read the shuffled copy under another.
         # The judge runs on the pre-materialization graph, where that consumer
@@ -2792,6 +2794,35 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
 
+    def _commit_copy_out_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: Iterable[str],
+    ) -> None:
+        """Give each copy-out the apply minted its tiled op's core division.
+
+        ``_insert_copy_op`` (wsr/coarse_tile.py) builds the copy-out over the
+        tiled op's own ``data.ranges`` and reads the per-tile buffer, so it
+        keeps no division of its own -- one core -- while the tiled op commits
+        whatever the solve chose. ``get_ncores_for_buffers`` then reports the
+        mismatch and withholds the tiled buffer's view, and a resident one
+        raises in :meth:`_post_solve`.
+
+        The copy's iteration symbols are the tiled op's output symbols in order
+        (``iteration_space_from_op`` lists reductions after), so the splits map
+        positionally and only a reduction split is dropped. A hint-tiled op is
+        not in ``tiled``: its copy-out predates the solve and is in
+        ``allocation`` already.
+        """
+        by_name = {b.name: b for b in allocation}
+        ops = {getattr(op, "name", None): op for op in graph.operations}
+        for source in tiled:
+            # Named as ``_insert_copy_op`` names it.
+            copy = ops.get(graph.qualify_name(f"coarse_tile_copy_{source}"))
+            if copy is not None:
+                self._commit_positionally(graph, copy, by_name[source])
+
     def _commit_staged_read_copy_divisions(
         self,
         graph: GraphLowering,
@@ -2808,30 +2839,39 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         core-division mismatch and withholds the physical ownership residency
         needs.
 
-        The reader's splits are mapped onto the copy's own iteration symbols
-        **positionally**. That is sound for exactly the reads this route stages:
-        ``_read_copy_can_be_sized`` admits a read only where the source's
-        non-unit dims and the reader's iteration extents correspond one to one,
-        which is the same correspondence being used here.
+        Mapping the reader's splits positionally is sound for exactly the reads
+        this route stages: ``_read_copy_can_be_sized`` admits a read only where
+        the source's non-unit dims and the reader's iteration extents
+        correspond one to one.
         """
         by_name = {b.name: b for b in allocation}
         for op, (_source, reader_name), _readers in staged:
-            reader = by_name.get(reader_name)
-            if reader is None or reader.chosen_division is None:
-                continue
-            splits = self._live_splits(
-                reader.name, reader.core_divisions[reader.chosen_division].splits
-            )
-            symbols = list(iteration_space_from_op(op))
-            reader_op = graph.get_buffer(reader.name)
-            reader_symbols = list(iteration_space_from_op(reader_op))
-            mapped = {
-                symbols[position]: factor
-                for position, source_symbol in enumerate(reader_symbols)
-                if position < len(symbols)
-                and (factor := splits.get(source_symbol, 1)) > 1
-            }
-            commit_iteration_space_ownership(op, mapped)
+            if (reader := by_name.get(reader_name)) is not None:
+                self._commit_positionally(graph, op, reader)
+
+    def _commit_positionally(
+        self, graph: GraphLowering, op: Operation, buffer: CoreDivisionBuffer
+    ) -> None:
+        """Commit ``buffer``'s chosen splits on ``op``, a copy minted after the
+        solve, mapped onto ``op``'s iteration symbols **positionally**.
+
+        Sound only where ``op``'s iteration dims correspond one to one, in
+        order, with the leading ones of ``buffer``'s op; a split past ``op``'s
+        rank is dropped.
+        """
+        if buffer.chosen_division is None:
+            return
+        splits = self._live_splits(
+            buffer.name, buffer.core_divisions[buffer.chosen_division].splits
+        )
+        symbols = list(iteration_space_from_op(op))
+        buffer_symbols = list(iteration_space_from_op(graph.get_buffer(buffer.name)))
+        mapped = {
+            symbols[position]: factor
+            for position, symbol in enumerate(buffer_symbols)
+            if position < len(symbols) and (factor := splits.get(symbol, 1)) > 1
+        }
+        commit_iteration_space_ownership(op, mapped)
 
     def _staged_read_copies(
         self, graph: GraphLowering
