@@ -335,7 +335,16 @@ def canonical_tiling(spec: TileSpec) -> TileSpec:
 
 
 def _tileable(op: object) -> bool:
-    return isinstance(op, ComputedBuffer) and not getattr(op, "dim_hints", [])
+    """Whether ``op`` may be offered a coarse tiling at all. Not in a loop
+    group already, which ``CoarseTilingPass`` would clobber by stamping
+    ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint and
+    span-overflow passes tiled, ``loop_info`` the members ``coarse_tile`` adds
+    around them (a copy-out, a restickify of a tiled read)."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and not getattr(op, "dim_hints", [])
+        and getattr(op, "loop_info", None) is None
+    )
 
 
 def build_tiling_space(
@@ -345,13 +354,8 @@ def build_tiling_space(
     max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
 ) -> TilingSpace:
     """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
-    be coarse-tiled at all, which is not an error -- untiled is always legal.
-
-    An op that already carries ``dim_hints`` is one of those: the hint pass and
-    the span-overflow pass both leave that marker set, and ``CoarseTilingPass``
-    stamps ``op.dim_hints`` wholesale, so offering such an op a tiling here
-    would silently clobber the group it is already part of.
-    """
+    be coarse-tiled at all (:func:`_tileable`), which is not an error -- untiled
+    is always legal."""
     output_counts: dict[int, list[int]] = {}
     stick_dim = _output_stick_host_dim(op) if _tileable(op) else None
     if stick_dim is not None:
