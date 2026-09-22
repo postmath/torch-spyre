@@ -48,6 +48,11 @@ except ImportError:
     _HAS_ORTOOLS = False
 
 
+# Layout solvers that choose coarse tilings under ``config.auto_coarse_tiling``
+# (with ``co_optimizing_lx_planning``, on by default).
+_TILING_SOLVERS = frozenset({"simulated_annealing"})
+
+
 def expected_unimplemented(fn):
     """Expect a test to fail *only* by reaching an unbuilt part of the feature.
 
@@ -281,15 +286,13 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Raises the "gate is missing" NotImplementedError before compiling.
-        if auto_tiling:
-            # TODO: Implement coarse tiling configuration
-            raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
+        # Only the SA co-optimizer chooses tilings; elsewhere the flag is inert.
+        if auto_tiling and layout_solver not in _TILING_SOLVERS:
+            raise NotImplementedError(f"{layout_solver} does not choose tilings")
 
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
@@ -302,6 +305,7 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                auto_coarse_tiling=auto_tiling,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
@@ -548,7 +552,10 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["tiling_mode"] in ("auto", "explicit_auto"):
+        if (
+            params["tiling_mode"] in ("auto", "explicit_auto")
+            and params["solver_method"] not in _TILING_SOLVERS
+        ):
             decorators.append(expected_unimplemented)
         return decorators
 
