@@ -2038,6 +2038,12 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+#: Prefix ``coarse_tile`` gives a copy-out it mints (Pass 3). Matched here
+#: rather than imported so the allocator does not depend on that module at
+#: import time; ``coarse_tile`` tests the same prefix the same way.
+_COPY_OUT_PREFIX = "coarse_tile_copy_"
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2429,6 +2435,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # staged read copy is not in ``allocation``, so nothing above gave it a
         # division and it would be judged against its reader's as a mismatch.
         self._commit_staged_read_copy_divisions(graph, allocation)
+        # Likewise for the copy-out the apply mints for a tiled op's escaping
+        # output: it reads the tiled op's per-tile buffer, so an unset division
+        # on it withholds that buffer's view.
+        self._commit_copy_out_divisions(graph, allocation, tiled)
         # A solver-fired relayout source stays resident under ITS committed view
         # while the consumer it feeds will read the shuffled copy under another.
         # The judge runs on the pre-materialization graph, where that consumer
@@ -2770,6 +2780,56 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 f"{', '.join(lost)}; it would commit as 1"
             )
         return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
+
+    def _commit_copy_out_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: set[str],
+    ) -> None:
+        """Give each copy-out the apply minted its tiled op's core division.
+
+        ``_insert_copy_op`` (wsr/coarse_tile.py) builds the copy-out over the
+        tiled op's own ``data.ranges`` and reads the per-tile buffer, so it
+        keeps no division of its own -- one core -- while the tiled op commits
+        whatever the solve chose. ``get_ncores_for_buffers`` then reports the
+        mismatch and withholds the tiled buffer's view, and a resident one
+        raises in :meth:`_post_solve`.
+
+        The copy's iteration symbols are the tiled op's output symbols in order
+        (``iteration_space_from_op`` lists those first, reductions after), so the
+        splits map positionally; a split on a reduction axis has no counterpart
+        and is dropped. A hint-tiled op's copy-out predates the solve and is in
+        ``allocation`` already, so it is not in ``tiled`` and is left alone.
+        """
+        if not tiled:
+            return
+        by_name = {b.name: b for b in allocation}
+        for op in graph.operations:
+            if not str(getattr(op, "name", "")).startswith(_COPY_OUT_PREFIX):
+                continue
+            sources = {
+                dep.name
+                for dep in op_read_writes(op).reads
+                if isinstance(dep, MemoryDep)
+            }
+            if len(sources) != 1 or (source := next(iter(sources))) not in tiled:
+                continue
+            producer = by_name.get(source)
+            if producer is None or producer.chosen_division is None:
+                continue
+            splits = self._live_splits(
+                source, producer.core_divisions[producer.chosen_division].splits
+            )
+            producer_symbols = list(iteration_space_from_op(graph.get_buffer(source)))
+            symbols = list(iteration_space_from_op(op))
+            mapped = {
+                symbols[position]: factor
+                for position, producer_symbol in enumerate(producer_symbols)
+                if position < len(symbols)
+                and (factor := splits.get(producer_symbol, 1)) > 1
+            }
+            commit_iteration_space_ownership(op, mapped)
 
     def _commit_staged_read_copy_divisions(
         self,

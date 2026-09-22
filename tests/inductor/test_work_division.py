@@ -2573,6 +2573,21 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
             (committed,) = [c.args[1] for c in applied.commit.call_args_list]
             self.assertEqual(self._by_extent(copy, committed), {64: 16})
 
+    def test_the_copy_out_takes_its_tiled_ops_live_splits(self):
+        with self._applied(
+            [4, 64, 256, 128],
+            TileSpec((TileAxis(host_dim=0, count=4),)),
+            {1: 16, 2: 2},
+        ) as applied:
+            copy = self._minted("coarse_tile_copy_tiled", [1, 64, 256, 128], "tiled")
+            applied.graph.operations.append(copy)
+            applied.graph.get_buffer.return_value = applied.op
+            applied.allocator._commit_copy_out_divisions(
+                applied.graph, applied.allocation, {"tiled"}
+            )
+            (committed,) = [c.args[1] for c in applied.commit.call_args_list]
+            self.assertEqual(self._by_extent(copy, committed), {64: 16, 256: 2})
+
 
 class TestTopKConstraints(unittest.TestCase):
     def test_topk_uses_minimum_supported_split_domains(self):
