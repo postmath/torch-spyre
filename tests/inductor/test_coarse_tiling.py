@@ -85,6 +85,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _divide_ranges,
     _full_buffer_read_deps,
     _index_var_prefix,
+    _patch_consumers,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
@@ -1299,6 +1300,23 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
 
         self.assertEqual(simplify(result - (256 * sympy_index_symbol("q0") + q1)), 0)
 
+    def test_squeezed_dim_not_added_for_a_consumer_with_loop_info(self):
+        # The squeeze shape of the test above, but the consumer sits in a loop
+        # nest of its own, which already supplies a term for every real dim.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+            new_size=(Integer(4), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+        consumer = _make_consumer_with_ranges([4, 256])
+        consumer.loop_info = object()
+
+        result = _retile_load_index("buf", q1, info, consumer)
+
+        self.assertEqual(result, q1)
+
     def test_unit_consumer_dim_adds_no_term_and_does_not_collide(self):
         # Same squeeze shape as above, but the consumer's own dim 0 is ALSO
         # unit-size (e.g. B=1 when only H is tiled) -- no real loop variable
@@ -1441,6 +1459,89 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
         )
 
         self.assertEqual(result, contraction)
+
+
+class TestPatchConsumersLoopInfo(unittest.TestCase):
+    """``_patch_consumers`` redirecting a tiled buffer's ``loop_info`` readers.
+
+    The tile [1024, 128] (stride [128, 1]) of a [1024, 256] buffer (stride
+    [256, 1]) is redirected to the full buffer.
+    """
+
+    _INFO = _RetiledBufferInfo(
+        old_stride=(Integer(128), Integer(1)),
+        new_stride=(Integer(256), Integer(1)),
+        old_size=(Integer(1024), Integer(128)),
+        new_size=(Integer(1024), Integer(256)),
+    )
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _redirected_index(self, consumer, old_name: str) -> sympy.Expr:
+        consumer.loop_info = SimpleNamespace(tiled_dims_per_read=[])
+        operations = [consumer]
+        _patch_consumers([consumer], old_name, "full", operations, self._INFO)
+        (read,) = [r for r in operations[0].get_read_writes().reads if r.name == "full"]
+        return read.index
+
+    def test_full_scale_read_from_another_loop_group_is_preserved(self):
+        # A matmul in a loop group of its own reads the whole weight every
+        # iteration, so its index is traced at the full buffer's scale;
+        # decomposing 256 against the tile's row stride of 128 would turn it
+        # into 512.
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            InputBuffer,
+            Reduction,
+            StorageBox,
+            TensorBox,
+        )
+
+        weight = InputBuffer(
+            name="weight",
+            layout=FixedLayout(
+                torch.device("cpu"), torch.float32, [1024, 256], [256, 1]
+            ),
+        )
+        V.graph.name_to_buffer["weight"] = weight
+        loader = TensorBox(StorageBox(weight)).make_loader()
+        red = Reduction.create(
+            device=torch.device("cpu"),
+            dst_dtype=torch.float32,
+            src_dtype=torch.float32,
+            inner_fn=lambda index, rindex: loader([index[1], rindex[0]]),
+            ranges=[Integer(1024), Integer(1024)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+        )
+        mm = ComputedBuffer(
+            name="mm",
+            layout=FixedLayout(torch.device("cpu"), torch.float32, [1024, 1024], None),
+            data=red.data.data,
+        )
+        mm.operation_name = "mm"
+        d1, d2 = sympy_index_symbol("d1"), sympy_index_symbol("d2")
+
+        self.assertEqual(self._redirected_index(mm, "weight"), 256 * d1 + d2)
+
+    def test_tile_local_read_in_the_same_loop_group_is_rescaled(self):
+        # A same-group reader iterates the tile, so its index is tile-local.
+        op = _make_real_pointwise_op(
+            ranges=[Integer(1024), Integer(128)],
+            input_shapes_strides=[([1024, 128], [128, 1])],
+            name="pw",
+            hints=(),
+        )
+        d0, d1 = sympy_index_symbol("d0"), sympy_index_symbol("d1")
+
+        self.assertEqual(self._redirected_index(op, "in0_pw"), 256 * d0 + d1)
 
 
 class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):

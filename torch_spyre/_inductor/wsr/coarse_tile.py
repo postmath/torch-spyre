@@ -7067,29 +7067,13 @@ def _patch_consumers(
 
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
-        # _retile_load_index's squeezed-dim term injection (see
-        # _squeezed_retile_dims) is only meaningful for a consumer with no
-        # loop_info of its own -- an "outside" consumer whose incoming index
-        # was traced against old_name's tile-local (squeezed) layout with no
-        # enclosing coarse-tile loop nest to supply a term for a dim that
-        # layout squeezed away. An "inside" consumer (has loop_info) already
-        # derives its index from a real, enclosing loop nest that supplies a
-        # correct term for every one of *its own* real dimensions; passing
-        # it here anyway injects a bogus extra term for any dim this
-        # consumer tiles as an output dim but that new_name's layout does
-        # not vary over (e.g. a fully-reduced dim in an accum_full buffer),
-        # double-counting/corrupting the address. See
-        # test_copy_accum_with_reduction_512x256_A4_B4, where this caused a
-        # spurious B-tile-index term in a redirected read of an
-        # already-fully-B-reduced accum_full buffer.
-        _index_consumer = consumer if not hasattr(consumer, "loop_info") else None
 
         def new_inner_fn(
             *args,
             _map=name_map,
             _info=retile_info if has_retile else None,
             _orig=orig_inner,
-            _consumer=_index_consumer,
+            _consumer=consumer,
         ):
             if _info is not None:
                 handler = _NameAndIndexSwapHandler(
@@ -7623,7 +7607,24 @@ def _retile_load_index(
         )
         new_index += preserved_index
 
-    if consumer is not None and not dense_full_view:
+    # The squeezed-dim term injection is only meaningful for a consumer with
+    # no loop_info of its own -- an "outside" consumer whose incoming index
+    # was traced against buf_name's tile-local (squeezed) layout with no
+    # enclosing coarse-tile loop nest to supply a term for a dim that layout
+    # squeezed away. An "inside" consumer (has loop_info) already derives its
+    # index from a real, enclosing loop nest that supplies a correct term for
+    # every one of *its own* real dimensions; injecting anyway adds a bogus
+    # term for any dim this consumer tiles as an output dim but that the new
+    # layout does not vary over (e.g. a fully-reduced dim in an accum_full
+    # buffer) -- see test_copy_accum_with_reduction_512x256_A4_B4. Such a
+    # consumer still reaches the dense-full-view check above: one in another
+    # loop group can read the whole buffer every iteration, its index traced
+    # at full scale.
+    if (
+        consumer is not None
+        and not hasattr(consumer, "loop_info")
+        and not dense_full_view
+    ):
         for d in _squeezed_retile_dims(info, consumer):
             # A consumer read by multiple _patch_consumers redirects (e.g.
             # buf24 reading both a _divide_ranges-mutated buffer and a
