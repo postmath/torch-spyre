@@ -48,6 +48,11 @@ except ImportError:
     _HAS_ORTOOLS = False
 
 
+# Layout solvers that choose coarse tilings under ``config.auto_coarse_tiling``
+# (with ``co_optimizing_lx_planning``, on by default).
+_TILING_SOLVERS = frozenset({"simulated_annealing"})
+
+
 def expected_unimplemented(fn):
     """Expect a test to fail *only* by reaching an unbuilt part of the feature.
 
@@ -281,15 +286,13 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Raises the "gate is missing" NotImplementedError before compiling.
-        if auto_tiling:
-            # TODO: Implement coarse tiling configuration
-            raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
+        # Only the SA co-optimizer chooses tilings; elsewhere the flag is inert.
+        if auto_tiling and layout_solver not in _TILING_SOLVERS:
+            raise NotImplementedError(f"{layout_solver} does not choose tilings")
 
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
@@ -302,6 +305,7 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                auto_coarse_tiling=auto_tiling,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
@@ -385,9 +389,14 @@ class AutomatedCoarseTilingTests(
     # ------------------------------------------------------------------
     # Models.  Each returns the model, its axis labels and the tiling contract,
     # defined once and reused across every tiling_mode and solver.
+    #
+    # Each is sized so its working set overflows LX even split across 32
+    # cores: a cost-driven tile search is right to leave a graph that already
+    # fits untiled, so a smaller model cannot tell a working search from one
+    # that never tiles.
     # ------------------------------------------------------------------
     def _softmax_case(self) -> "_TilingCase":
-        """softmax(dim=0) over (512, 1024), dims R (reduced) x C.
+        """softmax(dim=0) over (512, 65536), dims R (reduced) x C.
 
         One level: C divided 4 ways, each tile a whole-column softmax.  The
         other axis, R, is the reduced one: a map loop over it would softmax
@@ -399,7 +408,7 @@ class AutomatedCoarseTilingTests(
         return _TilingCase(
             inner=functools.partial(torch.softmax, dim=0),
             outer=None,
-            args=(torch.rand((512, 1024), dtype=torch.float16, device=DEVICE_NAME),),
+            args=(torch.rand((512, 65536), dtype=torch.float16, device=DEVICE_NAME),),
             named_dims=(["R", "C"],),
             out_dims=["R", "C"],
             pins=(("C", 4),),  # Reduction axis is not tiled for now
@@ -422,7 +431,7 @@ class AutomatedCoarseTilingTests(
         cover the whole model, so the explicit_auto mode writes the same nest
         and leaves the compiler nothing outside it to tile.
         """
-        seq_len, in_dim, hidden_dim, out_dim = 128, 256, 1024, 256
+        seq_len, in_dim, hidden_dim, out_dim = 8192, 256, 1024, 256
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
@@ -466,7 +475,7 @@ class AutomatedCoarseTilingTests(
         branches together.  The down projection reduces over Dh and runs
         outside every loop; the explicit_auto mode writes only the S loop.
         """
-        seq_len, in_dim, hidden_dim = 128, 256, 1024
+        seq_len, in_dim, hidden_dim = 16384, 256, 1024
         fc_gate = torch.nn.Linear(in_dim, hidden_dim).half()
         fc_up = torch.nn.Linear(in_dim, hidden_dim).half()
         fc_down = torch.nn.Linear(hidden_dim, in_dim, bias=False).half()
@@ -514,7 +523,10 @@ class AutomatedCoarseTilingTests(
         "explicit_auto": _check_loops_preserved_with_auto,
     }
 
-    parameter_axes = {"tiling_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
+    parameter_axes = {
+        "tiling_mode": tuple(_CHECKS),
+        "solver_method": ("cpsat", "simulated_annealing"),
+    }
 
     # SDPA is omitted: using SDPA in this test suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198
@@ -540,7 +552,10 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["tiling_mode"] in ("auto", "explicit_auto"):
+        if (
+            params["tiling_mode"] in ("auto", "explicit_auto")
+            and params["solver_method"] not in _TILING_SOLVERS
+        ):
             decorators.append(expected_unimplemented)
         return decorators
 
