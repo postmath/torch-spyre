@@ -17,9 +17,9 @@
 import contextlib
 import dataclasses
 import functools
-import pytest
 import os
 import sys
+import pytest
 import torch
 import unittest
 
@@ -64,33 +64,9 @@ except ImportError:
     _HAS_ORTOOLS = False
 
 
-def expected_unimplemented(fn):
-    """Expect a test to fail *only* by reaching an unbuilt part of the feature.
-
-    ``unittest.expectedFailure`` absorbs any exception, so a test written
-    against a gate that does not exist yet would be satisfied by the resulting
-    ``AttributeError`` -- and would stay satisfied after the feature landed
-    wrong.  This narrows the expectation to one declared cause and fails the
-    test on anything else, including a clean pass (the signal to delete the
-    marker).
-
-    Because it is imperative rather than a pytest mark, ``-m 'not xfail'`` does
-    not deselect these; they still run and still xfail at runtime.
-
-    Nothing here is specific to coarse tiling; it belongs in
-    ``utils_inductor.py`` once a second suite wants it.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        try:
-            fn(self, *args, **kwargs)
-        except NotImplementedError as exc:
-            pytest.xfail(f"not built yet: {exc}")
-        else:
-            self.fail(f"{fn.__name__} passed -- remove @expected_unimplemented")
-
-    return wrapper
+# Layout solvers that choose coarse tilings under ``config.auto_coarse_tiling``
+# (with ``co_optimizing_lx_planning``, on by default).
+_TILING_SOLVERS = frozenset({"cpsat", "simulated_annealing"})
 
 
 # The trip counts of a loop nest, outermost level first.  An op at an outer
@@ -180,6 +156,10 @@ class _TilingCase:
     explicit_auto_pins:
         The loops for the *explicit_auto* mode, where automatic tiling is on
         as well.  What must survive is each loop exactly as written.
+    sa_may_stay_untiled:
+        Why the SA co-optimizer's own objective prices this model untiled, so
+        its *auto* mode is an expected failure rather than a broken search;
+        ``None`` where tiling pays.
     """
 
     inner: Callable[..., torch.Tensor]
@@ -191,6 +171,7 @@ class _TilingCase:
     explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
+    sa_may_stay_untiled: Optional[str] = None
 
     @property
     def explicit_nest(self) -> _Counts:
@@ -297,13 +278,17 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
+        # Only a joint solver chooses tilings; elsewhere the flag is inert.
+        if auto_tiling and layout_solver not in _TILING_SOLVERS:
+            raise NotImplementedError(f"{layout_solver} does not choose tilings")
+
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        # Auto tiling needs the joint CP-SAT co-opt path on (R8.1): the solver
-        # carries and applies the tiling candidates only under
-        # co_optimizing_lx_planning + layout_solver="cpsat". The two gates
-        # default off, so they are patched on only for the auto modes.
+        # Auto tiling needs a joint co-opt path on: the solver carries and
+        # applies the tiling candidates only under co_optimizing_lx_planning,
+        # and only once auto_coarse_tiling is on, which defaults off -- so the
+        # gates are patched on only for the auto modes.
         tiling_cfg = (
             dict(
                 co_optimizing_lx_planning=True,
@@ -383,17 +368,17 @@ class AutomatedCoarseTilingTests(
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
-        if solver == "simulated_annealing":
-            raise NotImplementedError
         cpu, device, tiling = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
+        self._assert_matches_cpu(case, device, cpu)
+        if not tiling and solver == "simulated_annealing" and case.sa_may_stay_untiled:
+            pytest.xfail(case.sa_may_stay_untiled)
         self.assertTrue(
             tiling,
             "Auto tiling is on and no loops were written, but no op was "
             "coarse-tiled -- the tile search found nothing to do",
         )
-        self._assert_matches_cpu(case, device, cpu)
 
     def _check_loops_preserved_with_auto(
         self, case: "_TilingCase", solver: str
@@ -484,6 +469,10 @@ class AutomatedCoarseTilingTests(
             explicit_auto_pins=(("S", 2), ("Dout", 2)),
             atol=0.02,
             rtol=0.05,
+            # Tiling buf5 two ways on dim 1 gains nothing in the expression and
+            # adds a 5120 ns copy-out; the SA tiled it only where its anneal
+            # stopped short, and #5103's burst term moved that stop.
+            sa_may_stay_untiled="the SA's objective prices this MLP untiled",
         )
 
     def _swiglu_case(self) -> "_TilingCase":
@@ -574,10 +563,6 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["solver_method"] in ("simulated_annealing") and params[
-            "tiling_mode"
-        ] in ("auto"):
-            decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:
