@@ -515,8 +515,9 @@ class RelayoutCharge(sympy.Function):
 def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
     for a placed buffer and 0 for a spilled one; a core-division buffer with a
-    chosen division binds its ``division`` index and each per-axis split
-    symbol to that division's split (1 for an axis it does not split). The
+    chosen division binds its ``division`` index, each per-axis split symbol to
+    that division's split (1 for an axis it does not split), and each tile-count
+    symbol to that division's tiling (1 for an axis it does not tile). The
     same reading the annealer applies to a candidate plan."""
     bindings: dict = {}
     for buf in buffers:
@@ -529,6 +530,11 @@ def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
         splits = divisions[chosen].splits
         for key, sym in buf.sym_core_divs.items():
             bindings[sym] = splits.get(key, 1)
+        tile_syms = buf.sym_tile_counts
+        if tile_syms:
+            counts = buf.division_space.tile_counts(divisions[chosen].tiling)
+            for axis, sym in tile_syms.items():
+                bindings[sym] = counts.get(axis, 1)
     return bindings
 
 
