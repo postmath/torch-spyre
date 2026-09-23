@@ -73,6 +73,7 @@ from torch._inductor.ir import ComputedBuffer, Reduction
 
 from .. import config
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates
 from ..scratchpad.plan_solver import TileAxis, TileSpec
@@ -335,13 +336,16 @@ def canonical_tiling(spec: TileSpec) -> TileSpec:
 
 
 def _tileable(op: object) -> bool:
-    """Whether ``op`` may be offered a coarse tiling at all. Not in a loop
-    group already, which ``CoarseTilingPass`` would clobber by stamping
-    ``dim_hints`` wholesale: ``dim_hints`` marks the ops the hint and
-    span-overflow passes tiled, ``loop_info`` the members ``coarse_tile`` adds
-    around them (a copy-out, a restickify of a tiled read)."""
+    """Whether ``op`` may be offered a coarse tiling at all. Not without a
+    ``FixedTiledLayout``: no device layout to check stick alignment against
+    (e.g. a KV-cache write). Not in a loop group already, which
+    ``CoarseTilingPass`` would clobber by stamping ``dim_hints`` wholesale:
+    ``dim_hints`` marks the ops the hint and span-overflow passes tiled,
+    ``loop_info`` the members ``coarse_tile`` adds around them (a copy-out, a
+    restickify of a tiled read)."""
     return (
         isinstance(op, ComputedBuffer)
+        and isinstance(op.layout, FixedTiledLayout)
         and not getattr(op, "dim_hints", [])
         and getattr(op, "loop_info", None) is None
     )
