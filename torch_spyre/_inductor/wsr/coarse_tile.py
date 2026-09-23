@@ -2830,7 +2830,12 @@ def _divide_ranges(
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        old_host_stride=old_stride,
+        new_host_stride=layout.stride,
     )
     return _DivideRangesResult(retiled_info, symbol_remap)
 
@@ -4145,6 +4150,8 @@ def _allocate_full_buffer(
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=orig_layout.stride,
+                new_host_stride=strides,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
