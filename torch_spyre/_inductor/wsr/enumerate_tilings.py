@@ -70,6 +70,7 @@ from torch._inductor.ir import ComputedBuffer, Reduction
 
 from .. import config
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates
 from ..scratchpad.plan_solver import TileAxis, TileSpec
@@ -392,7 +393,9 @@ def build_tiling_space(
     set on the ops they tiled, but not on the members ``coarse_tile`` adds
     around them -- a group's copy-out, which writes through a
     ``MutationLayoutSHOULDREMOVE`` rather than a tiled layout, or a restickify
-    of a tiled read -- so ``loop_info`` is checked as well.
+    of a tiled read -- so ``loop_info`` is checked as well. Any other op
+    without a ``FixedTiledLayout`` (a mutation outside any group, e.g. a KV-cache
+    write) has no device layout to check stick alignment against.
 
     ``include_reductions`` derives the reduction half, which costs a
     stick-alignment analysis per input dep x host coord x candidate divisor.
@@ -404,6 +407,7 @@ def build_tiling_space(
     reduction_counts: dict[int, list[int]] = {}
     if (
         isinstance(op, ComputedBuffer)
+        and isinstance(op.layout, FixedTiledLayout)
         and not getattr(op, "dim_hints", [])
         and getattr(op, "loop_info", None) is None
     ):

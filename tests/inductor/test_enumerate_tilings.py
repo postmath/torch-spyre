@@ -30,7 +30,14 @@ import sympy
 import torch
 
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FlexibleLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    Reduction,
+)
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -190,6 +197,14 @@ class TestOutputEnumeration(unittest.TestCase):
     def test_non_computed_buffer_returns_only_untiled(self):
         opts = enumerate_tile_options(MagicMock())
         self.assertEqual(opts, [TileSpec()])
+
+    def test_mutation_outside_a_loop_group_returns_only_untiled(self):
+        op = _pointwise_op((512, 256, 128))
+        with V.set_graph_handler(MagicMock()):
+            op.layout = MutationLayoutSHOULDREMOVE(
+                _pointwise_op((512, 256, 128), "buf1")
+            )
+        self.assertEqual(enumerate_tile_options(op), [TileSpec()])
 
 
 class TestReductionEnumeration(unittest.TestCase):
