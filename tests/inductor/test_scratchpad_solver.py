@@ -1658,11 +1658,26 @@ class TestSympyExprToCpSatPrinter(TestCase):
         # 5 * 7 * 17 = 595 over the narrower 7 * 17 = 119 because the wider
         # scale leaves 11 a smaller remainder.
         a = sympy.Symbol("split_a", integer=True, positive=True)
-        _, model = self._pinned_split_cost(1 / a, {"split_a": [1, 7, 11, 13]}, 0)
-        self.assertEqual(self._domain_of(model, "inv_split_a"), (77, 1001))
-        got, model = self._pinned_split_cost(1000 / a, {"split_a": [1, 7, 11, 17]}, 1)
-        self.assertEqual(self._domain_of(model, "inv_split_a"), (595 // 17, 595))
-        self.assertAlmostEqual(got, 1000 / 7)
+        under_cap_values = [1, 7, 11, 13]
+        lcm_scale = 7 * 11 * 13
+        _, model = self._pinned_split_cost(1 / a, {"split_a": under_cap_values}, 0)
+        self.assertEqual(
+            self._domain_of(model, "inv_split_a"), (lcm_scale // 13, lcm_scale)
+        )
+
+        over_cap_values = [1, 7, 11, 17]
+        fallback_scale = 5 * 7 * 17
+        numerator = 1000
+        pinned = over_cap_values.index(7)
+        got, model = self._pinned_split_cost(
+            numerator / a, {"split_a": over_cap_values}, pinned
+        )
+        self.assertEqual(
+            self._domain_of(model, "inv_split_a"),
+            (fallback_scale // 17, fallback_scale),
+        )
+        # 7 divides the fallback scale, so the pinned division is priced exactly.
+        self.assertAlmostEqual(got, numerator / 7)
 
     @staticmethod
     def _lin_max_operand_sizes(model):
