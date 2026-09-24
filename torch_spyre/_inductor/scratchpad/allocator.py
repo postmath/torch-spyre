@@ -67,6 +67,11 @@ from torch_spyre._inductor.work_division_constraints import (
     JOINT_TILING_AND_DIVISION_ATTR,
 )
 from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
+from torch_spyre._inductor.wsr.coarse_tile import (
+    capture_iteration_frame,
+    iteration_symbol_remap,
+    IterationFrame,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     ceil_div,
     cost_expr_record,
@@ -2068,6 +2073,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # function rather than a class. Engines that cannot are never handed a
         # copy, and their objective never carries a relayout term.
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
+        # Per op ``_apply_chosen_tilings`` tiled, its pre-apply iteration
+        # symbols to its live ones; read through :meth:`_live_splits`.
+        self._tiling_symbol_remaps: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
         self._decides_lx_relayouts: bool = bool(
             getattr(layout_planning([], size), "decides_lx_relayouts", False)
         )
@@ -2640,9 +2648,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # from this module, so a top-level import would be circular.
         from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
+        frames = {
+            name: capture_iteration_frame(op)
+            for name in tiled
+            if isinstance(op := op_by_name[name], ComputedBuffer)
+        }
         tiling_pass = CoarseTilingPass(choices)
         tiling_pass.plan_only(graph)
         tiling_pass.apply_pass(graph)
+        self._remap_tiled_symbols(graph, frames)
         # These ops' tilings and divisions were chosen together by one solve, so
         # they are exempt from the pin that keeps *independent* choosers off a
         # coarse-tile-local dim -- see ``coarse_tile_local_dim_split_domains``.
@@ -2657,6 +2671,48 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ", ".join(f"{name}={spec.label}" for name, spec in sorted(choices.items())),
         )
         return tiled
+
+    def _remap_tiled_symbols(
+        self, graph: GraphLowering, frames: dict[str, IterationFrame]
+    ) -> None:
+        """Record how the apply renumbered each tiled op's iteration symbols, and
+        move the op's span floors through it.
+
+        The solve keyed its splits by the pre-apply symbols. A tile that shrinks
+        a dim to extent 1 drops that dim's symbol and renumbers every later one,
+        so a pre-apply key read against the live op names the next axis. The
+        floors ``span_reduction_pass`` committed are keyed the same way and are
+        read against the live op by ``meets_span_floors``.
+        """
+        live = {op.name: op for op in graph.operations}
+        self._tiling_symbol_remaps = {}
+        for name, frame in frames.items():
+            op = live[name]
+            assert isinstance(op, ComputedBuffer)
+            self._tiling_symbol_remaps[name] = iteration_symbol_remap(op, frame)
+            floors = getattr(op, "_work_division_span_min_splits", None)
+            if floors:
+                op._work_division_span_min_splits = self._live_splits(name, floors)
+
+    def _live_splits(
+        self, name: str, splits: dict[sympy.Symbol, int]
+    ) -> dict[sympy.Symbol, int]:
+        """``splits``, keyed by op ``name``'s pre-apply symbols, re-keyed to its
+        live ones. Identity for an op the apply did not tile."""
+        remap = self._tiling_symbol_remaps.get(name)
+        if remap is None:
+            return dict(splits)
+        lost = sorted(
+            str(sym)
+            for sym, factor in splits.items()
+            if sym not in remap and factor > 1
+        )
+        if lost:
+            raise Unsupported(
+                f"{name}: the coarse tiling left no axis for the split on "
+                f"{', '.join(lost)}; it would commit as 1"
+            )
+        return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
 
     def _check_priced_footprints(
         self,
@@ -2735,28 +2791,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
-            if not cd.tiling.is_untiled:
-                # The apply ran first, so this op's iteration space has been
-                # re-derived since the division was chosen. A split naming a
-                # symbol that no longer exists would not be rejected by
-                # ``make_iteration_space_ownership`` -- it reads
-                # ``splits.get(sym, 1)`` over the *live* space, so a stale key is
-                # dropped and the axis silently commits as unsplit.
-                live = set(iteration_space_from_op(op))
-                stale = sorted(str(sym) for sym in cd.splits if sym not in live)
-                if stale:
-                    raise Unsupported(
-                        f"{op.name}: applying {cd.tiling.label} left the chosen "
-                        f"division naming iteration symbols the op no longer has "
-                        f"({', '.join(stale)}); those splits would commit as 1"
-                    )
-            if not _split_option_is_legal(op, cd.splits):
+            # The apply ran first, so a tiled op's splits need re-keying.
+            splits = self._live_splits(buf.name, cd.splits)
+            if not _split_option_is_legal(op, splits):
                 raise Unsupported(
                     f"{op.name}: chosen split violates hard domain "
                     f"(division {cd.label}, tiling {cd.tiling.label}, ranges "
                     f"{[str(r) for r in getattr(op.data, 'ranges', [])]})"
                 )
-            commit_iteration_space_ownership(op, cd.splits)
+            commit_iteration_space_ownership(op, splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
