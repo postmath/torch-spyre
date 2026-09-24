@@ -2127,6 +2127,22 @@ class TestDivideRanges(unittest.TestCase):
             SpyreTensorLayout(tile_size, tile_stride, torch.float16, [1, 0, 2, 3]),
         )
 
+    def test_resize_device_layout_refuses_a_tile_count_dim_at_a_foreign_stride(
+        self,
+    ):
+        """The same layout without its strides: the two size-8 dims tie the
+        tile count in size, but not in stride, so they are not the tile count.
+        Taking them for it returned the layout unresized."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, [1, 0, 2, 3])
+        for tile_size in ([4, 8, 512, 512], [8, 4, 512, 512]):
+            with self.subTest(tile_size=tile_size):
+                with self.assertRaisesRegex(RuntimeError, "not the tile-count dim"):
+                    _resize_device_layout(stl, size, tile_size, stick_host_dim=3)
+
     def test_resize_device_layout_raises_on_unsupported(self):
         """_resize_device_layout raises RuntimeError when the stick host dim
         cannot be uniquely identified from stride_map[-1].
@@ -6057,6 +6073,76 @@ class TestPlanReadCopies(unittest.TestCase):
         )
         self.assertEqual(entries_by_name["only_a_buf"].consumer_op_names, ("op_a",))
         self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
+
+    def test_a_copy_of_a_permuted_source_is_resized_by_its_strides(self):
+        # Attention scores [8, 8, 512, 512] at host strides
+        # (512, 4096, 32768, 1), read by ops tiling d0 by 2. Without the
+        # strides the resize cannot tell d0 from d1 or the tile count; the
+        # copy kept the full-size device layout, twice its reservation.
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device, dtype = torch.device("cpu"), torch.float16
+        size, stride, order = [8, 8, 512, 512], [512, 4096, 32768, 1], [1, 0, 2, 3]
+        tile_size, tile_stride = [4, 8, 512, 512], [512, 2048, 16384, 1]
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, size, device, dtype
+        )
+        full_buf.layout = FixedTiledLayout(
+            device,
+            dtype,
+            [Integer(x) for x in size],
+            [Integer(x) for x in stride],
+            SpyreTensorLayout(size, stride, dtype, order, ElementArrangement.STANDARD),
+        )
+        loader = TensorBox(StorageBox(full_buf)).make_loader()
+        readers = []
+        for name in ("op_a", "op_b"):
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=loader,
+                ranges=[Integer(x) for x in tile_size],
+            )
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(x) for x in tile_size]),
+                data=pw.data.data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[Integer(2)],
+                loop_tiled_dims=[[0]],
+                tiled_dims_per_read=[[[]]],
+            )
+            V.graph.name_to_buffer[name] = op
+            readers.append(op)
+        operations = [full_buf, *readers]
+        plans = _plan_read_copies(operations, [((0,), readers, {})])
+        _insert_all_read_copy_ops(operations, plans)
+        (copy,) = [
+            op
+            for op in operations
+            if op.get_name().startswith("coarse_tile_read_copy_")
+        ]
+        self.assertEqual(
+            copy.layout.device_layout,
+            SpyreTensorLayout(tile_size, tile_stride, dtype, order),
+        )
 
 
 class TestReadCopyPlanDataclasses(unittest.TestCase):
