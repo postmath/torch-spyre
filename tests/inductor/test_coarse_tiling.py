@@ -100,6 +100,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_group_idx_offset,
     _derive_hint_id_base,
     derive_tiling_groups,
+    tile_aligned_host_dims,
     tile_spec_to_dim_hints,
     try_resolve_tile_axis_loop_vars,
 )
@@ -126,6 +127,11 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_offset,
     compute_tile_index,
     compute_tile_stride,
+)
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    patch_row_major_out_coords,
 )
 
 _FP16 = DataFormats.SEN169_FP16
@@ -9870,63 +9876,23 @@ class TestDeriveTilingGroupsLogicalDims(unittest.TestCase):
     but not ``V``'s."""
 
     def setUp(self):
-        from torch._inductor.ir import (
-            ComputedBuffer,
-            FixedLayout,
-            InputBuffer,
-            Pointwise,
-            Reduction,
-            StorageBox,
-            TensorBox,
-        )
         from torch._inductor.virtualized import ops
 
         gm = fx.symbolic_trace(lambda: None)
         self.enterContext(V.set_graph_handler(GraphLowering(gm)))
-        # Host coords of a row-major layout are the write's own loop vars.
-        self.enterContext(
-            patch(
-                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
-                side_effect=lambda op: list(
-                    next(iter(op.get_read_writes().writes)).var_names
-                ),
-            )
-        )
-        cpu = torch.device("cpu")
-
-        def buf(name, ranges, inner_fn, reduction_ranges=None):
-            if reduction_ranges is None:
-                box = Pointwise.create(
-                    device=cpu, dtype=torch.float32, inner_fn=inner_fn, ranges=ranges
-                )
-            else:
-                box = Reduction.create(
-                    device=cpu,
-                    dst_dtype=torch.float32,
-                    src_dtype=torch.float32,
-                    inner_fn=inner_fn,
-                    ranges=ranges,
-                    reduction_ranges=reduction_ranges,
-                    reduction_type="sum",
-                )
-            data = box.data.data
-            op = ComputedBuffer(
-                name=name,
-                layout=FixedLayout(cpu, torch.float32, ranges, None),
-                data=data,
-            )
-            op.operation_name = name
-            V.graph.name_to_buffer[name] = op
-            return TensorBox(StorageBox(op)).make_loader(), op
-
-        def load_input(name, size):
-            inp = InputBuffer(name=name, layout=FixedLayout(cpu, torch.float32, size))
-            V.graph.name_to_buffer[name] = inp
-            return TensorBox(StorageBox(inp)).make_loader()
+        self.enterContext(patch_row_major_out_coords())
+        buf, load_input = ir_computed_buffer, ir_input_loader
 
         load_p, p = buf("P", [4, 8, 128], load_input("in0", [4, 8, 128]))
-        _, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+        load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
         self.graph = _graph([p, c])
+        self.p, self.c = p, c
+        _, d = buf(
+            "D",
+            [8, 4, 128],
+            lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+        )
+        self.stretch_graph = _graph([p, c, d])
 
         load_v, v = buf("V", [8, 128], load_input("in_v", [8, 128]))
         load_s, s = buf("S", [8, 8], load_input("in_s", [8, 8]))
@@ -9946,6 +9912,18 @@ class TestDeriveTilingGroupsLogicalDims(unittest.TestCase):
 
     def test_permuted_host_dim_breaks_the_run(self):
         self.assertEqual(self._names(TileSpec((TileAxis(0, 2),))), [["P"], ["C"]])
+
+    def test_the_aligned_dims_are_those_walked_as_written(self):
+        self.assertEqual(tile_aligned_host_dims(self.c, self.p), frozenset({2}))
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted: whether a
+        # group starts at D depends on the specs since P, not on C's group.
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(
+            self._names(spec, self.stretch_graph, ("P", "C", "D")),
+            [["P"], ["C"], ["D"]],
+        )
 
     def test_host_dim_the_permutation_keeps_stays_one_run(self):
         self.assertEqual(self._names(TileSpec((TileAxis(2, 2),))), [["P", "C"]])

@@ -989,3 +989,69 @@ def mock_op_split_space(
         # Output host dim i is the i-th iteration axis, as it is for a real op.
         axis_by_host_dim=dict(enumerate(domains)),
     )
+
+
+def ir_input_loader(name: str, size: list[int]) -> Callable:
+    """A loader over a float32 CPU ``InputBuffer`` registered with the active
+    graph handler."""
+    from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
+    from torch._inductor.virtualized import V
+
+    inp = InputBuffer(
+        name=name, layout=FixedLayout(torch.device("cpu"), torch.float32, size)
+    )
+    V.graph.name_to_buffer[name] = inp
+    return TensorBox(StorageBox(inp)).make_loader()
+
+
+def ir_computed_buffer(
+    name: str,
+    ranges: list[int],
+    inner_fn: Callable,
+    reduction_ranges: list[int] | None = None,
+) -> tuple[Callable, Any]:
+    """``(loader, op)`` for a float32 CPU ``ComputedBuffer`` -- a ``Pointwise``,
+    or a sum ``Reduction`` over ``reduction_ranges`` -- registered with the
+    active graph handler."""
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        Pointwise,
+        Reduction,
+        StorageBox,
+        TensorBox,
+    )
+    from torch._inductor.virtualized import V
+
+    cpu = torch.device("cpu")
+    if reduction_ranges is None:
+        box = Pointwise.create(
+            device=cpu, dtype=torch.float32, inner_fn=inner_fn, ranges=ranges
+        )
+    else:
+        box = Reduction.create(
+            device=cpu,
+            dst_dtype=torch.float32,
+            src_dtype=torch.float32,
+            inner_fn=inner_fn,
+            ranges=ranges,
+            reduction_ranges=reduction_ranges,
+            reduction_type="sum",
+        )
+    op = ComputedBuffer(
+        name=name,
+        layout=FixedLayout(cpu, torch.float32, ranges, None),
+        data=box.data.data,
+    )
+    op.operation_name = name
+    V.graph.name_to_buffer[name] = op
+    return TensorBox(StorageBox(op)).make_loader(), op
+
+
+def patch_row_major_out_coords() -> Any:
+    """Patch ``coarse_tiling.op_out_coords``: the host coords of a row-major
+    layout are the write's own loop vars."""
+    return mock_patch(
+        "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+        side_effect=lambda op: list(next(iter(op.get_read_writes().writes)).var_names),
+    )
