@@ -9516,6 +9516,105 @@ class TestDeriveTilingGroups(unittest.TestCase):
         self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
 
 
+class TestDeriveTilingGroupsLogicalDims(unittest.TestCase):
+    """A shared positional spec groups a reader only where it tiles the same
+    logical dim of what it reads: ``[A, S, D] -> [S, A, D]`` puts ``A`` at
+    host dim 0 of the writer and ``S`` at host dim 0 of the reader. Likewise
+    ``O = S @ V`` reduces over ``V``'s host dim 0, so it tiles ``S``'s row dim
+    but not ``V``'s."""
+
+    def setUp(self):
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            InputBuffer,
+            Pointwise,
+            Reduction,
+            StorageBox,
+            TensorBox,
+        )
+        from torch._inductor.virtualized import ops
+
+        gm = fx.symbolic_trace(lambda: None)
+        self.enterContext(V.set_graph_handler(GraphLowering(gm)))
+        # Host coords of a row-major layout are the write's own loop vars.
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=lambda op: list(
+                    next(iter(op.get_read_writes().writes)).var_names
+                ),
+            )
+        )
+        cpu = torch.device("cpu")
+
+        def buf(name, ranges, inner_fn, reduction_ranges=None):
+            if reduction_ranges is None:
+                box = Pointwise.create(
+                    device=cpu, dtype=torch.float32, inner_fn=inner_fn, ranges=ranges
+                )
+            else:
+                box = Reduction.create(
+                    device=cpu,
+                    dst_dtype=torch.float32,
+                    src_dtype=torch.float32,
+                    inner_fn=inner_fn,
+                    ranges=ranges,
+                    reduction_ranges=reduction_ranges,
+                    reduction_type="sum",
+                )
+            data = box.data.data
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(cpu, torch.float32, ranges, None),
+                data=data,
+            )
+            op.operation_name = name
+            V.graph.name_to_buffer[name] = op
+            return TensorBox(StorageBox(op)).make_loader(), op
+
+        def load_input(name, size):
+            inp = InputBuffer(name=name, layout=FixedLayout(cpu, torch.float32, size))
+            V.graph.name_to_buffer[name] = inp
+            return TensorBox(StorageBox(inp)).make_loader()
+
+        load_p, p = buf("P", [4, 8, 128], load_input("in0", [4, 8, 128]))
+        _, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+        self.graph = _graph([p, c])
+
+        load_v, v = buf("V", [8, 128], load_input("in_v", [8, 128]))
+        load_s, s = buf("S", [8, 8], load_input("in_s", [8, 8]))
+        _, o = buf(
+            "O",
+            [8, 128],
+            lambda i, r: ops.mul(load_s([i[0], r[0]]), load_v([r[0], i[1]])),
+            reduction_ranges=[8],
+        )
+        self.attn_graph = _graph([v, s, o])
+
+    def _names(self, spec, graph=None, tiled=("P", "C")):
+        groups = derive_tiling_groups(
+            graph or self.graph, {name: spec for name in tiled}
+        )
+        return [[o.get_operation_name() for o in ops] for ops, _ in groups]
+
+    def test_permuted_host_dim_breaks_the_run(self):
+        self.assertEqual(self._names(TileSpec((TileAxis(0, 2),))), [["P"], ["C"]])
+
+    def test_host_dim_the_permutation_keeps_stays_one_run(self):
+        self.assertEqual(self._names(TileSpec((TileAxis(2, 2),))), [["P", "C"]])
+
+    def test_reduction_over_a_tiled_dim_breaks_the_run(self):
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(
+            self._names(spec, self.attn_graph, ("V", "S", "O")), [["V", "S"], ["O"]]
+        )
+
+    def test_reduction_reader_of_its_own_row_dim_stays_one_run(self):
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(self._names(spec, self.attn_graph, ("S", "O")), [["S", "O"]])
+
+
 class TestDerivedBases(unittest.TestCase):
     """Hint-id and group-idx bases are derived off the graph, never reserved."""
 

@@ -34,6 +34,7 @@ from collections.abc import Mapping, Sequence
 
 import sympy
 
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
@@ -117,6 +118,64 @@ def tile_spec_to_dim_hints(
     return hints
 
 
+def _host_dim_walk(
+    op: ComputedBuffer, dep: MemoryDep, host_dim: int
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """``(stride, extent)`` of ``dep`` along the loop var at output ``host_dim``
+    of ``op``, or ``None`` where that is not a single affine loop var."""
+    coords = op_out_coords(op)
+    if host_dim >= len(coords) or len(coords[host_dim].free_symbols) != 1:
+        return None
+    var = next(iter(coords[host_dim].free_symbols))
+    stride = sympy.diff(dep.index, var)
+    extent = dict(zip(dep.var_names, dep.size)).get(var)
+    if stride == 0 or stride.free_symbols or extent is None:
+        return None
+    return stride, extent
+
+
+def _reads_tiles_as_written(
+    op: Operation,
+    run_by_buf: Mapping[str, ComputedBuffer],
+    spec: TileSpec,
+) -> bool:
+    """Whether ``op`` walks every tiled output axis of each run member it reads
+    along the same buffer dim, at the same extent, as that member writes it.
+
+    ``TileAxis.host_dim`` is positional, so a shared spec is not a shared
+    logical dim: across ``[A, S, D] -> [S, A, D]`` host dim 0 is ``A`` on one
+    side and ``S`` on the other, and the reader would index the writer's
+    per-tile scratch as though it held a tile of ``S``. Anything not provably
+    aligned counts as misaligned. Reduction axes are not in a written buffer.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return True
+    rw = op.get_read_writes()
+    for read in rw.reads:
+        producer = run_by_buf.get(read.name)
+        if producer is None:
+            continue
+        if not isinstance(read, MemoryDep):
+            return False
+        write = next(
+            (
+                w
+                for w in producer.get_read_writes().writes
+                if isinstance(w, MemoryDep) and w.name == read.name
+            ),
+            None,
+        )
+        if write is None:
+            return False
+        for axis in spec.axes:
+            if axis.is_reduction:
+                continue
+            written = _host_dim_walk(producer, write, axis.host_dim)
+            if written is None or written != _host_dim_walk(op, read, axis.host_dim):
+                return False
+    return True
+
+
 def derive_tiling_groups(
     graph: GraphLowering,
     choices: Mapping[str, TileSpec],
@@ -147,16 +206,26 @@ def derive_tiling_groups(
     to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
     for the illegal case.
 
+    A run also breaks at an op that reads a run member along a different
+    logical dim than the spec tiles it by (:func:`_reads_tiles_as_written`):
+    one group would hand it the wrong slice, two make it a cross-group read of
+    the full buffer.
+
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
     groups: list[tuple[list[Operation], TileSpec]] = []
     current_ops: list[Operation] = []
     current_spec: TileSpec | None = None
+    run_by_buf: dict[str, ComputedBuffer] = {}
     for op in graph.operations:
         spec = choices.get(op.get_operation_name())
         if spec is not None and spec.is_untiled:
             spec = None
-        if spec is not None and spec == current_spec:
+        if (
+            spec is not None
+            and spec == current_spec
+            and _reads_tiles_as_written(op, run_by_buf, spec)
+        ):
             current_ops.append(op)
         else:
             if current_ops:
@@ -164,6 +233,9 @@ def derive_tiling_groups(
                 groups.append((current_ops, current_spec))
             current_ops = [op] if spec is not None else []
             current_spec = spec
+            run_by_buf = {}
+        if spec is not None and isinstance(op, ComputedBuffer):
+            run_by_buf[op.get_name()] = op
     if current_ops:
         assert current_spec is not None
         groups.append((current_ops, current_spec))
