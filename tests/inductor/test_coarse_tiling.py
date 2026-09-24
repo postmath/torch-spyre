@@ -99,6 +99,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_group_idx_offset,
     _derive_hint_id_base,
     derive_tiling_groups,
+    tile_aligned_host_dims,
     tile_spec_to_dim_hints,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -9579,8 +9580,15 @@ class TestDeriveTilingGroupsLogicalDims(unittest.TestCase):
             return TensorBox(StorageBox(inp)).make_loader()
 
         load_p, p = buf("P", [4, 8, 128], load_input("in0", [4, 8, 128]))
-        _, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+        load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
         self.graph = _graph([p, c])
+        self.p, self.c = p, c
+        _, d = buf(
+            "D",
+            [8, 4, 128],
+            lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+        )
+        self.stretch_graph = _graph([p, c, d])
 
         load_v, v = buf("V", [8, 128], load_input("in_v", [8, 128]))
         load_s, s = buf("S", [8, 8], load_input("in_s", [8, 8]))
@@ -9600,6 +9608,18 @@ class TestDeriveTilingGroupsLogicalDims(unittest.TestCase):
 
     def test_permuted_host_dim_breaks_the_run(self):
         self.assertEqual(self._names(TileSpec((TileAxis(0, 2),))), [["P"], ["C"]])
+
+    def test_the_aligned_dims_are_those_walked_as_written(self):
+        self.assertEqual(tile_aligned_host_dims(self.c, self.p), frozenset({2}))
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted: whether a
+        # group starts at D depends on the specs since P, not on C's group.
+        spec = TileSpec((TileAxis(0, 2),))
+        self.assertEqual(
+            self._names(spec, self.stretch_graph, ("P", "C", "D")),
+            [["P"], ["C"], ["D"]],
+        )
 
     def test_host_dim_the_permutation_keeps_stays_one_run(self):
         self.assertEqual(self._names(TileSpec((TileAxis(2, 2),))), [["P", "C"]])

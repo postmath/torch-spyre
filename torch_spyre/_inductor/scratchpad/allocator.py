@@ -3125,9 +3125,34 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 and self._solver_generates_divisions
             ):
                 buffer.division_space = self._division_space(op, buffer)
+            if self._solver_chooses_tilings and isinstance(op, ComputedBuffer):
+                buffer.tile_aligned_parents = self._tile_aligned_parents(op, op_by_name)
             buffers.append(buffer)
         buffers.extend(self._relayout_copy_buffers(buffers, self.size))
         return buffers
+
+    @staticmethod
+    def _tile_aligned_parents(
+        op: ComputedBuffer, op_by_name: dict[str, Operation]
+    ) -> dict[str, Optional[frozenset[int]]]:
+        """``CoreDivisionBuffer.tile_aligned_parents`` for ``op``: every
+        computed buffer it reads, ``None`` (misaligned under any spec) where
+        the walk cannot be derived."""
+        # Local import: ``coarse_tiling`` imports this module.
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            tile_aligned_host_dims,
+        )
+
+        aligned: dict[str, Optional[frozenset[int]]] = {}
+        for name in sorted({read.name for read in op.get_read_writes().reads}):
+            producer = op_by_name.get(name)
+            if not isinstance(producer, ComputedBuffer):
+                continue
+            try:
+                aligned[name] = tile_aligned_host_dims(op, producer)
+            except Exception:  # noqa: BLE001 - fail closed: the run breaks
+                aligned[name] = None
+        return aligned
 
     @staticmethod
     def _loop_carry_update_edge(

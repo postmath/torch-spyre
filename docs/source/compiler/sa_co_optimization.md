@@ -216,7 +216,10 @@ Three move types:
   the first op that refuses rather than the move being rejected — sliding the boundary as far as it
   will go. An operation that produces no solver buffer stops the walk for the same reason it breaks
   a run: nothing can carry a tiling to it. Runs are measured over `CoreDivisionBuffer.op_position`,
-  because buffer indices are not operation positions.
+  because buffer indices are not operation positions. A run is exactly the group
+  `derive_tiling_groups` forms, so it also breaks at an op reading an op of its stretch along
+  another logical dim than the spec tiles (`CoreDivisionBuffer.tile_aligned_parents`); the walk
+  stops there, and the flood carries no spec across such a read.
 
   Two costs of that, recorded rather than fixed. The tile levels are **concatenated onto the
   neighbour list, not weighted against it**, so from the untiled state most of flip's mass goes to

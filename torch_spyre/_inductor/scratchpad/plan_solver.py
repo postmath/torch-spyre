@@ -231,6 +231,16 @@ class TileSpec:
         final rather than a partial sum."""
         return not any(a.is_reduction for a in self.axes)
 
+    def read_as_written(self, aligned: Optional[frozenset[int]]) -> bool:
+        """Whether a reader walking a writer's output host dims ``aligned`` as
+        the writer does (``None``: an edge no spec aligns, see
+        :func:`~torch_spyre._inductor.scratchpad.coarse_tiling.tile_aligned_host_dims`)
+        reads each tile of this spec as written. Reduction axes are not in a
+        written buffer."""
+        return aligned is not None and all(
+            a.is_reduction or a.host_dim in aligned for a in self.axes
+        )
+
     @property
     def label(self) -> str:
         if not self.axes:
@@ -338,6 +348,14 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # solver reads as "operation order is unknown here, so no tiling may span
     # more than nothing".
     op_position: Optional[int] = None
+    # Parent name -> the parent's output host dims this buffer's op reads as
+    # the parent writes them (``tile_aligned_host_dims``), for the parents the
+    # op reads that a tiling run could hold. A spec those dims do not cover
+    # breaks the run there (``derive_tiling_groups``). Filled only where the
+    # solver chooses tilings.
+    tile_aligned_parents: dict[str, Optional[frozenset[int]]] = field(
+        default_factory=dict
+    )
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy

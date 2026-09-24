@@ -135,45 +135,61 @@ def _host_dim_walk(
     return stride, extent
 
 
-def _reads_tiles_as_written(
-    op: Operation,
-    run_by_buf: Mapping[str, ComputedBuffer],
-    spec: TileSpec,
-) -> bool:
-    """Whether ``op`` walks every tiled output axis of each run member it reads
-    along the same buffer dim, at the same extent, as that member writes it.
+def tile_aligned_host_dims(
+    op: ComputedBuffer, producer: ComputedBuffer
+) -> frozenset[int] | None:
+    """The output host dims of ``producer`` that ``op`` walks, in every read of
+    it, along the same buffer dim at the same extent as ``producer`` writes
+    them; ``None`` where no spec is read as written (a read or the write that
+    is not a :class:`MemoryDep`).
 
     ``TileAxis.host_dim`` is positional, so a shared spec is not a shared
     logical dim: across ``[A, S, D] -> [S, A, D]`` host dim 0 is ``A`` on one
     side and ``S`` on the other, and the reader would index the writer's
     per-tile scratch as though it held a tile of ``S``. Anything not provably
-    aligned counts as misaligned. Reduction axes are not in a written buffer.
+    aligned counts as misaligned.
     """
-    if not isinstance(op, ComputedBuffer):
-        return True
-    rw = op.get_read_writes()
-    for read in rw.reads:
-        producer = run_by_buf.get(read.name)
-        if producer is None:
+    name = producer.get_name()
+    write = next(
+        (
+            w
+            for w in producer.get_read_writes().writes
+            if isinstance(w, MemoryDep) and w.name == name
+        ),
+        None,
+    )
+    if write is None:
+        return None
+    dims = set(range(len(op_out_coords(producer))))
+    for read in op.get_read_writes().reads:
+        if read.name != name:
             continue
         if not isinstance(read, MemoryDep):
+            return None
+        dims = {
+            d
+            for d in dims
+            if (walk := _host_dim_walk(producer, write, d)) is not None
+            and walk == _host_dim_walk(op, read, d)
+        }
+    return frozenset(dims)
+
+
+def _reads_tiles_as_written(
+    op: Operation,
+    by_buf: Mapping[str, ComputedBuffer],
+    spec: TileSpec,
+) -> bool:
+    """Whether ``op`` reads each op of ``by_buf`` it reads with every tiled
+    output axis of ``spec`` walked as that op writes it."""
+    if not isinstance(op, ComputedBuffer):
+        return True
+    for name in {read.name for read in op.get_read_writes().reads}:
+        producer = by_buf.get(name)
+        if producer is not None and not spec.read_as_written(
+            tile_aligned_host_dims(op, producer)
+        ):
             return False
-        write = next(
-            (
-                w
-                for w in producer.get_read_writes().writes
-                if isinstance(w, MemoryDep) and w.name == read.name
-            ),
-            None,
-        )
-        if write is None:
-            return False
-        for axis in spec.axes:
-            if axis.is_reduction:
-                continue
-            written = _host_dim_walk(producer, write, axis.host_dim)
-            if written is None or written != _host_dim_walk(op, read, axis.host_dim):
-                return False
     return True
 
 
@@ -207,25 +223,31 @@ def derive_tiling_groups(
     to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
     for the illegal case.
 
-    A run also breaks at an op that reads a run member along a different
-    logical dim than the spec tiles it by (:func:`_reads_tiles_as_written`):
+    A run also breaks at an op that reads an op of its *stretch* -- the ops
+    since the spec last changed, not only its group -- along a different
+    logical dim than the spec tiles it by (:func:`tile_aligned_host_dims`):
     one group would hand it the wrong slice, two make it a cross-group read of
-    the full buffer.
+    the full buffer. Taking the stretch over-breaks only where that op is
+    already in an earlier group, and makes where a group starts depend on the
+    specs between an op and what it reads alone, which the SA co-optimizer
+    re-derives per move (``SaCoOptimizingSolver._run_bounds``).
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
     groups: list[tuple[list[Operation], TileSpec]] = []
     current_ops: list[Operation] = []
     current_spec: TileSpec | None = None
-    run_by_buf: dict[str, ComputedBuffer] = {}
+    stretch_by_buf: dict[str, ComputedBuffer] = {}
     for op in graph.operations:
         spec = choices.get(op.get_operation_name())
         if spec is not None and spec.is_untiled:
             spec = None
+        if spec != current_spec:
+            stretch_by_buf = {}
         if (
             spec is not None
             and spec == current_spec
-            and _reads_tiles_as_written(op, run_by_buf, spec)
+            and _reads_tiles_as_written(op, stretch_by_buf, spec)
         ):
             current_ops.append(op)
         else:
@@ -234,9 +256,8 @@ def derive_tiling_groups(
                 groups.append((current_ops, current_spec))
             current_ops = [op] if spec is not None else []
             current_spec = spec
-            run_by_buf = {}
         if spec is not None and isinstance(op, ComputedBuffer):
-            run_by_buf[op.get_name()] = op
+            stretch_by_buf[op.get_name()] = op
     if current_ops:
         assert current_spec is not None
         groups.append((current_ops, current_spec))
