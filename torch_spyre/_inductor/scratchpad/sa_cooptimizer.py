@@ -1323,7 +1323,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Cache the loop-invariant inputs to :meth:`_score`. A move changes only
         the *per-core* footprint the packer sees, never a buffer's total size, so
         neither the spill costs nor the bandwidth constant can move."""
-        self._spill_costs = [self._spill_cost(b) for b in self._bufs]
+        # A staged copy's traffic is :meth:`_read_copy_credit`'s to price; a
+        # spill cost too would credit placing it twice.
+        self._spill_costs = [
+            0 if isinstance(b, CoarseTileReadCopyBuffer) else self._spill_cost(b)
+            for b in self._bufs
+        ]
         self._hbm_bytes_per_us = utils.hbm_bytes_per_us()
 
     # -- division-dependent derivations --------------------------------------
@@ -1715,17 +1720,67 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         the saving over ``r - 1`` has already paid for it. A read copy for a
         single read (``r == 1``) therefore saves nothing and is never worth
         placing, which is the arithmetic and not a special case.
+
+        This is the saving's own estimate; what :meth:`_score` credits is
+        bounded by what the expression charges (:meth:`_read_copy_credit`).
         """
+        return sum(self._staged_savings(addresses).values())
+
+    def _staged_savings(self, addresses: Sequence[Optional[int]]) -> dict[int, int]:
+        """:meth:`_read_copy_savings` by source index (``-1``: not a solver
+        buffer)."""
+        savings: dict[int, int] = {}
         if not self._tilings_are_possible:
-            return 0
-        total = 0
+            return savings
         for idx, buf in enumerate(self._bufs):
             if not isinstance(buf, CoarseTileReadCopyBuffer):
                 continue
             if addresses[idx] is None:
                 continue
-            total += max(0, buf.size) * max(0, self._staged_reads(idx) - 1)
-        return total
+            saved = max(0, buf.size) * max(0, self._staged_reads(idx) - 1)
+            if saved:
+                source_idx = self._read_copy_topology[idx][0]
+                key = -1 if source_idx is None else source_idx
+                savings[key] = savings.get(key, 0) + saved
+        return savings
+
+    def _read_copy_credit(
+        self,
+        addresses: Sequence[Optional[int]],
+        resident: Optional[frozenset[str]],
+        base: int,
+    ) -> int:
+        """What :meth:`_score` subtracts for the resident staged copies, in its
+        fixed-point units, given the objective ``base`` it subtracts from
+        (``resident`` is ``None`` for the memory-only objective).
+
+        :meth:`_read_copy_savings` assumes the objective charges every staged
+        read a full HBM pass over the source. It need not (a compute-bound
+        reader's term hides the pass), and crediting more than is charged
+        drives the score negative. So the credit is capped at what the
+        objective charges for the staged sources being in HBM: its drop when
+        they are counted resident, or their spill cost in the memory-only
+        objective. That charge covers the staged reads (and more: the
+        producer's write, other readers), and it leaves the score at least the
+        objective with those sources resident, which is non-negative. A source
+        outside the solver, or resident, has no HBM residency to price, so its
+        copies earn nothing.
+        """
+        by_source = self._staged_savings(addresses)
+        if not by_source:
+            return 0
+        sources = [s for s in by_source if s >= 0 and addresses[s] is None]
+        if not sources:
+            return 0
+        savings = sum(by_source[s] for s in sources)
+        if resident is None:
+            charged = utils.to_fixed_us(
+                sum(self._spill_costs[s] for s in sources) / self._hbm_bytes_per_us
+            )
+        else:
+            also = frozenset(self._bufs[s].name for s in sources)
+            charged = base - self._score_fn(self.chosen, resident | also)
+        return min(utils.to_fixed_us(savings / self._hbm_bytes_per_us), max(0, charged))
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
@@ -1741,33 +1796,39 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         and only spilled ones are summed, the same shape as the CP-SAT engine's
         ``spill_cost() * (1 - in_buffer)``.
 
-        :meth:`_companion_bytes` and :meth:`_read_copy_savings` are added to both,
-        at the HBM rate, because neither objective can express them: the cost
-        expression is built once from the untiled graph (its tile counts price
-        only the loop over each op), and neither the full buffer the apply mints
-        nor the staged tile it reads through is in it. Both are zero unless a
-        buffer is tiled, so a run that chooses no tiling scores exactly as it did
-        before they existed.
+        :meth:`_companion_bytes` is added to both, and :meth:`_read_copy_credit`
+        subtracted, at the HBM rate, because neither objective can express them:
+        the cost expression is built once from the untiled graph (its tile
+        counts price only the loop over each op), and neither the full buffer
+        the apply mints nor the staged tile it reads through is in it. Both are
+        zero unless a buffer is tiled, so a run that chooses no tiling scores
+        exactly as it did before they existed.
         """
         addresses = self.packer.addresses
         companions = utils.to_fixed_us(
-            (self._companion_bytes(addresses) - self._read_copy_savings(addresses))
-            / self._hbm_bytes_per_us
+            self._companion_bytes(addresses) / self._hbm_bytes_per_us
         )
+        base, resident = self._objective(addresses)
+        return base - self._read_copy_credit(addresses, resident, base) + companions
+
+    def _objective(
+        self, addresses: Sequence[Optional[int]]
+    ) -> tuple[int, Optional[frozenset[str]]]:
+        """:meth:`_score` before its off-expression terms, and the resident
+        names it was evaluated at (``None`` for the memory-only objective)."""
         if self._score_fn is not None:
             resident = frozenset(
                 b.name
                 for b, address in zip(self._bufs, addresses)
                 if address is not None
             )
-            return self._score_fn(self.chosen, resident) + companions
-
+            return self._score_fn(self.chosen, resident), resident
         traffic = sum(
             cost
             for cost, address in zip(self._spill_costs, addresses)
             if address is None
         )
-        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us) + companions
+        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us), None
 
     # -- moves ---------------------------------------------------------------
 

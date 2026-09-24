@@ -1736,6 +1736,68 @@ def _staging_graph(reads):
     return SimpleNamespace(operations=operations), buffers
 
 
+class StagedReadCopyCreditTest(TestCase):
+    """What the score credits for a resident staged copy is bounded by what the
+    objective charges for its source being in HBM, so the score stays
+    non-negative however little the expression prices those reads."""
+
+    def _solver(self, cost_expr):
+        solver = _staging_solver(("R", "B", "C"), ["R"])
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        solver._score_fn = solver._build_score_fn(cost_expr)
+        return solver
+
+    def _credit(self, solver):
+        addresses = [None] * 4 + [0]
+        resident = frozenset({solver._bufs[4].name})
+        base = solver._score_fn(solver.chosen, resident)
+        return solver._read_copy_credit(addresses, resident, base)
+
+    def test_the_credit_is_the_saving_while_the_source_is_charged_more(self):
+        source_lx = _staging_solver(("R",), [])._bufs[1].sym_is_lx
+        solver = self._solver(1e6 * (1 - source_lx))
+        saving = utils.to_fixed_us(2 * 1024 / solver._hbm_bytes_per_us)
+        self.assertEqual(self._credit(solver), saving)
+
+    def test_the_credit_is_capped_at_what_the_source_is_charged(self):
+        source_lx = _staging_solver(("R",), [])._bufs[1].sym_is_lx
+        solver = self._solver(1.0 + 2.0 * (1 - source_lx))
+        self.assertEqual(self._credit(solver), utils.to_fixed_us(2.0 / 1000))
+
+    def test_an_expression_that_does_not_price_the_source_credits_nothing(self):
+        solver = self._solver(sympy.Float(5.0))
+        self.assertEqual(self._credit(solver), 0)
+
+    def test_the_memory_only_objective_credits_a_placed_copy_once(self):
+        solver = _staging_solver(("R", "B", "C"), ["R"])
+        _tile(solver, ["R", "B", "C"], _TILE_2)
+        placed, spilled = [None] * 4 + [0], [None] * 5
+        self.assertEqual(solver._objective(placed), solver._objective(spilled))
+        saving = utils.to_fixed_us(2 * 1024 / solver._hbm_bytes_per_us)
+        self.assertEqual(solver._read_copy_credit(placed, None, 0), saving)
+
+    def test_annealing_a_staged_copy_the_expression_does_not_price(self):
+        """Regression: crediting the full saving here took the score below
+        zero, and ``to_fixed_us`` raised during temperature calibration."""
+        readers = [
+            _run_buffer(n, p, _two_axis_space(tiling=_tiling_space()))
+            for p, n in ((0, "R"), (1, "Q"))
+        ]
+        source = _run_buffer("S", 2)
+        source.op_position = None
+        for reader in readers:
+            reader.parents = ["S"]
+        bufs = [
+            *readers,
+            source,
+            _read_copy("S", "R", reader_index=0, readers=("R", "Q")),
+        ]
+        cost_expr = sum(1e6 / b.sym_tile_counts[_AXIS_0] for b in readers)
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertGreaterEqual(solver.best_score, 0)
+
+
 class StagedReadCopyPredictionTest(TestCase):
     """``_coarse_tile_read_copies`` predicts, per (source, reader), the copies
     ``_plan_read_copies`` could mint, keyed on the same read key."""
