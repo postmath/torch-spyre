@@ -412,8 +412,9 @@ Two useful flags:
 - `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line per
   solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
   per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
-  chose, every term evaluated under those bindings, and the alternative divisions each buffer
-  could have taken instead — a self-describing record of one solve, meant to be read without
+  chose, every term evaluated under those bindings, the terms the solver adds outside the
+  expression and the total it minimized, and the alternative divisions each buffer could have
+  taken instead — a self-describing record of one solve, meant to be read without
   needing to know which flags produced it. This one is specific to a *co-optimized* solve.
 
 ### Keeping the model honest: recalibrating against real hardware
