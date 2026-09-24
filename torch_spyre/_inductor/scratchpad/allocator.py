@@ -2324,7 +2324,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             emit_json_line(
                 config.dump_cost_expr_file,
                 cost_expr_record(
-                    cost_expr, bundle_terms, result, _COST_PARAMS, context=context
+                    cost_expr,
+                    bundle_terms,
+                    result,
+                    _COST_PARAMS,
+                    solver.off_expression_ns(),
+                    context=context,
                 ),
             )
         return result

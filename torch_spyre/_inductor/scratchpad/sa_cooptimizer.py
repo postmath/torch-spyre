@@ -1782,6 +1782,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             charged = base - self._score_fn(self.chosen, resident | also)
         return min(utils.to_fixed_us(savings / self._hbm_bytes_per_us), max(0, charged))
 
+    def off_expression_ns(self) -> dict[str, float]:
+        """:meth:`_score`'s two terms outside ``cost_expr``, for the current
+        state."""
+        if not self._bufs:
+            return {}
+        addresses = self.packer.addresses
+        base, resident = self._objective(addresses)
+        credit = self._read_copy_credit(addresses, resident, base)
+        ns_per_byte = 1000.0 / self._hbm_bytes_per_us
+        return {
+            "companions": self._companion_bytes(addresses) * ns_per_byte,
+            "read_copy_savings": -credit * 1000.0 / utils.US_FIXED_POINT_SCALE,
+        }
+
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
         time units. A buffer with a packer address is LX-resident (its address is

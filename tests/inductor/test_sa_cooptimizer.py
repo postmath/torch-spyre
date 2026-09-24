@@ -83,6 +83,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     TileAxis,
     TileSpec,
+    cost_expr_record,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
 
@@ -3115,3 +3116,61 @@ class CompanionBufferPricingTest(TestCase):
         self.assertEqual(
             after - before, utils.to_fixed_us(4096 / solver._hbm_bytes_per_us)
         )
+
+
+class CostDumpScoreTest(TestCase):
+    """The cost dump's ``score_ns`` is what the search minimized: ``cost_expr``
+    plus the terms :meth:`SaCoOptimizingSolver._score` adds outside it."""
+
+    def _solved(self):
+        # A tiled alone with two untiled readers, so its output escapes.
+        bufs = [_run_buffer("A", 0, _two_axis_space(tiling=_tiling_space()))]
+        for position, name in ((1, "B"), (2, "C")):
+            bufs.append(_run_buffer(name, position, _two_axis_space()))
+            bufs[-1].parents = ["A"]
+        cost_expr = 1e6 / bufs[0].sym_tile_counts[_AXIS_0]
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        result = solver.plan_layout_and_core_divisions(cost_expr)
+        return solver, cost_expr, result
+
+    def _record(self, solver, cost_expr, result):
+        return cost_expr_record(
+            cost_expr, [], result, off_expression_ns=solver.off_expression_ns()
+        )
+
+    def test_score_ns_is_the_best_score_with_a_companion(self):
+        solver, cost_expr, result = self._solved()
+        record = self._record(solver, cost_expr, result)
+        self.assertGreater(record["off_expression_ns"]["companions"], 0)
+        self.assertNotAlmostEqual(
+            record["objective_ns"], solver.best_score / 1000, places=2
+        )
+        self.assertAlmostEqual(record["score_ns"], solver.best_score / 1000, places=2)
+
+    def test_score_ns_subtracts_the_read_copy_credit(self):
+        # Two tiled readers of an untiled source, staged through one copy.
+        readers = [
+            _run_buffer(n, p, _two_axis_space(tiling=_tiling_space()))
+            for p, n in ((0, "R"), (1, "Q"))
+        ]
+        source = _run_buffer("S", 2)
+        source.op_position = None
+        for reader in readers:
+            reader.parents = ["S"]
+        bufs = [
+            *readers,
+            source,
+            _read_copy("S", "R", reader_index=0, readers=("R", "Q")),
+        ]
+        cost_expr = 1e5 * (1 - source.sym_is_lx) + sum(
+            1e6 / b.sym_tile_counts[_AXIS_0] for b in readers
+        )
+        solver = SaCoOptimizingSolver(bufs, 1 << 30, 128)
+        result = solver.plan_layout_and_core_divisions(cost_expr)
+        record = self._record(solver, cost_expr, result)
+        self.assertAlmostEqual(
+            record["off_expression_ns"]["read_copy_savings"],
+            -1024 * 1000 / solver._hbm_bytes_per_us,
+            places=2,
+        )
+        self.assertAlmostEqual(record["score_ns"], solver.best_score / 1000, places=2)
