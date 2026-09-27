@@ -187,8 +187,7 @@ def _resize_device_layout(
     ``new_host_stride`` (optional, with ``old_host_stride``): the resized
     buffer's host strides.  A device dim that stepped its host dim at the old
     actual stride steps it at the new one, so a permuted per-tile buffer gets a
-    ``stride_map`` that agrees with its host layout.  Without both, a
-    non-contiguous stride is left unchanged, as before.
+    ``stride_map`` that agrees with its host layout.
 
     Multi-pass algorithm:
 
