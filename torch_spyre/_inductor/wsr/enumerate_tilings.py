@@ -68,6 +68,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+from collections.abc import Sequence
 
 from torch._inductor.ir import ComputedBuffer, Reduction
 
@@ -117,6 +118,25 @@ def _output_split_counts(op: ComputedBuffer, host_dim: int) -> list[int]:
     except Unsupported:
         return []
     return [s for s in candidates if s > 1]
+
+
+def _unit_tile_breaks_a_reader(
+    op: ComputedBuffer, host_dim: int, count: int, readers: Sequence[ComputedBuffer]
+) -> bool:
+    """Whether tiling ``host_dim`` ``count`` ways leaves a 1-extent tile that a
+    reader views through another rank or shape, which ``_squeezed_retile_dims``
+    refuses for a reader outside the tiling group. Which readers end up outside
+    is not known yet, so any reader counts."""
+    ranges = tuple(op.data.ranges)
+    if int(ranges[host_dim]) // count != 1:
+        return False
+    for reader in readers:
+        reader_ranges = tuple(reader.data.ranges)
+        if len(reader_ranges) < len(ranges) or (
+            reader_ranges[host_dim] != 1 and reader_ranges != ranges
+        ):
+            return True
+    return False
 
 
 def _reduction_split_cuts_input_stick(op: ComputedBuffer, red_var, split: int) -> bool:
@@ -356,10 +376,12 @@ def build_tiling_space(
     *,
     max_dims: int = _MAX_TILE_DIMS,
     max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
+    readers: Sequence[ComputedBuffer] = (),
 ) -> TilingSpace:
     """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
     be coarse-tiled at all (:func:`_tileable`), which is not an error -- untiled
-    is always legal."""
+    is always legal. ``readers`` are the ops that read ``op``'s output (see
+    :func:`_unit_tile_breaks_a_reader`)."""
     output_counts: dict[int, list[int]] = {}
     stick_dim = _output_stick_host_dim(op) if _tileable(op) else None
     if stick_dim is not None:
@@ -367,7 +389,11 @@ def build_tiling_space(
         for host_dim in range(n_out):
             if host_dim == stick_dim:
                 continue  # fail closed on the stick dim (module docstring)
-            counts = _output_split_counts(op, host_dim)[:max_splits_per_dim]
+            counts = [
+                count
+                for count in _output_split_counts(op, host_dim)
+                if not _unit_tile_breaks_a_reader(op, host_dim, count, readers)
+            ][:max_splits_per_dim]
             if counts:
                 output_counts[host_dim] = counts
     return TilingSpace(max_dims=max_dims, output_counts=output_counts)

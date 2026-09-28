@@ -403,5 +403,64 @@ class TestTilingSpace(unittest.TestCase):
         self.assertEqual(space.enumerate(), [TileSpec()])
 
 
+def _reader(ranges):
+    """An op reading the tiled op's output, over ``ranges``."""
+    return SimpleNamespace(data=SimpleNamespace(ranges=list(ranges)))
+
+
+class TestApplyRefusals(unittest.TestCase):
+    """Counts the coarse-tile apply would refuse are not admitted."""
+
+    def test_a_folded_device_dim_admits_no_count(self):
+        # The attention output [1, 64, hq, 128] lays heads and head_dim's outer
+        # stick out as one device dim, which ``_resize_device_layout`` cannot
+        # resize for any tile.
+        from torch_spyre._C import SpyreTensorLayout
+
+        op = _pointwise_op((1, 64, 40, 128))
+        self.assertFalse(build_tiling_space(op).is_empty)  # non-vacuity
+        dl = op.layout.device_layout
+        op.layout.device_layout = SpyreTensorLayout(
+            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertTrue(build_tiling_space(op).is_empty)
+
+    def test_a_unit_tile_beside_another_unit_dim_is_refused(self):
+        # The tile [1, 1, 2048] has two unit host dims, so growing a copy-out's
+        # full buffer back from it cannot tell which device dim grows.
+        self.assertEqual(
+            build_tiling_space(_pointwise_op((1, 64, 2048))).counts(1),
+            [2, 4, 8, 16, 32],
+        )
+        self.assertIn(64, build_tiling_space(_pointwise_op((8, 64, 128))).counts(1))
+
+    def test_a_reshaping_reader_drops_only_the_unit_tile(self):
+        shape = (2, 8, 5, 64, 128)
+        untouched = build_tiling_space(_pointwise_op(shape))
+        self.assertIn(64, untouched.counts(3))  # non-vacuity
+        space = build_tiling_space(
+            _pointwise_op(shape), readers=[_reader((2, 8, 5, 64, 64))]
+        )
+        for dim in (0, 1, 2, 3):
+            self.assertEqual(
+                space.counts(dim),
+                [c for c in untouched.counts(dim) if c != shape[dim]],
+            )
+
+    def test_a_rank_changing_reader_drops_the_unit_tile(self):
+        space = build_tiling_space(
+            _pointwise_op((2, 8, 5, 64, 128)), readers=[_reader((2, 40, 64, 128))]
+        )
+        self.assertNotIn(64, space.counts(3))
+        self.assertIn(32, space.counts(3))
+
+    def test_a_same_shape_reader_or_none_keeps_the_unit_tile(self):
+        shape = (2, 8, 5, 64, 128)
+        for readers in ([], [_reader(shape)]):
+            space = build_tiling_space(_pointwise_op(shape), readers=readers)
+            self.assertIn(64, space.counts(3))
+            self.assertEqual(space.counts(2), [5])
+
+
 if __name__ == "__main__":
     unittest.main()

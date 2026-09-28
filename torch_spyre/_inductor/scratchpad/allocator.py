@@ -3195,6 +3195,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name = {op.name: op for op in graph.operations}
         position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
+        readers_by_name: dict[str, list[ComputedBuffer]] = {}
+        if self._solver_chooses_tilings:
+            for reader in graph.operations:
+                if isinstance(reader, ComputedBuffer):
+                    for name in {read.name for read in reader.get_read_writes().reads}:
+                        readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
@@ -3413,7 +3419,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 and output_name in division_map.enumerated
                 and self._solver_generates_divisions
             ):
-                buffer.division_space = self._division_space(op)
+                buffer.division_space = self._division_space(
+                    op, readers_by_name.get(output_name, ())
+                )
             if self._solver_chooses_tilings and isinstance(op, ComputedBuffer):
                 buffer.tile_aligned_parents = self._tile_aligned_parents(op, op_by_name)
             buffers.append(buffer)
@@ -3702,15 +3710,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         return config.auto_coarse_tiling and self._solver_generates_divisions
 
-    def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
-        """The op's split space.
+    def _division_space(
+        self, op: Operation, readers: Sequence[ComputedBuffer] = ()
+    ) -> Optional[OpSplitSpace]:
+        """The op's split space; ``readers`` are the ops reading its output.
 
         The tiling half is attached only for the solver that can use it (see
         :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
         analysis per output dim, so an engine that would ignore the answer does
         not pay for it.
         """
-        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        tiling = (
+            build_tiling_space(op, readers=readers)
+            if self._solver_chooses_tilings
+            else None
+        )
         return build_op_split_space(op, config.sencores, tiling=tiling)
 
     def _eligible_clone_inputs(
