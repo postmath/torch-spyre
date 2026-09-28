@@ -9621,7 +9621,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
 
     def test_unit_reduction_index_offset(self):
         """
-        Tests that the returned index is the unsqueezed index when providing 
+        Tests that the returned index is the unsqueezed index when providing
         a unity reduction axis.
         """
         op = self._unit_dim_op()
@@ -9743,8 +9743,6 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
 
 
 def _loop_var_to_reduction_ranges_pos_public(op, sym):
-
-
     return _loop_var_to_reduction_ranges_pos(op, sym)
 
 
