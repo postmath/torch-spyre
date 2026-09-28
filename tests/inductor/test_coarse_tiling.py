@@ -84,6 +84,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _divide_ranges,
     _full_buffer_read_deps,
     _index_var_prefix,
+    _loop_var_to_reduction_ranges_pos,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
@@ -9618,19 +9619,26 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
             hints=((1, 2),),
         )
 
+    def test_unit_reduction_index_offset(self):
+        """
+        Tests that the returned index is the unsqueezed index when providing 
+        a unity reduction axis.
+        """
+        op = self._unit_dim_op()
+        self.assertEqual(
+            [
+                _loop_var_to_reduction_ranges_pos(op, var)
+                for var in reduction_loop_vars(op)
+            ],
+            [1, 2],
+        )
+
     def test_unit_reduction_dim_tiles_the_named_dim(self):
         """``host_dim`` counts the squeezed reduction dims, so on ``[1, 8, 16]``
         host_dim 0 names the 8 and host_dim 1 the 16. The applier must divide
         that dim's ``reduction_ranges`` entry, not the entry at the squeezed
         position."""
         op = self._unit_dim_op()
-        self.assertEqual(
-            [
-                _loop_var_to_reduction_ranges_pos_public(op, var)
-                for var in reduction_loop_vars(op)
-            ],
-            [1, 2],
-        )
         for host_dim, count, expected in ((0, 2, [1, 4, 16]), (1, 4, [1, 8, 4])):
             with self.subTest(host_dim=host_dim):
                 op = self._unit_dim_op(f"buf_unit{host_dim}")
@@ -9735,9 +9743,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
 
 
 def _loop_var_to_reduction_ranges_pos_public(op, sym):
-    from torch_spyre._inductor.wsr.coarse_tile import (
-        _loop_var_to_reduction_ranges_pos,
-    )
+
 
     return _loop_var_to_reduction_ranges_pos(op, sym)
 
