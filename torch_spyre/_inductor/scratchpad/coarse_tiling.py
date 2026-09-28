@@ -43,6 +43,7 @@ from ..logging_utils import get_inductor_logger
 from ..pass_utils import iteration_space_from_op, op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
+    _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
@@ -112,16 +113,16 @@ def _get_red_var(
     Rejects, in order: an op that is not a ``Reduction``; one with no write dep
     to derive loop variables from; one with no reduction loop variables, because
     no read dep carries one (``reduction_loop_vars`` returns none when the op
-    loads no buffer); one whose loop variables do not line up one-to-one with
-    ``reduction_ranges``; and a ``host_dim`` past the end of its loop variables.
+    loads no buffer); a ``host_dim`` past the end of its loop variables; and a
+    loop variable the applier cannot place in ``reduction_ranges``.
 
-    The fourth is not a lowering limit but an applier one. The applier picks the
+    The last is not a lowering limit but an applier one. The applier picks the
     ``reduction_ranges`` entry to divide with
-    ``_loop_var_to_reduction_ranges_pos``, which returns the loop variable's
-    *squeezed* position, so once a size-1 dim is squeezed out (or a broadcast
-    symbol leaks into the loop variables) it divides a different entry than the
-    dim this loop variable tiles. Refusing here keeps lowering from handing the
-    applier a tiling it would misapply.
+    ``_loop_var_to_reduction_ranges_pos``, which pairs the squeezed loop
+    variables with the dims whose extent is not 1 and gives up when they do not
+    pair one-to-one (say, a broadcast symbol leaks into the loop variables).
+    Asking it here keeps lowering from handing the applier a hint it cannot
+    place.
     """
     if not isinstance(op.data, Reduction):
         return None, (
@@ -141,22 +142,22 @@ def _get_red_var(
             "no read dep carries a reduction loop variable, so there is no "
             "reduction loop to tile."
         )
-    reduction_ranges = list(op.data.reduction_ranges)
-    if len(red_vars) != len(reduction_ranges):
-        return None, (
-            f"coarse tiling: reduction host_dim={host_dim} on {op.get_name()}: "
-            f"{len(red_vars)} reduction loop variables for reduction ranges "
-            f"{reduction_ranges}, so a loop variable's position is not its "
-            "reduction_ranges position and the applier would divide a different "
-            "entry than the tiled dim."
-        )
     if host_dim >= len(red_vars):
         return None, (
             f"coarse tiling: reduction host_dim={host_dim} is out "
             f"of bounds for {len(red_vars)} reduction loop variables on "
             f"{op.get_name()}."
         )
-    return red_vars[host_dim], None
+    loop_var = red_vars[host_dim]
+    if _loop_var_to_reduction_ranges_pos(op, loop_var) is None:
+        return None, (
+            f"coarse tiling: reduction host_dim={host_dim} on {op.get_name()}: "
+            f"its {len(red_vars)} reduction loop variables do not pair "
+            "one-to-one with the non-size-1 dims of reduction ranges "
+            f"{list(op.data.reduction_ranges)}, so the applier cannot place "
+            f"{loop_var} in them."
+        )
+    return loop_var, None
 
 
 def try_resolve_tile_axis_loop_vars(

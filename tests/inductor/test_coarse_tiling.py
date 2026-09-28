@@ -84,6 +84,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _divide_ranges,
     _full_buffer_read_deps,
     _index_var_prefix,
+    _loop_var_to_reduction_ranges_pos,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
@@ -10266,7 +10267,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         # The inverse relationship: the lowered loop_var is exactly the one
         # reduction_loop_vars reports at that position.
         self.assertEqual(h.loop_var, red_vars[0])
-        self.assertEqual(_loop_var_to_reduction_ranges_pos_public(op, h.loop_var), 0)
+        self.assertEqual(_loop_var_to_reduction_ranges_pos(op, h.loop_var), 0)
 
     def test_reduction_host_dim_out_of_bounds_raises(self):
         op = _make_real_reduction_op(
@@ -10291,45 +10292,82 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
-    def _unit_dim_op(self):
+    def _unit_dim_op(self, name="buf0"):
         # reduction_ranges [1, 8, 16]: the size-1 dim gets no loop variable.
         return _make_real_reduction_op(
             ranges=[Integer(8)],
             reduction_ranges=[Integer(1), Integer(8), Integer(16)],
             input_shape_stride=([8, 1, 8, 16], [128, 128, 16, 1]),
-            name="buf0",
+            name=name,
             hints=((1, 2),),
         )
 
-    def test_unit_reduction_dim_raises(self):
-        """With a size-1 reduction dim, a loop variable's squeezed position is
-        not its ``reduction_ranges`` position, and the applier divides the entry
-        at the squeezed position -- a different dim than the one tiled."""
+    def test_unit_reduction_index_offset(self):
+        """_loop_var_to_reduction_ranges_pos returns the unsqueezed position when a
+        size-1 reduction dim is squeezed out."""
         op = self._unit_dim_op()
-        # Not vacuous: both host_dims are in bounds for the loop variables.
-        self.assertEqual(len(reduction_loop_vars(op)), 2)
-        for host_dim in (0, 1):
-            spec = TileSpec((TileAxis(host_dim, 2, is_reduction=True),))
-            with self.subTest(host_dim=host_dim), self.assertRaises(Unsupported):
+        self.assertEqual(
+            [
+                _loop_var_to_reduction_ranges_pos(op, var)
+                for var in reduction_loop_vars(op)
+            ],
+            [1, 2],
+        )
+
+    def test_unit_reduction_dim_tiles_the_named_dim(self):
+        """``host_dim`` counts the squeezed reduction dims, so on ``[1, 8, 16]``
+        host_dim 0 names the 8 and host_dim 1 the 16. The applier must divide
+        that dim's ``reduction_ranges`` entry, not the entry at the squeezed
+        position."""
+        for host_dim, count, expected in ((0, 2, [1, 4, 16]), (1, 4, [1, 8, 4])):
+            with self.subTest(host_dim=host_dim):
+                op = self._unit_dim_op(f"buf_unit{host_dim}")
+                loop_var = reduction_loop_vars(op)[host_dim]
+                spec = TileSpec((TileAxis(host_dim, count, is_reduction=True),))
+                op.dim_hints = tile_spec_to_dim_hints(op, spec, [1])
+                levels = [(1, Integer(count))]
+                plan = plan_coarse_tile_groups([op], [([op], levels)])
+                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+                self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
+                # ... and the loop the hint named is the one that shrank.
+                (read,) = op.get_read_writes().reads
+                self.assertEqual(int(read.ranges[loop_var]), expected[host_dim + 1])
+
+    def test_loop_vars_that_do_not_pair_raise(self):
+        """Loop variables that do not pair one-to-one with the non-size-1
+        reduction dims (a leaked broadcast symbol, say) leave the applier no
+        position to divide, so lowering refuses them."""
+        op = self._unit_dim_op()
+        leaked = [*reduction_loop_vars(op), sympy_index_symbol("d9")]
+        spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.reduction_loop_vars",
+                return_value=leaked,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.reduction_loop_vars",
+                return_value=leaked,
+            ),
+        ):
+            self.assertIsNone(_loop_var_to_reduction_ranges_pos(op, leaked[0]))
+            with self.assertRaises(Unsupported):
                 tile_spec_to_dim_hints(op, spec, [0])
 
     def test_resolver_reports_what_lowering_raises(self):
-        spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
+        # Out of bounds: [1, 8, 16] has two reduction loop variables.
+        spec = TileSpec((TileAxis(2, 2, is_reduction=True),))
         loop_vars, reason = try_resolve_tile_axis_loop_vars(self._unit_dim_op(), spec)
         self.assertIsNone(loop_vars)
         with self.assertRaises(Unsupported) as ctx:
             tile_spec_to_dim_hints(self._unit_dim_op(), spec, [0])
         self.assertIn(reason, str(ctx.exception))
 
-        op = _make_real_reduction_op(
-            ranges=[Integer(8)],
-            reduction_ranges=[Integer(16)],
-            input_shape_stride=([8, 16], [16, 1]),
-            name="buf1",
-            hints=((1, 0),),
-        )
+        op = self._unit_dim_op("buf1")
+        spec = TileSpec((TileAxis(1, 2, is_reduction=True),))
         self.assertEqual(
-            try_resolve_tile_axis_loop_vars(op, spec), (reduction_loop_vars(op), None)
+            try_resolve_tile_axis_loop_vars(op, spec),
+            ([reduction_loop_vars(op)[1]], None),
         )
 
     def test_no_write_dep_raises(self):
