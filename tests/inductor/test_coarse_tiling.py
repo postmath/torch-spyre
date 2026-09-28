@@ -9669,6 +9669,37 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         ):
             tile_spec_to_dim_hints(op, spec, [0])
 
+    def test_no_indexed_read_dep_raises(self):
+        """``out[i] = sum_r r`` loads no buffer, so ``reduction_loop_vars`` has
+        no read dep to take loop variables from and returns none. The refusal
+        must name that, not the size-1-dim misalignment an empty list also
+        looks like."""
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Reduction
+        from torch._inductor.virtualized import ops
+
+        node = Reduction.create(
+            device=torch.device("cpu"),
+            dst_dtype=torch.int64,
+            src_dtype=torch.int64,
+            inner_fn=lambda index, rindex: ops.index_expr(rindex[0], torch.int64),
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            reduction_type="sum",
+        )
+        op = ComputedBuffer(
+            name="buf0",
+            layout=FixedLayout(torch.device("cpu"), torch.int64, [8], [1]),
+            data=node.data.data,  # TensorBox -> StorageBox -> Reduction
+        )
+        op.operation_name = "buf0"
+        self.assertEqual(reduction_loop_vars(op), [])
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+        self.assertIsNone(loop_vars)
+        self.assertIn("read dep", reason)
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
 
 def _loop_var_to_reduction_ranges_pos_public(op, sym):
     from torch_spyre._inductor.wsr.coarse_tile import (
