@@ -327,10 +327,12 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
 
     # reads indexes are unaffected by current op tiling
     try:
-        read_index = next((d.index for d in rw.reads if hasattr(d, "index")), write_index)
+        read_index = next(
+            (d.index for d in rw.reads if hasattr(d, "index")), write_index
+        )
     except NotImplementedError:
         return None
-        
+
     if output_counts:
         full_strides = [sympy.sympify(s) for s in op.layout.stride]
         tile_strides = [sympy.sympify(s) for s in layout.stride]
