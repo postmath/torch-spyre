@@ -1468,6 +1468,29 @@ class TestRetileLoadIndexWithConsumer(unittest.TestCase):
 
         self.assertEqual(result, contraction)
 
+    def test_regrouped_full_scale_view_from_a_consumer_tiled_elsewhere(self):
+        # q [1, 32, 64, 128], tiled on seq by 2, read as [1, 8, 4, s, 128] by
+        # a consumer tiled on s in a loop group of its own. A full-scale
+        # trace (32768 per kv head) is kept; a tile-scale one is rescaled.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(4096), Integer(128), Integer(1)),
+            new_stride=(Integer(262144), Integer(8192), Integer(128), Integer(1)),
+            old_size=(Integer(1), Integer(32), Integer(32), Integer(128)),
+            new_size=(Integer(1), Integer(32), Integer(64), Integer(128)),
+        )
+        consumer = _make_consumer_with_ranges([1, 8, 4, 32, 128])
+        consumer.loop_info = SimpleNamespace(
+            loop_count=[2], loop_tiled_dims=[[3]], loop_tiled_reduction_dims=[[]]
+        )
+        kv, group, seq, column = map(sympy_index_symbol, ("d0", "d1", "d2", "d3"))
+        full_scale = 32768 * kv + 8192 * group + 128 * seq + column
+
+        for index in (full_scale, 16384 * kv + 4096 * group + 128 * seq + column):
+            result = _retile_load_index(
+                "q", index, info, consumer, preserve_target_stride_atoms=True
+            )
+            self.assertEqual(simplify(result - full_scale), 0)
+
 
 class TestPatchConsumersLoopInfo(unittest.TestCase):
     """``_patch_consumers`` redirecting a tiled buffer's ``loop_info`` readers.
@@ -1492,7 +1515,12 @@ class TestPatchConsumersLoopInfo(unittest.TestCase):
         self._graph_ctx.__exit__(None, None, None)
 
     def _redirected_index(self, consumer, old_name: str) -> sympy.Expr:
-        consumer.loop_info = SimpleNamespace(tiled_dims_per_read=[])
+        consumer.loop_info = SimpleNamespace(
+            tiled_dims_per_read=[],
+            loop_count=[],
+            loop_tiled_dims=[],
+            loop_tiled_reduction_dims=[],
+        )
         operations = [consumer]
         _patch_consumers([consumer], old_name, "full", operations, self._INFO)
         (read,) = [r for r in operations[0].get_read_writes().reads if r.name == "full"]
