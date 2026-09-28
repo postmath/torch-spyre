@@ -3075,7 +3075,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         op.layout = layout
 
-        with self.assertRaisesRegex(Unsupported, "maps to reduction range position 1"):
+        with self.assertRaisesRegex(
+            Unsupported, "maps to reduction range position None"
+        ):
             _dims_to_hints(op, ((0, 4, True),), [_SPAN_OVERFLOW_HINT_ID])
 
     def test_bmm_mixed_output_and_k_input_span_becomes_output_candidate(self):
