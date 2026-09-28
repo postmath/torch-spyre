@@ -406,6 +406,11 @@ class AutomatedCoarseTilingTests(
     # ------------------------------------------------------------------
     # Models.  Each returns the model, its axis labels and the tiling contract,
     # defined once and reused across every tiling_mode and solver.
+    #
+    # Each is sized so its working set overflows LX even split across 32
+    # cores: a cost-driven tile search is right to leave a graph that already
+    # fits untiled, so a smaller model cannot tell a working search from one
+    # that never tiles.
     # ------------------------------------------------------------------
     def _softmax_case(self) -> "_TilingCase":
         """softmax(dim=0) over (512, 65536), dims R (reduced) x C.
@@ -443,7 +448,7 @@ class AutomatedCoarseTilingTests(
         cover the whole model, so the explicit_auto mode writes the same nest
         and leaves the compiler nothing outside it to tile.
         """
-        seq_len, in_dim, hidden_dim, out_dim = 4096, 128, 8192, 128
+        seq_len, in_dim, hidden_dim, out_dim = 8192, 256, 1024, 256
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
@@ -487,7 +492,7 @@ class AutomatedCoarseTilingTests(
         branches together.  The down projection reduces over Dh and runs
         outside every loop; the explicit_auto mode writes only the S loop.
         """
-        seq_len, in_dim, hidden_dim = 4096, 128, 8192
+        seq_len, in_dim, hidden_dim = 16384, 256, 1024
         fc_gate = torch.nn.Linear(in_dim, hidden_dim).half()
         fc_up = torch.nn.Linear(in_dim, hidden_dim).half()
         fc_down = torch.nn.Linear(hidden_dim, in_dim, bias=False).half()
@@ -535,7 +540,10 @@ class AutomatedCoarseTilingTests(
         "explicit_auto": _check_loops_preserved_with_auto,
     }
 
-    parameter_axes = {"tiling_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
+    parameter_axes = {
+        "tiling_mode": tuple(_CHECKS),
+        "solver_method": ("cpsat", "simulated_annealing"),
+    }
 
     # SDPA is omitted: using SDPA in this test suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198

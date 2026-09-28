@@ -27,9 +27,9 @@ it is offered, so a spec the solver picks from this set cannot then fail in
 reads the same resolver, cannot refuse it on axis grounds either. A reduction
 ``host_dim`` is minted, sized and stick-checked in the frame that resolver reads
 it in: a position in the op's *squeezed* reduction loop variables
-(:func:`~.coarse_tile.reduction_loop_vars`). The resolver refuses every
-reduction axis of an op with a size-1 reduction dim, so such an op is offered
-no reduction tilings.
+(:func:`~.coarse_tile.reduction_loop_vars`). A size-1 reduction dim has no loop
+variable, so it is never offered, and the reduction dims around it are offered
+at their squeezed positions.
 
 The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
