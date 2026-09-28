@@ -52,10 +52,11 @@ by the time ``tile_spec_to_dim_hints`` runs the spec has been chosen, so it
 raises ``Unsupported``. Both read the same authority,
 ``scratchpad.coarse_tiling.try_resolve_tile_axis_loop_vars`` -- as does the
 enumerator -- so prediction cannot disagree with lowering or enumeration about
-which axis a spec names or whether it may name it. That includes the
-resolver's refusal of every reduction axis on an op with a size-1 reduction
-dim, where the applier would divide a different ``reduction_ranges`` entry than
-the tiled one.
+which axis a spec names or whether it may name it. A reduction axis names a
+position in the *squeezed* reduction loop variables, so on an op with a size-1
+reduction dim the ``reduction_ranges`` entry it divides is not the one at
+``host_dim``; prediction divides the entry the applier picks for that loop
+variable (``_loop_var_to_reduction_ranges_pos``).
 
 Dependencies stay one-way (``tile_prediction -> coarse_tile``, and the
 resolver in ``scratchpad.coarse_tiling``). Nothing here
@@ -82,6 +83,7 @@ from ..pass_utils import iteration_space_from_op
 from ..scratchpad.coarse_tiling import try_resolve_tile_axis_loop_vars
 from ..scratchpad.plan_solver import TileSpec
 from .coarse_tile import (
+    _loop_var_to_reduction_ranges_pos,
     _rescale_index,
     _stick_host_dim,
 )
@@ -160,13 +162,29 @@ def _try_div_extents(extents, counts_by_pos: dict[int, int]) -> list | None:
     return divided
 
 
-def _output_and_reduction_counts(tiling: TileSpec):
-    """Split a TileSpec into total per-dim counts, output vs reduction."""
+def _output_and_reduction_counts(op: ComputedBuffer, tiling: TileSpec):
+    """Split a TileSpec into total per-dim counts, output vs reduction.
+
+    Output counts are keyed by ``host_dim``, a position in ``op.data.ranges``.
+    A reduction ``host_dim`` counts only the non-size-1 reduction dims, so a
+    reduction count is keyed by the ``op.data.reduction_ranges`` entry the
+    applier divides for that axis's loop variable -- on ``[1, 8, 16]``,
+    host_dim 1 is entry 2. Only reached behind ``_rejection_reason``, so every
+    axis resolves.
+    """
+    loop_vars, _ = try_resolve_tile_axis_loop_vars(op, tiling)
+    assert loop_vars is not None, "unreachable behind _rejection_reason"
     output_counts: dict[int, int] = {}
     reduction_counts: dict[int, int] = {}
-    for axis in tiling.axes:
-        target = reduction_counts if axis.is_reduction else output_counts
-        target[axis.host_dim] = target.get(axis.host_dim, 1) * axis.count
+    for axis, loop_var in zip(tiling.axes, loop_vars):
+        if axis.is_reduction:
+            pos = _loop_var_to_reduction_ranges_pos(op, loop_var)
+            # _get_red_var refuses a loop variable the applier cannot place.
+            assert pos is not None
+            target = reduction_counts
+        else:
+            pos, target = axis.host_dim, output_counts
+        target[pos] = target.get(pos, 1) * axis.count
     return output_counts, reduction_counts
 
 
@@ -282,7 +300,7 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
         logger.debug("dropping tiling %s on %s: %s", tiling, op.get_name(), reason)
         return None
 
-    output_counts, reduction_counts = _output_and_reduction_counts(tiling)
+    output_counts, reduction_counts = _output_and_reduction_counts(op, tiling)
     ranges = _try_div_extents(op.data.ranges, output_counts)
     reduction_ranges = _try_div_extents(
         getattr(op.data, "reduction_ranges", []), reduction_counts
