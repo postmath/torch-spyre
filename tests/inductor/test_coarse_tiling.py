@@ -9584,7 +9584,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         # The inverse relationship: the lowered loop_var is exactly the one
         # reduction_loop_vars reports at that position.
         self.assertEqual(h.loop_var, red_vars[0])
-        self.assertEqual(_loop_var_to_reduction_ranges_pos_public(op, h.loop_var), 0)
+        self.assertEqual(_loop_var_to_reduction_ranges_pos(op, h.loop_var), 0)
 
     def test_reduction_host_dim_out_of_bounds_raises(self):
         op = _make_real_reduction_op(
@@ -9620,10 +9620,8 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         )
 
     def test_unit_reduction_index_offset(self):
-        """
-        Tests that the returned index is the unsqueezed index when providing
-        a unity reduction axis.
-        """
+        """_loop_var_to_reduction_ranges_pos returns the unsqueezed position when a
+        size-1 reduction dim is squeezed out."""
         op = self._unit_dim_op()
         self.assertEqual(
             [
@@ -9638,7 +9636,6 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         host_dim 0 names the 8 and host_dim 1 the 16. The applier must divide
         that dim's ``reduction_ranges`` entry, not the entry at the squeezed
         position."""
-        op = self._unit_dim_op()
         for host_dim, count, expected in ((0, 2, [1, 4, 16]), (1, 4, [1, 8, 4])):
             with self.subTest(host_dim=host_dim):
                 op = self._unit_dim_op(f"buf_unit{host_dim}")
@@ -9670,7 +9667,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
                 return_value=leaked,
             ),
         ):
-            self.assertIsNone(_loop_var_to_reduction_ranges_pos_public(op, leaked[0]))
+            self.assertIsNone(_loop_var_to_reduction_ranges_pos(op, leaked[0]))
             with self.assertRaises(Unsupported):
                 tile_spec_to_dim_hints(op, spec, [0])
 
@@ -9740,10 +9737,6 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         self.assertIn("read dep", reason)
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
-
-
-def _loop_var_to_reduction_ranges_pos_public(op, sym):
-    return _loop_var_to_reduction_ranges_pos(op, sym)
 
 
 class TestDeriveTilingGroups(unittest.TestCase):
