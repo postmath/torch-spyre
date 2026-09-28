@@ -104,6 +104,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_hint_id_base,
     derive_tiling_groups,
     tile_spec_to_dim_hints,
+    try_resolve_tile_axis_loop_vars,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
@@ -2273,6 +2274,21 @@ class TestCoarseTile(unittest.TestCase):
                 _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
             )
 
+    def test_refuses_to_overwrite_existing_loop_info(self):
+        """An op that already carries loop_info -- a for_each_tile loop, say --
+        is not re-tiled: coarse_tile raises rather than replace the record."""
+        gm = fx.symbolic_trace(lambda: None)
+        with V.set_graph_handler(GraphLowering(gm)):
+            tiled_op, _, operations = _make_full_buffer_read_fixture()
+            before = tiled_op.loop_info
+            self.assertIsNotNone(before)
+
+            groups = [([tiled_op], [(0, Integer(8))])]
+            with self.assertRaises(Unsupported) as ctx:
+                coarse_tile_post_stickify(_graph(operations), groups)
+            self.assertIn("would overwrite the existing loop_info", str(ctx.exception))
+            self.assertIs(tiled_op.loop_info, before)
+
     def test_post_stickify_skips_pass_1(self):
         """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
@@ -2286,6 +2302,9 @@ class TestCoarseTile(unittest.TestCase):
             tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
             self.assertEqual(len(full_deps), 1)
             full_buf_name = full_deps[0].name
+            # The fixture pre-stamps loop_info for the read-copy tests; here
+            # coarse_tile does the stamping, and refuses to overwrite a stamp.
+            tiled_op.loop_info = None
 
             groups = [([tiled_op], [(0, Integer(8))])]
             coarse_tile_post_stickify(_graph(operations), groups)
@@ -10199,6 +10218,21 @@ class TestTileSpecLoweringOutput(unittest.TestCase):
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
+    def test_output_coord_outside_iteration_space_raises(self):
+        # op_out_coords can surface a symbol the op does not loop over -- an
+        # indirect-index symbol, or an enclosing for_each_tile loop's variable
+        # -- which leaves no loop of the op's own to tile.
+        op = self._op(2)
+        with patch(
+            "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+            return_value=[sympy.Symbol("indirect0"), sympy.Symbol("c1")],
+        ):
+            with self.assertRaises(Unsupported):
+                tile_spec_to_dim_hints(op, TileSpec((TileAxis(0, 4),)), [0])
+            # Not vacuous: the other coordinate is an iteration variable.
+            hints = tile_spec_to_dim_hints(op, TileSpec((TileAxis(1, 4),)), [0])
+        self.assertEqual(hints[0].loop_var, sympy.Symbol("c1"))
+
 
 class TestTileSpecLoweringReduction(unittest.TestCase):
     """The reduction-axis lowering is the inverse of reduction_loop_vars."""
@@ -10254,6 +10288,98 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
             hints=((0, 0),),
         )
         spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+    def _unit_dim_op(self):
+        # reduction_ranges [1, 8, 16]: the size-1 dim gets no loop variable.
+        return _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(1), Integer(8), Integer(16)],
+            input_shape_stride=([8, 1, 8, 16], [128, 128, 16, 1]),
+            name="buf0",
+            hints=((1, 2),),
+        )
+
+    def test_unit_reduction_dim_raises(self):
+        """With a size-1 reduction dim, a loop variable's squeezed position is
+        not its ``reduction_ranges`` position, and the applier divides the entry
+        at the squeezed position -- a different dim than the one tiled."""
+        op = self._unit_dim_op()
+        # Not vacuous: both host_dims are in bounds for the loop variables.
+        self.assertEqual(len(reduction_loop_vars(op)), 2)
+        for host_dim in (0, 1):
+            spec = TileSpec((TileAxis(host_dim, 2, is_reduction=True),))
+            with self.subTest(host_dim=host_dim), self.assertRaises(Unsupported):
+                tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_resolver_reports_what_lowering_raises(self):
+        spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(self._unit_dim_op(), spec)
+        self.assertIsNone(loop_vars)
+        with self.assertRaises(Unsupported) as ctx:
+            tile_spec_to_dim_hints(self._unit_dim_op(), spec, [0])
+        self.assertIn(reason, str(ctx.exception))
+
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf1",
+            hints=((1, 0),),
+        )
+        self.assertEqual(
+            try_resolve_tile_axis_loop_vars(op, spec), (reduction_loop_vars(op), None)
+        )
+
+    def test_no_write_dep_raises(self):
+        # reduction_loop_vars raises StopIteration on an op with no write dep;
+        # lowering reports it as Unsupported rather than letting it escape.
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.reduction_loop_vars",
+                side_effect=StopIteration,
+            ),
+            self.assertRaises(Unsupported),
+        ):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_no_indexed_read_dep_raises(self):
+        """``out[i] = sum_r r`` loads no buffer, so ``reduction_loop_vars`` has
+        no read dep to take loop variables from and returns none. The refusal
+        must name that, not the size-1-dim misalignment an empty list also
+        looks like."""
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Reduction
+        from torch._inductor.virtualized import ops
+
+        node = Reduction.create(
+            device=torch.device("cpu"),
+            dst_dtype=torch.int64,
+            src_dtype=torch.int64,
+            inner_fn=lambda index, rindex: ops.index_expr(rindex[0], torch.int64),
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            reduction_type="sum",
+        )
+        op = ComputedBuffer(
+            name="buf0",
+            layout=FixedLayout(torch.device("cpu"), torch.int64, [8], [1]),
+            data=node.data.data,  # TensorBox -> StorageBox -> Reduction
+        )
+        op.operation_name = "buf0"
+        self.assertEqual(reduction_loop_vars(op), [])
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+        self.assertIsNone(loop_vars)
+        self.assertIn("read dep", reason)
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
@@ -10655,6 +10781,13 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
                 side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling."
+                "iteration_space_from_op",
+                side_effect=_mock_iteration_space,
             )
         )
 

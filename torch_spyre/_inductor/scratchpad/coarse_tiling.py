@@ -110,18 +110,18 @@ def _get_red_var(
     size-1 reduction dim carries no loop variable and has no position.
 
     Rejects, in order: an op that is not a ``Reduction``; one with no write dep
-    or indexed read dep to derive loop variables from; one whose loop variables
-    do not line up one-to-one with ``reduction_ranges``; and a ``host_dim`` past
-    the end of its loop variables.
+    to derive loop variables from; one with no reduction loop variables, because
+    no read dep carries one (``reduction_loop_vars`` returns none when the op
+    loads no buffer); one whose loop variables do not line up one-to-one with
+    ``reduction_ranges``; and a ``host_dim`` past the end of its loop variables.
 
-    The third is not a lowering limit but an applier one. The applier picks the
+    The fourth is not a lowering limit but an applier one. The applier picks the
     ``reduction_ranges`` entry to divide with
     ``_loop_var_to_reduction_ranges_pos``, which returns the loop variable's
     *squeezed* position, so once a size-1 dim is squeezed out (or a broadcast
     symbol leaks into the loop variables) it divides a different entry than the
-    dim this loop variable tiles. Refusing here keeps every consumer --
-    lowering, enumeration and prediction -- from offering a tiling the applier
-    would misapply.
+    dim this loop variable tiles. Refusing here keeps lowering from handing the
+    applier a tiling it would misapply.
     """
     if not isinstance(op.data, Reduction):
         return None, (
@@ -132,8 +132,14 @@ def _get_red_var(
         red_vars = reduction_loop_vars(op)
     except StopIteration:
         return None, (
-            f"coarse tiling: {op.get_name()} has no write dep or no indexed "
-            "read dep to derive reduction loop variables from."
+            f"coarse tiling: {op.get_name()} has no write dep to derive "
+            "reduction loop variables from."
+        )
+    if not red_vars:
+        return None, (
+            f"coarse tiling: reduction host_dim={host_dim} on {op.get_name()}: "
+            "no read dep carries a reduction loop variable, so there is no "
+            "reduction loop to tile."
         )
     reduction_ranges = list(op.data.reduction_ranges)
     if len(red_vars) != len(reduction_ranges):
@@ -160,13 +166,10 @@ def try_resolve_tile_axis_loop_vars(
 
     The single authority on which loop variable each :class:`TileAxis` names on
     ``op`` and on whether ``spec`` can be applied at all. It reports rather than
-    raises because its consumers need the answer in different forms:
-    :func:`tile_spec_to_dim_hints` lowers a spec the planner has committed to,
-    so it raises ``Unsupported`` with the ``reason``; the enumerator
-    (``wsr.enumerate_tilings``) and the predictor (``wsr.tile_prediction``)
-    weigh candidates nobody has committed to, so a rejection there is ordinary
-    pruning. Going through one resolver is what keeps the three from disagreeing
-    about which specs exist.
+    raises so a caller weighing candidates nobody has committed to can treat a
+    rejection as ordinary pruning; :func:`tile_spec_to_dim_hints` lowers a spec
+    the planner has committed to, so it raises ``Unsupported`` with the
+    ``reason``.
 
     ``host_dim`` is positional within one of two frames, selected by
     ``is_reduction``: ``op_out_coords(op)`` for an output axis
