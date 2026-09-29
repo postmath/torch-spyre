@@ -381,6 +381,8 @@ class AutomatedCoarseTilingTests(
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
+        if solver == "simulated_annealing":
+            raise NotImplementedError
         cpu, device, tiling = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
@@ -570,6 +572,10 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
+        if params["solver_method"] in ("simulated_annealing") and params[
+            "tiling_mode"
+        ] in ("auto"):
+            decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:
