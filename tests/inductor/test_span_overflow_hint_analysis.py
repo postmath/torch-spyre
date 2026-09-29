@@ -2581,7 +2581,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + n, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=None),
@@ -2610,7 +2610,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + n, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=None),
@@ -3149,7 +3149,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k + m, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=4_194_304),
@@ -3191,7 +3191,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[m, k, sympy.Integer(0)],
             ),
             patch.object(soha, "_coordinate_span_elems", return_value=2),
@@ -3884,7 +3884,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value={m: 0, n: 1},
             ),
             patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._device_coordinates_for_span",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.device_coordinates",
                 return_value=[k, m, n],
             ),
             patch(
@@ -4288,7 +4288,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[p + q, sympy.Integer(0)],
             ),
         ):
@@ -4345,9 +4345,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 "_output_symbol_to_dim",
                 return_value={d0: 0, d1: 1, d2: 2, d3: 3, d4: 4},
             ),
-            patch.object(
-                soha, "_device_coordinates_for_span", return_value=device_coords
-            ),
+            patch.object(soha, "device_coordinates", return_value=device_coords),
         ):
             d1_only_infos = soha._input_span_infos_controlled_by_output_dims(
                 op,
@@ -4417,7 +4415,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[p + q, sympy.Integer(0)],
             ),
         ):
@@ -5111,7 +5109,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             patch.object(soha, "MAX_SPAN_BYTES", 1024),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
-            patch.object(soha, "_device_coordinates_for_span", return_value=[m + k, k]),
+            patch.object(soha, "device_coordinates", return_value=[m + k, k]),
         ):
             enabled_infos = soha._input_span_infos_controlled_by_output_dims(
                 op, max_cores=1
@@ -5354,7 +5352,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k0, 2 * m + k1, k1],
             ),
         ):
@@ -5399,7 +5397,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             ),
             patch.object(
                 soha,
-                "_device_coordinates_for_span",
+                "device_coordinates",
                 return_value=[k, sympy.Mod(3 * h, 64), n],
             ),
         ):
