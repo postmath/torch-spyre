@@ -728,6 +728,23 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 
         self.assertEqual(options, [TileSpec()])
 
+    def test_reshaping_reader_drops_the_unit_tile(self):
+        # d3:64 leaves a 1-extent tile, which CoarseTilingPass cannot retile
+        # for a reader that views the output through another rank.
+        op = _pointwise_op((2, 8, 5, 64, 128))
+        reader = MagicMock(spec=ComputedBuffer)
+        reader.data = SimpleNamespace(ranges=[2, 40, 64, 128])
+        unit_tile = TileSpec((TileAxis(host_dim=3, count=64),))
+
+        self.assertIn(unit_tile, self._candidates(op))
+        with patch.object(
+            CoOptimizingAllocator,
+            "_readers_by_name",
+            {op.get_name(): [reader]},
+            create=True,
+        ):
+            self.assertNotIn(unit_tile, self._candidates(op))
+
     def test_matmul_offered_output_tiling(self):
         # A matmul is no longer excluded by an op-kind guard: under discovery it
         # is offered its row/M-axis (host_dim 0, non-reduction) output tilings,
