@@ -115,6 +115,13 @@ def _reduction_op(out_shape, reduction_ranges, name="buf0", reduction_type="sum"
     return op
 
 
+def _reader(ranges):
+    """A ComputedBuffer reading the tiled op's output, over ``ranges``."""
+    reader = MagicMock(spec=ComputedBuffer)
+    reader.data = SimpleNamespace(ranges=list(ranges))
+    return reader
+
+
 def _counts(options, host_dim):
     """The single-level counts ``options`` offers for output ``host_dim``."""
     return [
@@ -281,6 +288,36 @@ class TestApplyRefusals(unittest.TestCase):
         self.assertIn(
             64, _counts(enumerate_tile_options(_pointwise_op((8, 64, 128))), 1)
         )
+
+    _SHAPE = (2, 8, 5, 64, 128)
+
+    def test_a_reshaping_reader_drops_only_the_unit_tile(self):
+        untouched = enumerate_tile_options(_pointwise_op(self._SHAPE))
+        self.assertIn(64, _counts(untouched, 3))  # non-vacuity
+        options = enumerate_tile_options(
+            _pointwise_op(self._SHAPE), readers=[_reader((2, 8, 5, 64, 64))]
+        )
+        for dim in (0, 1, 2, 3):
+            self.assertEqual(
+                _counts(options, dim),
+                [c for c in _counts(untouched, dim) if c != self._SHAPE[dim]],
+            )
+
+    def test_a_rank_changing_reader_drops_the_unit_tile(self):
+        options = enumerate_tile_options(
+            _pointwise_op(self._SHAPE), readers=[_reader((2, 40, 64, 128))]
+        )
+        self.assertNotIn(64, _counts(options, 3))
+        self.assertIn(32, _counts(options, 3))
+
+    def test_a_same_shape_or_non_computed_reader_keeps_the_unit_tile(self):
+        extern = SimpleNamespace(data=SimpleNamespace(ranges=[2, 40, 64, 128]))
+        for readers in ([], [_reader(self._SHAPE)], [extern]):
+            options = enumerate_tile_options(
+                _pointwise_op(self._SHAPE), readers=readers
+            )
+            self.assertIn(64, _counts(options, 3))
+            self.assertEqual(_counts(options, 2), [5])
 
 
 if __name__ == "__main__":
