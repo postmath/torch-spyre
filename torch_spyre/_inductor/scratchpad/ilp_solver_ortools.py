@@ -1387,7 +1387,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         """One bool per buffer, true when that buffer is a coarse-tiling *cut*.
 
         A cut is a tiled op whose value has to be published into a full-sized
-        buffer because some consumer does not share its tiling -- exactly the
+        buffer because some consumer sits outside its loop nest -- the
         ``kind="copy_out"`` classification ``_plan_tiling_propagation`` makes
         later, expressed over the solver's own division variables so it can be
         ranked *while* the tiling is being chosen rather than discovered after.
@@ -1395,8 +1395,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Each candidate ``TileSpec`` is interned to a small integer id (the empty
         spec is always 0, so ``tile_id != 0`` means "tiled"), and ``add_element``
         ties a buffer's id to its chosen division exactly as ``eff_size`` and
-        ``cores`` are already tied. A tiled buffer with no modelled consumer --
-        a graph output, or one read only by an extern kernel -- is a cut
+        ``cores`` are already tied. Whether a consumer shares its producer's
+        nest is decided over op order, not the edge alone: see
+        :meth:`_tiling_group_ids`. A tiled graph output, or a tiled buffer with
+        no modelled consumer (one read only by an extern kernel), is a cut
         unconditionally, since its value must reach HBM either way.
 
         Returns an empty list when nothing carries a non-empty spec, which is
@@ -1420,35 +1422,44 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         max_id = max(spec_ids.values())
         tile_id = {}
+        tiled = {}
         for name, sb in divided.items():
             ids = [spec_ids[cd.tiling] for cd in sb.buffer.core_divisions]
             var = model.new_int_var(0, max_id, f"tile_id_{name}")
             model.add_element(sb.division, ids, var)
             tile_id[name] = var
-
-        cuts = []
-        for name, var in tile_id.items():
             is_tiled = model.new_bool_var(f"tiled_{name}")
             model.add(var != 0).only_enforce_if(is_tiled)
             model.add(var == 0).only_enforce_if(is_tiled.negated())
+            tiled[name] = is_tiled
 
+        group, segment = self._tiling_group_ids(model, divided, tile_id, tiled)
+
+        cuts = []
+        for name, is_tiled in tiled.items():
             diffs: list["cp_model.IntVar"] = []
-            # A consumer with no divisions of its own (placement-only) cannot
-            # share a tiling, so reading it is always a cut.
-            unshareable = False
+            # A graph output is copied out whatever its consumers do.
+            unshareable = (
+                getattr(divided[name].buffer, "boundary", None) == BufferType.Output
+            )
+            seg = segment.get(name)
             for child, _ in children_of.get(name, []):
-                child_var = tile_id.get(child)
-                if child_var is None:
+                if unshareable:
+                    break
+                # A consumer with no divisions of its own (placement-only), or
+                # one an untileable op separates from this buffer, can never
+                # share its nest, so reading it is always a cut.
+                if seg is None or segment.get(child) != seg:
                     unshareable = True
                     break
-                d = model.new_bool_var(f"tilediff_{name}_{child}")
-                model.add(var != child_var).only_enforce_if(d)
-                model.add(var == child_var).only_enforce_if(d.negated())
+                d = model.new_bool_var(f"apart_{name}_{child}")
+                model.add(group[name] != group[child]).only_enforce_if(d)
+                model.add(group[name] == group[child]).only_enforce_if(d.negated())
                 diffs.append(d)
 
             cut = model.new_bool_var(f"cut_{name}")
             if unshareable or not diffs:
-                # No modelled consumer that could share the tiling: tiled => cut.
+                # No modelled consumer that could share the nest: tiled => cut.
                 model.add(cut == is_tiled)
             else:
                 any_diff = model.new_bool_var(f"anydiff_{name}")
@@ -1459,6 +1470,65 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 ).only_enforce_if(cut.negated())
             cuts.append(cut)
         return cuts
+
+    @staticmethod
+    def _tiling_group_ids(
+        model: "cp_model.CpModel",
+        divided: dict[str, _LifetimeBufferWithCpVars],
+        tile_id: dict[str, "cp_model.IntVar"],
+        tiled: dict[str, "cp_model.IntVar"],
+    ) -> tuple[dict[str, "cp_model.IntVar"], dict[str, int]]:
+        """The loop group each tileable op lands in, as solver variables.
+
+        ``derive_tiling_groups`` fuses only *consecutive* ops that share a
+        non-empty spec, so any op between a producer and its consumer that does
+        not carry the same spec splits them into two nests, whether or not it
+        touches their edge. Op order is the solver's own time axis -- an op
+        output's ``uses[0]`` is its producing write -- so each pair of adjacent
+        ops gets a ``joined`` literal (both carry the same non-empty spec) and
+        a running group id that steps wherever it fails. Two ops share a nest
+        exactly when their group ids agree.
+
+        An op that can never be tiled -- one with only untiled candidates, or
+        no op-output buffer in the solve at all -- always breaks the run, so it
+        starts a new *segment* instead of a literal. Returns ``(group,
+        segment)``: an op in no segment is untileable, and ops in different
+        segments are split whatever the solve picks.
+        """
+        position = {
+            name: sb.buffer.uses[0]
+            for name, sb in divided.items()
+            if sb.buffer.uses
+            and not sb.buffer.first_use_is_read
+            and not isinstance(sb.buffer, RelayoutCopyBuffer)
+            and any(not cd.tiling.is_untiled for cd in sb.buffer.core_divisions)
+        }
+        group: dict[str, "cp_model.IntVar"] = {}
+        segment: dict[str, int] = {}
+        segments = 0
+        prev: Optional[str] = None
+        for name, pos in sorted(position.items(), key=lambda item: item[1]):
+            if prev is None or pos != position[prev] + 1:
+                group[name] = model.new_constant(0)
+                segment[name] = segments
+                segments += 1
+            else:
+                same = model.new_bool_var(f"sametile_{prev}_{name}")
+                model.add(tile_id[prev] == tile_id[name]).only_enforce_if(same)
+                model.add(tile_id[prev] != tile_id[name]).only_enforce_if(
+                    same.negated()
+                )
+                joined = model.new_bool_var(f"joined_{prev}_{name}")
+                model.add_bool_and([same, tiled[name]]).only_enforce_if(joined)
+                model.add_bool_or(
+                    [same.negated(), tiled[name].negated()]
+                ).only_enforce_if(joined.negated())
+                var = model.new_int_var(0, len(position), f"tile_group_{name}")
+                model.add(var == group[prev] + 1 - joined)
+                group[name] = var
+                segment[name] = segment[prev]
+            prev = name
+        return group, segment
 
     def _tile_count_terms(
         self,
