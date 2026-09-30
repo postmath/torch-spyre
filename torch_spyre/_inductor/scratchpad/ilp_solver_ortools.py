@@ -1392,20 +1392,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         later, expressed over the solver's own division variables so it can be
         ranked *while* the tiling is being chosen rather than discovered after.
 
-        Each candidate ``TileSpec`` is interned to a small integer id (the empty
-        spec is always 0, so ``tile_id != 0`` means "tiled"), and ``add_element``
-        ties a buffer's id to its chosen division exactly as ``eff_size`` and
-        ``cores`` are already tied. Whether a consumer shares its producer's
-        nest is decided over op order, not the edge alone: see
-        :meth:`_tiling_group_ids`. A tiled graph output, or a tiled buffer with
-        no modelled consumer (one read only by an extern kernel), is a cut
-        unconditionally, since its value must reach HBM either way.
+        Each candidate's loop nest (:attr:`TileSpec.level_counts`) is interned
+        to a small integer id (the untiled nest is always 0, so ``loop_id !=
+        0`` means "tiled"), and ``add_element`` ties a buffer's id to its
+        chosen division exactly as ``eff_size`` and ``cores`` are already tied.
+        Which ops share a nest is decided over op order, not the edge alone:
+        see :meth:`_tiling_group_ids`. A consumer that shares its producer's
+        nest reads it one tile at a time, so their chosen divisions must be a
+        ``cd_parent_matches`` pair, whose views are owned per (tile, core); a
+        pair that is not must be split by a cut. A tiled graph output, or a
+        tiled buffer with no modelled consumer (one read only by an extern
+        kernel), is a cut unconditionally, since its value must reach HBM
+        either way.
 
         Returns an empty list when nothing carries a non-empty spec, which is
-        every path except the joint solve with ``unified_tiling`` on, so the
+        every path except the joint solve with ``auto_coarse_tiling`` on, so the
         cut stage below vanishes there.
         """
-        spec_ids: dict[object, int] = {}
+        nest_ids: dict[tuple[int, ...], int] = {(): 0}
         divided = {
             name: sb
             for name, sb in tensors.items()
@@ -1413,27 +1417,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         }
         for sb in divided.values():
             for cd in sb.buffer.core_divisions:
-                if cd.tiling.is_untiled:
-                    spec_ids.setdefault(cd.tiling, 0)
-                elif cd.tiling not in spec_ids:
-                    spec_ids[cd.tiling] = len(spec_ids) + 1
-        if not any(i for i in spec_ids.values()):
+                nest_ids.setdefault(cd.tiling.level_counts, len(nest_ids))
+        if len(nest_ids) == 1:
             return []
 
-        max_id = max(spec_ids.values())
-        tile_id = {}
+        max_id = max(nest_ids.values())
+        loop_id = {}
         tiled = {}
         for name, sb in divided.items():
-            ids = [spec_ids[cd.tiling] for cd in sb.buffer.core_divisions]
-            var = model.new_int_var(0, max_id, f"tile_id_{name}")
+            ids = [nest_ids[cd.tiling.level_counts] for cd in sb.buffer.core_divisions]
+            var = model.new_int_var(0, max_id, f"loop_id_{name}")
             model.add_element(sb.division, ids, var)
-            tile_id[name] = var
+            loop_id[name] = var
             is_tiled = model.new_bool_var(f"tiled_{name}")
             model.add(var != 0).only_enforce_if(is_tiled)
             model.add(var == 0).only_enforce_if(is_tiled.negated())
             tiled[name] = is_tiled
 
-        group, segment = self._tiling_group_ids(model, divided, tile_id, tiled)
+        group, segment = self._tiling_group_ids(model, divided, loop_id, tiled)
 
         cuts = []
         for name, is_tiled in tiled.items():
@@ -1443,18 +1444,23 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 getattr(divided[name].buffer, "boundary", None) == BufferType.Output
             )
             seg = segment.get(name)
-            for child, _ in children_of.get(name, []):
-                if unshareable:
-                    break
+            for child, pairs in children_of.get(name, []):
                 # A consumer with no divisions of its own (placement-only), or
                 # one an untileable op separates from this buffer, can never
                 # share its nest, so reading it is always a cut.
                 if seg is None or segment.get(child) != seg:
                     unshareable = True
-                    break
+                    continue
                 d = model.new_bool_var(f"apart_{name}_{child}")
                 model.add(group[name] != group[child]).only_enforce_if(d)
                 model.add(group[name] == group[child]).only_enforce_if(d.negated())
+                _gate_divisions(
+                    model,
+                    pairs,
+                    divided[name].division,
+                    divided[child].division,
+                    d.negated(),
+                )
                 diffs.append(d)
 
             cut = model.new_bool_var(f"cut_{name}")
@@ -1475,19 +1481,19 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     def _tiling_group_ids(
         model: "cp_model.CpModel",
         divided: dict[str, _LifetimeBufferWithCpVars],
-        tile_id: dict[str, "cp_model.IntVar"],
+        loop_id: dict[str, "cp_model.IntVar"],
         tiled: dict[str, "cp_model.IntVar"],
     ) -> tuple[dict[str, "cp_model.IntVar"], dict[str, int]]:
         """The loop group each tileable op lands in, as solver variables.
 
-        ``derive_tiling_groups`` fuses only *consecutive* ops that share a
-        non-empty spec, so any op between a producer and its consumer that does
-        not carry the same spec splits them into two nests, whether or not it
-        touches their edge. Op order is the solver's own time axis -- an op
-        output's ``uses[0]`` is its producing write -- so each pair of adjacent
-        ops gets a ``joined`` literal (both carry the same non-empty spec) and
-        a running group id that steps wherever it fails. Two ops share a nest
-        exactly when their group ids agree.
+        ``derive_tiling_groups`` fuses only *consecutive* ops that run the same
+        non-empty loop nest, so any op between a producer and its consumer that
+        does not run it splits them into two nests, whether or not it touches
+        their edge. Op order is the solver's own time axis -- an op output's
+        ``uses[0]`` is its producing write -- so each pair of adjacent ops gets
+        a ``joined`` literal (both run the same non-empty nest) and a running
+        group id that steps wherever it fails. Two ops share a nest exactly when
+        their group ids agree.
 
         An op that can never be tiled -- one with only untiled candidates, or
         no op-output buffer in the solve at all -- always breaks the run, so it
@@ -1513,9 +1519,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 segment[name] = segments
                 segments += 1
             else:
-                same = model.new_bool_var(f"sametile_{prev}_{name}")
-                model.add(tile_id[prev] == tile_id[name]).only_enforce_if(same)
-                model.add(tile_id[prev] != tile_id[name]).only_enforce_if(
+                same = model.new_bool_var(f"samenest_{prev}_{name}")
+                model.add(loop_id[prev] == loop_id[name]).only_enforce_if(same)
+                model.add(loop_id[prev] != loop_id[name]).only_enforce_if(
                     same.negated()
                 )
                 joined = model.new_bool_var(f"joined_{prev}_{name}")
@@ -1544,7 +1550,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         and cannot move the sum.
 
         Returns an empty list when nothing carries a choice of tiling, which is
-        every path except the joint solve with ``unified_tiling`` on, so the
+        every path except the joint solve with ``auto_coarse_tiling`` on, so the
         tile-count stage below vanishes there.
         """
         terms = []
@@ -1669,7 +1675,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             return result
 
         if cost_expr is not None:
-            # Only reached with unified_tiling off: the allocator withholds the
+            # Only reached with auto_coarse_tiling off: the allocator withholds the
             # expression when tiling is a solver axis, because the cost model is
             # flat in tile size and cut count. Unchanged behaviour otherwise --
             # a successful cost solve returns here and the ladder is skipped.

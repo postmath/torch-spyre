@@ -69,6 +69,7 @@ from torch._inductor.ir import ComputedBuffer, Reduction
 
 from .. import config
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates, iteration_space_from_op
 from ..scratchpad.coarse_tiling import _get_red_var, try_resolve_tile_axis_loop_vars
@@ -279,6 +280,11 @@ def enumerate_tile_options(
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
         return options
+    # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
+    # and has no device layout of its own to size or stick-check a tile
+    # against; prediction refuses to tile it for the same reason.
+    if not isinstance(op.get_layout(), FixedTiledLayout):
+        return options
 
     # --- output-range options -------------------------------------------------
     stick_dim = _output_stick_host_dim(op)
@@ -292,16 +298,13 @@ def enumerate_tile_options(
             per_dim.append((host_dim, counts))
 
     # Axes are emitted outermost-first in ascending host_dim order: per_dim is
-    # built over range(n_out) and itertools.combinations preserves it. That
-    # canonical ordering is load-bearing, not cosmetic. TileSpec order is
-    # semantic -- levels nest, so a swapped pair is a different plan -- yet a
-    # swapped pair has the *same* per-tile shape, so predict_frame reports
-    # identical ranges/layout/indices for both and nothing downstream can
-    # prefer one. Emitting only the canonical order is what stops
-    # derive_tiling_groups -- which breaks a run on full ordered
-    # ``spec == current_spec`` -- from silently splitting two shape-equivalent
-    # ops into separate loop groups, losing the fusion. Keep any new option
-    # canonically ordered. Mixing an output axis with a reduction axis in one
+    # built over range(n_out) and itertools.combinations preserves it. TileSpec
+    # order is semantic -- levels nest, so a swapped pair is a different plan
+    # with the same per-tile shape -- and only this order is offered. A consumer
+    # that reads its producer with two tiled dims permuted walks the tiles in
+    # the swapped order, so it cannot share that producer's loop nest (the
+    # per-(tile, core) match in the solve's pair table rules it out) and is
+    # split from it instead. Mixing an output axis with a reduction axis in one
     # spec (impossible today: the reduction options below are single-level)
     # would further make the relative nesting semantic -- reduction-outer
     # partially accumulates every output tile on each pass, reduction-inner

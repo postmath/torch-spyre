@@ -51,6 +51,7 @@ from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     _is_matmul_op,
     op_short_name,
+    tile_ownership_view,
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
@@ -1571,11 +1572,13 @@ def _core_division(
     op: Operation,
     splits: dict[sympy.Symbol, int],
     tiling: "TileSpec | None" = None,
+    tile_splits: tuple[tuple[sympy.Symbol, int], ...] = (),
 ) -> CoreDivision:
     """Classify one symbol-keyed candidate for its producing operation.
 
     ``tiling`` is the coarse tiling the candidate was enumerated under, carried
-    onto the division so the pair travels together. Output/reduction
+    onto the division so the pair travels together, and ``tile_splits`` is
+    that tiling resolved to ``op``'s loop symbols. Output/reduction
     classification asks only whether a symbol *appears* in the write index,
     which a tiling rescales but never eliminates, so it is tiling-invariant and
     the same test serves both frames.
@@ -1585,6 +1588,7 @@ def _core_division(
         splits=sparse,
         reduction_syms=_reduction_syms(op, sparse),
         tiling=tiling if tiling is not None else TileSpec(),
+        tile_splits=tile_splits,
     )
 
 
@@ -1732,18 +1736,17 @@ def _view_for_div(
     """One candidate division's per-core view of ``buf_name``.
 
     ``prep_cache`` holds the candidate-invariant (sympy-heavy) context, keyed by
-    ``(op name, dep, buf_name, tiling)``: a producer's write-dep and a consumer's
+    ``(op name, dep, buf_name)``: a producer's write-dep and a consumer's
     read-dep on the same buffer can be equal ``MemoryDep``s, so the op name
     keeps their preps distinct while a parent read by several consumers reuses
-    its write-view prep. The tiling is part of the key because a candidate's
-    view is taken on its *tiled* frame -- two candidates differing only in
-    tiling see different divided ranges and a different resized layout, so they
-    must not share a prep. Every ``division.tiling`` is the empty spec unless
-    the solver is choosing tilings, so the key is unchanged in effect otherwise.
+    its write-view prep.
+
+    This is core ownership only, on the untiled buffer whatever the division's
+    tiling; how the tiling owns the buffer is :func:`_tile_view_for_div`.
     """
-    key = (op.get_name(), dep, buf_name, division.tiling)
+    key = (op.get_name(), dep, buf_name)
     if key not in prep_cache:
-        prep_cache[key] = _prep_for_division(op, dep, buf_name, division)
+        prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
     splits = division.splits
     syms = _reduction_syms(op, splits)
     return _per_core_view_from_prep(
@@ -1753,37 +1756,35 @@ def _view_for_div(
     )
 
 
-def _prep_for_division(
-    op: Operation, dep: MemoryDep, buf_name: str, division: CoreDivision
-):
-    """The ``_prepare_per_core_view`` prep for one candidate division.
+_WHOLE_VIEW = PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=1)
 
-    Untiled: the committed layout, exactly as an untiled candidate has always
-    been prepped. Tiled: the *predicted* per-tile frame
-    (``wsr.tile_prediction.predict_frame``) supplies the divided iteration
-    space and rescaled indices, and -- when ``buf_name`` is the op's own output
-    -- the resized layout, since the committed layout is still untiled at solve
-    time. Imported lazily so the solver-facing modules stay free of the
-    predictor.
 
-    ``predict_frame`` reports an unpredictable candidate by returning ``None``
-    rather than raising, so that a spec the solver merely *enumerated* is
-    pruned instead of failing the compile. ``None`` is forwarded here as the
-    prep, which ``_per_core_view_from_prep`` already maps to the
-    unrepresentable view -- the same sink an unviewable buffer takes -- so such
-    a candidate can never be priced as though it had a frame.
+def _tile_view_for_div(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    division: CoreDivision,
+    prep_cache: dict,
+) -> Optional[PerCoreView]:
+    """How ``division``'s coarse tiling owns ``buf_name``, tile by tile.
+
+    The whole-buffer view when untiled, and ``None`` when the tiling cannot be
+    represented. Kept apart from the per-core view so it is built once per
+    tiling rather than once per division: comparing the two separately is the
+    same test as comparing ownership per (tile, core), since a tile owns a slice
+    of each tiled dim and a core a slice of that tile.
     """
-    if division.tiling.is_untiled:
-        return _prepare_per_core_view(op, dep, buf_name)
-    from torch_spyre._inductor.wsr.tile_prediction import predict_frame
-
-    frame = predict_frame(op, division.tiling)
-    if frame is None:
-        return None
-    override = frame.layout if buf_name == op.get_name() else None
-    return _prepare_per_core_view(
-        op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
-    )
+    if not division.tile_splits:
+        return _WHOLE_VIEW
+    key = ("tile", op.get_name(), dep, buf_name, division.tile_splits)
+    if key not in prep_cache:
+        prep_key = (op.get_name(), dep, buf_name)
+        if prep_key not in prep_cache:
+            prep_cache[prep_key] = _prepare_per_core_view(op, dep, buf_name)
+        prep_cache[key] = tile_ownership_view(
+            prep_cache[prep_key], division.tile_splits
+        )
+    return prep_cache[key]
 
 
 @dataclass
@@ -1844,16 +1845,39 @@ class ResidencyEdge:
         consumer_divisions: Sequence[CoreDivision],
     ) -> list[tuple[int, int]]:
         """Compatible ``(parent index, consumer index)`` pairs, with each side's
-        view computed once per candidate rather than once per pair."""
+        view computed once per candidate rather than once per pair.
+
+        A pair must agree on core ownership and on tile ownership: the consumer
+        of a tiled producer reads it one tile at a time, so tile ``t`` has to
+        touch the same slice on both sides (see :func:`_tile_view_for_div`).
+        Two untiled divisions have equal, whole-buffer tile views."""
         parent_views = [self.parent_view(cd) for cd in parent_divisions]
         consumer_views = [self.consumer_view(cd) for cd in consumer_divisions]
+        parent_tiles = [
+            _tile_view_for_div(
+                self.parent_op, self.write_dep, self.buf_name, cd, self.prep_cache
+            )
+            for cd in parent_divisions
+        ]
+        consumer_tiles = [
+            _tile_view_for_div(
+                self.consumer_op, self.read_dep, self.buf_name, cd, self.prep_cache
+            )
+            for cd in consumer_divisions
+        ]
         return [
             (i, j)
-            for i, parent_view in enumerate(parent_views)
-            if parent_view is not None
-            for j, consumer_view in enumerate(consumer_views)
+            for i, (parent_view, parent_tile) in enumerate(
+                zip(parent_views, parent_tiles)
+            )
+            if parent_view is not None and parent_tile is not None
+            for j, (consumer_view, consumer_tile) in enumerate(
+                zip(consumer_views, consumer_tiles)
+            )
             if consumer_view is not None
+            and consumer_tile is not None
             and parent_view.same_partition(consumer_view)
+            and parent_tile.same_partition(consumer_tile)
             and self._cores_used(parent_divisions[i])
             == self._cores_used(consumer_divisions[j])
         ]
@@ -2267,6 +2291,16 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
+def _solver_picks_tilings() -> bool:
+    """Whether the joint solve chooses a coarse tiling for each op.
+
+    Only the CP-SAT joint solve prices tiled candidates and ranks cuts, so
+    ``auto_coarse_tiling`` is inert on any other solver -- including dropping
+    the cost expression, which the annealing co-optimizer still scores by.
+    """
+    return config.auto_coarse_tiling and config.layout_solver == "cpsat"
+
+
 def _op_read_span_is_evaluable(op: Operation) -> bool:
     """True when the read-distance filter can compute concrete post-tile spans.
 
@@ -2582,7 +2616,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
-        if config.unified_tiling:
+        if _solver_picks_tilings():
             # The cost model is flat in both axes the tiling search moves along:
             # it has no term for tile size and none for cut count, so every
             # candidate tiling scores identically and the choice falls to
@@ -2596,8 +2630,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # residency, cuts, parallelism and division shape instead. Off this
             # path the expression is unchanged and still the objective.
             logger.debug(
-                "cost objective skipped: unified_tiling makes tile size and cut "
-                "count decision axes the cost model cannot score"
+                "cost objective skipped: auto_coarse_tiling makes tile size and "
+                "cut count decision axes the cost model cannot score"
             )
             result = solver.plan_layout_and_core_divisions(None)
             assert not any(buffer.lx_relayout_plans for buffer in result), (
@@ -2957,6 +2991,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         max_cores = config.sencores
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
+        # Tilings are offered per op (``_tiling_candidates``), but whether an op
+        # sits inside a for_each_tile region is a graph-level fact.
+        self._prescribed_ops: frozenset[str] = frozenset()
+        if _solver_picks_tilings():
+            from torch_spyre._inductor.scratchpad.coarse_tiling import (
+                prescribed_regions,
+            )
+
+            self._prescribed_ops = frozenset(
+                name
+                for region in prescribed_regions(graph.operations)
+                for name in region.names
+            )
 
         # Ops pinned to their committed (work-division) division: each guard
         # detects a distinct wrong-code or scheduling hazard the joint solver
@@ -3074,9 +3121,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Divisions are symbol-keyed and a tiling rescales indices without
         # renaming loop symbols, so both frames' keys are directly comparable.
         for tiling in self._tiling_candidates(op, max_cores):
+            tile_splits: tuple[tuple[sympy.Symbol, int], ...] = ()
             if tiling.is_untiled:
                 tiled_candidates = candidates
             else:
+                from torch_spyre._inductor.scratchpad.coarse_tiling import (
+                    try_resolve_tile_axis_loop_vars,
+                )
+
+                loop_vars, reason = try_resolve_tile_axis_loop_vars(op, tiling)
+                if loop_vars is None:
+                    logger.debug(
+                        "skip tiling %s for %s: %s", tiling.label, op.name, reason
+                    )
+                    continue
+                tile_splits = tuple(
+                    (sym, axis.count) for sym, axis in zip(loop_vars, tiling.axes)
+                )
                 try:
                     tiled_candidates = enumerate_work_division_candidates(
                         op, max_cores, tiling=tiling
@@ -3090,7 +3151,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     )
                     continue
             for candidate in tiled_candidates:
-                division = _core_division(op, candidate, tiling)
+                division = _core_division(op, candidate, tiling, tile_splits)
                 key = (
                     tuple(
                         sorted(
@@ -3109,16 +3170,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
 
-        With unified tiling off the only option is the untiled ``TileSpec``, so
-        enumeration and every downstream plan stay bit-identical to today. With
-        it on (the CP-SAT co-opt path), **discovery** (an extra
-        ``auto_coarse_tiling`` turns on) offers the op the output-axis tilings it
-        could take, minus any whose per-core read span would still exceed the
-        read-distance limit (``MAX_SPAN_BYTES``); the untiled option is dropped
-        too when the op's own full-size read overflows, and an op with no
-        fitting tiling raises ``Unsupported`` (see
-        :func:`_drop_read_distance_violations`). Without discovery the op stays
-        untiled.
+        Unless the solve picks tilings (:func:`_solver_picks_tilings`) the only
+        option is the untiled ``TileSpec``, so enumeration and every downstream
+        plan stay bit-identical to today. When it does, the op is offered the
+        output-axis tilings it could take, minus any whose per-core read span
+        would still exceed the read-distance limit (``MAX_SPAN_BYTES``); the
+        untiled option is dropped too when the op's own full-size read
+        overflows, and an op with no fitting tiling raises ``Unsupported`` (see
+        :func:`_drop_read_distance_violations`).
 
         Filtered by op kind:
 
@@ -3143,19 +3202,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         An op already tiled (``loop_info`` set -- by the ``spyre_hint`` pass
         pre-stickification, a ``for_each_tile`` loop, or a prior apply) is left
-        untouched, so the solve never re-tiles or un-tiles it. The solve reads no
+        untouched, so the solve never re-tiles or un-tiles it, and so is every
+        other op inside a ``for_each_tile`` region (``_prescribed_ops``): the
+        user's loop covers it even where no level stamped it. The solve reads no
         hints of its own.
         """
         untiled = [TileSpec()]
         if getattr(self, "_suppress_tiling", False):
             return untiled
-        if not (config.unified_tiling and config.layout_solver == "cpsat"):
+        if not _solver_picks_tilings():
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
-        if self._get_op_name(op) == "restickify":
+        if op.get_operation_name() in getattr(self, "_prescribed_ops", ()):
             return untiled
-        if not config.auto_coarse_tiling:
+        if self._get_op_name(op) == "restickify":
             return untiled
         from torch_spyre._inductor.wsr.enumerate_tilings import enumerate_tile_options
 
@@ -3344,6 +3405,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
         residency_by_buf = self._residency_by_buf(graph, mem_usage, lifetimes)
+        not_read_in_full = frozenset(
+            name
+            for name, cds in divisions.items()
+            if any(cd.tile_splits for cd in cds)
+            and buffer_not_read_in_full(graph, name)
+        )
 
         # Resolve every compiler-tagged carry before constructing any buffer.
         # If its aliased update cannot be represented as a physical-ownership
@@ -3434,6 +3501,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 op_by_name,
                 prep_cache,
                 residency_by_buf,
+                not_read_in_full,
             )
             cd_parent_relayouts = self._cd_parent_relayouts(
                 graph,
@@ -3769,6 +3837,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
+        not_read_in_full: frozenset[str] = frozenset(),
     ) -> dict[str, list[tuple[int, int]]]:
         """Physical slicing-match pairs for each divided producer this op reads.
 
@@ -3786,12 +3855,29 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
+            reason = residency_by_buf.get(parent, "not in graph")
+            if (
+                reason is not None
+                and parent not in not_read_in_full
+                and any(
+                    cd.tile_splits
+                    for cd in (*divisions.get(parent, ()), *consumer_divs)
+                )
+            ):
+                # The pairs also decide which consumers may share a producer's
+                # loop nest, and that holds whether or not the buffer may live
+                # in LX. A barred parent is pinned out of LX by the solver, so
+                # its pairs gate nothing else. A buffer some reader takes only
+                # part of stays without pairs: views compare partitions, not
+                # extents, so they would pair a half-dim reader with a
+                # full-dim writer.
+                reason = None
             edge = build_residency_edge(
                 parent,
                 op_by_name[parent],
                 consumer_op,
                 consumer_reads,
-                residency_by_buf.get(parent, "not in graph"),
+                reason,
                 prep_cache,
             )
             if edge is None:
@@ -4138,9 +4224,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         The candidate-invariant prep is computed once and shared through
         ``prep_cache``, so cost scales with the op rather than its candidate
-        count.
+        count. A tiled division is reported unrepresentable: these views pair
+        clones and relayout copies on core ownership alone, and a tiled
+        candidate would also have to agree tile by tile.
         """
-        return [_view_for_div(op, dep, buf_name, cd, prep_cache) for cd in divs]
+        return [
+            _view_for_div(op, dep, buf_name, cd, prep_cache)
+            if not cd.tile_splits
+            else (PerCoreView((), (), num_cores=cd.cores_used), False, False)
+            for cd in divs
+        ]
 
 
 def _make_cpsat_solver(

@@ -45,9 +45,7 @@ valid only against *untiled* deps, while the symbol-free ones (``ranges``,
 A candidate that cannot be predicted is reported by returning ``None``, never
 by raising. Callers enumerate candidates and price the ones that survive, so an
 unpredictable spec is one to drop from the menu rather than a compilation
-failure -- and ``_prepare_per_core_view`` already returns ``None`` for a buffer
-no candidate can be viewed through, so the branch exists on the caller's side
-either way. The reason is logged at debug. Lowering keeps the opposite contract:
+failure. The reason is logged at debug. Lowering keeps the opposite contract:
 by the time ``tile_spec_to_dim_hints`` runs the spec has been chosen, so it
 raises ``Unsupported``. Both read the same authority,
 ``scratchpad.coarse_tiling.try_resolve_tile_axis_loop_vars`` -- as does the
@@ -100,13 +98,12 @@ class PredictedFrame:
     ``write_index`` is rescaled to the tile strides while ``read_index`` is the
     op's committed read index unchanged (see ``predict_frame`` -- coarse tiling
     resizes the op's own output buffer, never the buffers it reads); and
-    ``iter_space`` maps each loop symbol to its per-tile extent. These are
-    exactly the pieces ``_prepare_per_core_view`` consumes via ``view_parts``.
+    ``iter_space`` maps each loop symbol to its per-tile extent.
 
     ``iter_space``, ``write_index`` and ``read_index`` are keyed by the op's
     *pre-tiling* loop symbols (see ``_predict_iter_space``), so they pair only
-    with the committed, untiled ``MemoryDep`` that ``_prepare_per_core_view``
-    reads. ``ranges``, ``reduction_ranges`` and ``layout`` carry no symbols and
+    with the committed, untiled ``MemoryDep``. ``ranges``, ``reduction_ranges``
+    and ``layout`` carry no symbols and
     match the applied op exactly, including when a tiled dim divides to a
     per-tile extent of 1.
     """
@@ -119,11 +116,6 @@ class PredictedFrame:
     write_index: Expr
     read_index: Expr
     iter_space: dict
-
-    def view_parts(self) -> tuple[dict, Expr, Expr]:
-        """The ``(iter_space, write_index, read_index)`` tuple
-        ``_prepare_per_core_view`` accepts as its ``parts`` argument."""
-        return (self.iter_space, self.write_index, self.read_index)
 
 
 def _try_exact_div(value, count: int):
@@ -281,10 +273,6 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
     exception, because callers *enumerate* candidates: a spec that cannot be
     predicted is one to drop from the menu, not a compilation failure. The
     reason is logged at debug rather than discarded.
-
-    ``None`` is also what ``_prepare_per_core_view`` returns for a buffer no
-    candidate can be viewed through, so a caller pricing candidates already has
-    this branch.
 
     Everything is checked before anything is divided, so there is no partially
     divided frame to return -- but the divisibility of a given extent is

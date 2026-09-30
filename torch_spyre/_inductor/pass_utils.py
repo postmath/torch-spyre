@@ -3365,9 +3365,6 @@ def _prepare_per_core_view(
     op: Operation,
     dep: MemoryDep,
     buf_name: str,
-    *,
-    parts: "Optional[tuple[dict, sympy.Expr, sympy.Expr]]" = None,
-    buf_layout: "Optional[FixedTiledLayout]" = None,
 ) -> Optional[_ViewPrep]:
     """Compute the candidate-invariant pieces of a per-core view once.
 
@@ -3379,32 +3376,15 @@ def _prepare_per_core_view(
     The inputs come from the pre-scheduler operation. Post-scheduler ownership
     is validated by projecting the committed physical view through the final
     access; this builder no longer has a second scheduler-derived mode.
-
-    ``parts`` is *not* that mode returning. It supplies ``(iter_space,
-    write_index, read_index)`` for a frame that does not exist on ``op`` yet:
-    ``wsr.tile_prediction`` prices a coarse-tiling candidate the planner has not
-    committed to, so reading the iteration space off ``op`` would price every
-    tiled candidate on the untiled frame. Only the first two entries are used --
-    the prep no longer carries a read index, because the target dep is projected
-    into physical coordinates directly (``dep_device_coordinates``). Default
-    (None) reads both off ``op`` as before.
-
-    ``buf_layout`` overrides ``buf_name``'s committed layout, for the same
-    reason and the same caller: at solve time ``buf_name``'s committed layout is
-    still the untiled one, so the view would otherwise be taken on the wrong
-    frame. Default (None) reads the committed layout as before.
     """
-    if parts is not None:
-        iter_space, write_index = parts[0], parts[1]
-    else:
-        # The op-level write index bridges stride-keyed split counts back to
-        # operation symbols, independently of the target buffer's access.
-        rw = op_read_writes(op)
-        write_index = next(iter(rw.writes)).index
-        iter_space = iteration_space_from_op(op)
+    # The op-level write index bridges stride-keyed split counts back to
+    # operation symbols, independently of the target buffer's access.
+    rw = op_read_writes(op)
+    write_index = next(iter(rw.writes)).index
+    iter_space = iteration_space_from_op(op)
 
-    if buf_layout is None:
-        buf_layout = V.graph.get_buffer(buf_name).layout
+    buf_op = V.graph.get_buffer(buf_name)
+    buf_layout = buf_op.layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return None
 
@@ -3769,6 +3749,58 @@ def _per_core_view_from_prep(
         num_cores=num_cores,
     )
     return (view, has_partial_reduction, True)
+
+
+def tile_ownership_view(
+    prep: Optional[_ViewPrep],
+    tile_splits: Sequence[tuple[sympy.Symbol, int]],
+) -> Optional[PerCoreView]:
+    """How each coarse tile of an op owns the buffer ``prep`` describes.
+
+    A coarse tiling splits a loop in time the way a core division splits it in
+    space, so tile ``t`` is an owner just as core ``c`` is, and the ordinary
+    view machinery describes it: the view assigns each tile id its slice of the
+    untiled buffer. A consumer sharing its producer's loop nest reads the
+    producer one tile at a time, so the two must agree on this view -- and,
+    within a tile, on their per-core views too.
+
+    ``tile_splits`` lists the tiling's levels as ``(symbol, trip count)``,
+    outermost first; the innermost level varies fastest in the tile id, as the
+    loop nest runs. ``None`` when the slicing cannot be represented, or a level
+    names a symbol outside the op's iteration space or tiles one twice.
+
+    Like any per-core view it compares partitions, not extents: a reader that
+    covers only part of a dim looks like one that covers all of it. A caller
+    must rule such reads out (``buffer_not_read_in_full``) before trusting a
+    match.
+    """
+    if prep is None:
+        return None
+    iter_symbols = tuple(prep.iter_space)
+    tile_syms = [sym for sym, _ in tile_splits]
+    if len(set(tile_syms)) != len(tile_syms) or not set(tile_syms) <= set(iter_symbols):
+        return None
+    counts = dict(tile_splits)
+    tiles = math.prod(counts.values())
+    # core_to_slice_mapping varies its first dim fastest; the innermost level
+    # must, so the levels go in reversed.
+    order = tuple(reversed(tile_syms)) + tuple(
+        sym for sym in iter_symbols if sym not in counts
+    )
+    slots = core_to_slice_mapping(
+        order, tuple(counts.get(sym, 1) for sym in order), tiles
+    )
+    splits = {sym: counts.get(sym, 1) for sym in iter_symbols}
+    view, _partial, representable = _per_core_view_from_prep(
+        prep, splits, ownership=TensorWorkDivision(splits, slots, num_cores=tiles)
+    )
+    if not representable:
+        return None
+    if not view.work_slice_dims:
+        # No tiled loop indexes this buffer, so every tile reads all of it --
+        # the same ownership as no tiling at all, whatever the tile count.
+        return PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=1)
+    return view
 
 
 def _per_core_view_on_buf(

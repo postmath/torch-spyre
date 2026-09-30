@@ -194,9 +194,8 @@ class TileSpec:
 
     Ordered -- where the core-division splits are dicts and so order-free --
     because tile levels *nest*: swapping two levels is a different plan. Frozen
-    and hashable so ``==`` is exactly the "same tiling shape" test the group
-    derivation keys on. The empty spec is *untiled*, and is the inert default
-    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    and hashable. The empty spec is *untiled*, and is the inert default every
+    :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -214,6 +213,16 @@ class TileSpec:
     def tile_count(self) -> int:
         """Total number of loop tiles across every level (all axes)."""
         return math.prod(a.count for a in self.axes)
+
+    @property
+    def level_counts(self) -> tuple[int, ...]:
+        """Trip count of each level, outermost first: the loop nest alone,
+        without the dims it tiles. ``host_dim`` is positional in each op's own
+        output, so two specs can be equal and tile different dims of a buffer
+        they share, or differ and tile the same one. Ops therefore share a loop
+        group on equal nests (``derive_tiling_groups``), and whether a consumer
+        reads its producer tile by tile is checked per edge."""
+        return tuple(a.count for a in self.axes)
 
     @property
     def output_tile_count(self) -> int:
@@ -259,11 +268,16 @@ class CoreDivision:
     axis rather than an output axis.
     ``tiling`` pairs a coarse tiling onto this division as one candidate. The
     empty :class:`TileSpec` is untiled and inert.
+    ``tile_splits`` is that tiling in the keys ``splits`` uses: one
+    ``(iteration symbol, trip count)`` per level, outermost first. A tiling is
+    a split in time the way a core division is a split in space, so a view can
+    carry both and be matched the same way. Empty when untiled.
     """
 
     splits: dict[sympy.Symbol, int] = field(default_factory=dict)
     reduction_syms: frozenset[sympy.Symbol] = field(default_factory=frozenset)
     tiling: TileSpec = field(default_factory=TileSpec)
+    tile_splits: tuple[tuple[sympy.Symbol, int], ...] = ()
 
     @property
     def cores_used(self) -> int:

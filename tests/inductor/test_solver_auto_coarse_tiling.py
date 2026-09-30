@@ -14,6 +14,7 @@
 
 """Automated coarse tiling: explicit ``for_each_tile`` loops and tile discovery."""
 
+import contextlib
 import dataclasses
 import functools
 import pytest
@@ -33,6 +34,7 @@ from torch._inductor import config as t_inductor_config
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
@@ -44,10 +46,11 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
     _spec_within_read_distance,
     select_allocator,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
+from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -304,7 +307,6 @@ class AutomatedCoarseTilingTests(
         tiling_cfg = (
             dict(
                 co_optimizing_lx_planning=True,
-                unified_tiling=True,
                 auto_coarse_tiling=True,
             )
             if auto_tiling
@@ -678,7 +680,6 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 
     _AUTO_CFG = dict(
         co_optimizing_lx_planning=True,
-        unified_tiling=True,
         auto_coarse_tiling=True,
         layout_solver="cpsat",
         sencores=4,
@@ -769,3 +770,169 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
                 any(a.host_dim == stick_dim for a in spec.axes),
                 f"matmul offered a stick-dim tiling {spec}",
             )
+
+
+# ---------------------------------------------------------------------------
+# Loop nests follow tile ownership, not TileSpec equality
+# ---------------------------------------------------------------------------
+_D0_BY_4 = TileSpec((TileAxis(host_dim=0, count=4),))
+_D1_BY_4 = TileSpec((TileAxis(host_dim=1, count=4),))
+
+
+def _reads_graph_inputs_only(op) -> bool:
+    graph_inputs = set(V.graph.graph_inputs)
+    return all(dep.name in graph_inputs for dep in op.get_read_writes().reads)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+class TileOwnershipGroupingTests(unittest.TestCase):
+    """A consumer shares its producer's loop nest only where it reads it tile by
+    tile.
+
+    ``TileAxis.host_dim`` is positional in each op's own output, so a consumer
+    that reads its producer permuted, reduced or narrowed can carry an equal
+    ``TileSpec`` and still walk a different part of the producer's buffer.
+    Sharing a nest there reads, on tile ``t``, what the producer has not
+    written on tile ``t``. Each case compiles with automatic tiling on and is
+    checked against CPU.
+
+    ``consumer_menu`` replaces the discovered menus: the producer ``a = x + y``
+    (the one op that reads only graph inputs) is offered ``d0:4`` alone, and
+    every other op ``consumer_menu``. The ``_apply`` cases skip the solve's
+    choice instead, so they check ``CoarseTilingPass``'s own refusal.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0xAFFE)
+        torch.compiler.reset()
+        self.addCleanup(torch.compiler.reset)
+
+    def _compile(self, fn, args, consumer_menu=None):
+        """(cpu result, device result, tiling) for ``fn`` under auto tiling."""
+        cpu = fn(*args)
+        CollectTilingPasses.tiling = {}
+        with contextlib.ExitStack() as stack:
+            if consumer_menu is not None:
+
+                def offered(alloc, op, max_cores):
+                    if getattr(alloc, "_suppress_tiling", False):
+                        return [TileSpec()]
+                    if _reads_graph_inputs_only(op):
+                        return [_D0_BY_4]
+                    return consumer_menu
+
+                stack.enter_context(
+                    patch.object(CoOptimizingAllocator, "_tiling_candidates", offered)
+                )
+            stack.enter_context(torch.no_grad())
+            stack.enter_context(t_inductor_config.patch(force_disable_caches=True))
+            stack.enter_context(
+                ts_inductor_config.patch(
+                    co_optimizing_lx_planning=True,
+                    auto_coarse_tiling=True,
+                    layout_solver="cpsat",
+                    allow_all_ops_in_lx_planning=True,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses
+                )
+            )
+            compiled = torch.compile(fn, fullgraph=True)
+            device = compiled(*(arg.to(DEVICE_NAME) for arg in args)).to("cpu")
+        return cpu, device, CollectTilingPasses.tiling
+
+    def _assert_close(self, device, cpu):
+        torch.testing.assert_close(device, cpu, atol=0.1, rtol=0.05)
+
+    @staticmethod
+    def _model_ops(nest):
+        """The nest's ops other than the copies coarse tiling adds to it."""
+        return sorted(name for name in nest if not name.startswith("coarse_tile_copy_"))
+
+    def test_permuted_consumer_of_a_solver_tiled_producer(self):
+        # Unforced: the solve alone once tiled both ops d0:2/d1:2 into one
+        # nest, and only the diagonal tiles came out right.
+        x = torch.randn(128, 128, 2048, dtype=torch.float16)
+        y = torch.randn(128, 128, 2048, dtype=torch.float16)
+        cpu, device, _ = self._compile(
+            lambda x, y: (x + y).permute(1, 0, 2) * 2 + 1, (x, y)
+        )
+        self._assert_close(device, cpu)
+
+    def _compile_with_both_tiled_d0(self, fn, args):
+        """Compile ``fn`` as though the solve had tiled every op ``d0:4``.
+
+        Bypasses the solve's own pairing, so what is left to refuse an
+        out-of-step group is ``CoarseTilingPass`` itself.
+        """
+
+        def chosen(alloc, graph, allocation):
+            return {
+                op.get_operation_name(): _D0_BY_4
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+
+        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+            return self._compile(fn, args)
+
+    def _assert_group_refused(self, fn):
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        with self.assertRaisesRegex(Exception, "cannot share a loop nest"):
+            self._compile_with_both_tiled_d0(fn, (x, y))
+
+    def test_apply_refuses_a_permuted_consumer_in_the_nest(self):
+        # The consumer's d0 is the producer's dim 1.
+        self._assert_group_refused(lambda x, y: (x + y).permute(1, 0, 2) * 2)
+
+    def test_apply_refuses_a_reducing_consumer_in_the_nest(self):
+        # sum(0) drops the producer's dim 0, so the consumer's d0 is dim 1.
+        self._assert_group_refused(lambda x, y: (x + y).sum(dim=0))
+
+    def test_apply_refuses_a_narrowing_consumer_in_the_nest(self):
+        # Same dim, half the rows: tile t reads 8 rows where the producer
+        # wrote 16.
+        self._assert_group_refused(lambda x, y: (x + y)[:32] * 2)
+
+    def test_apply_accepts_a_consumer_that_reads_in_step(self):
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile_with_both_tiled_d0(
+            lambda x, y: (x + y) * 2, (x, y)
+        )
+        self._assert_close(device, cpu)
+        nests = list(_nests(tiling).values())
+        self.assertEqual(len(nests), 1, _describe(tiling))
+        self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
+
+    def test_permuted_consumer_shares_the_nest_on_the_matching_dim(self):
+        # d1:4 is the consumer tiling that walks the producer's dim 0, so the
+        # two share one four-trip nest although their specs differ.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile(
+            lambda x, y: (x + y).permute(1, 0, 2) * 2,
+            (x, y),
+            consumer_menu=[_D1_BY_4],
+        )
+        self._assert_close(device, cpu)
+        nests = list(_nests(tiling).values())
+        self.assertEqual(len(nests), 1, _describe(tiling))
+        self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
+        self.assertIsNone(_nest_mismatch(nests[0], (4,)), _describe(tiling))
+
+    def test_mutation_op_compiles(self):
+        # copy_forced writes through its target's layout, which has no device
+        # layout for the enumerator to stick-check a tile against.
+        a = torch.randn(128, 256, dtype=torch.float16) * 0.01
+        b = torch.randn(128, 256, dtype=torch.float16) * 0.01
+        d = torch.randn(128, 256, dtype=torch.float16) * 0.01
+
+        def fn(a, b, d):
+            return torch.ops.spyre.copy_forced(d, a + b)
+
+        cpu, device, _ = self._compile(fn, (a, b, d))
+        self._assert_close(device, cpu)
