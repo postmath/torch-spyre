@@ -908,6 +908,29 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertEqual(len(nests), 1, _describe(tiling))
         self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
 
+    @unittest.expectedFailure
+    def test_apply_grows_back_a_unit_tile_beside_a_unit_dim(self):
+        # d1:64 leaves the producer's tile (1, 1, 2048), and its copy-out's full
+        # buffer is grown back from that tile's device layout. Beside the unit
+        # dim 0 the grow-back cannot tell the two unit dims apart and returns
+        # [1, 32, 1, 64] for [64, 32, 1, 64], so the untiled consumer reads a
+        # buffer 1/64 the size it expects. The enumerator no longer offers this
+        # tiling; forcing it shows the apply itself still accepts it.
+        x = torch.randn(1, 64, 2048, dtype=torch.float16)
+        y = torch.randn(1, 64, 2048, dtype=torch.float16)
+        unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
+
+        def chosen(alloc, graph, allocation):
+            return {
+                op.get_operation_name(): unit_tile
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
+            }
+
+        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+            cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self._assert_close(device, cpu)
+
     def test_permuted_consumer_shares_the_nest_on_the_matching_dim(self):
         # d1:4 is the consumer tiling that walks the producer's dim 0, so the
         # two share one four-trip nest although their specs differ.
