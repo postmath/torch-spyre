@@ -936,3 +936,63 @@ class TileOwnershipGroupingTests(unittest.TestCase):
 
         cpu, device, _ = self._compile(fn, (a, b, d))
         self._assert_close(device, cpu)
+
+
+class ReplanAfterTilingGateTests(unittest.TestCase):
+    """``_materialize_selection`` applies chosen tilings and solves again only
+    for an engine whose ``replans_after_tiling()`` is true; any other engine's
+    first placement stands, whatever tilings its allocation carries."""
+
+    _CHOICES = {"buf0": _D0_BY_4}
+
+    def _materialize(self, layout_solver, **patches):
+        with ts_inductor_config.patch(
+            co_optimizing_lx_planning=True, layout_solver=layout_solver
+        ):
+            alloc = select_allocator()
+            solver = alloc._build_solver([])
+            allocation = [MagicMock()]
+            graph = SimpleNamespace(operations=[])
+            with contextlib.ExitStack() as stack:
+                chosen = stack.enter_context(
+                    patch.object(
+                        CoOptimizingAllocator,
+                        "_chosen_tilings",
+                        return_value=self._CHOICES,
+                    )
+                )
+                apply = stack.enter_context(
+                    patch(
+                        "torch_spyre._inductor.scratchpad.coarse_tiling."
+                        "CoarseTilingPass"
+                    )
+                )
+                for name, value in patches.items():
+                    stack.enter_context(
+                        patch.object(CoOptimizingAllocator, name, return_value=value)
+                    )
+                result = alloc._materialize_selection(graph, solver, allocation)
+            return solver, allocation, result, chosen, apply
+
+    def test_annealer_placement_stands(self):
+        solver, allocation, result, chosen, apply = self._materialize(
+            "simulated_annealing"
+        )
+        self.assertFalse(solver.replans_after_tiling())
+        self.assertIs(result[0], solver)
+        self.assertIs(result[1], allocation)
+        chosen.assert_not_called()
+        apply.assert_not_called()
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+    def test_cpsat_applies_and_solves_again(self):
+        second_solver, second_allocation = MagicMock(), [MagicMock()]
+        _, _, result, _, apply = self._materialize(
+            "cpsat",
+            _prepare_buffers=[],
+            _build_solver=second_solver,
+            _solve=second_allocation,
+        )
+        apply.assert_called_once_with(self._CHOICES)
+        self.assertIs(result[0], second_solver)
+        self.assertIs(result[1], second_allocation)

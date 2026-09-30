@@ -2909,7 +2909,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         spill reasons off the solver that produced the allocation it commits, so
         returning one without the other would report the first solve's reasons
         against the second solve's plan.
+
+        Only for an engine that asks for it (``replans_after_tiling()``): for any
+        other, the first placement stands and the pair is returned unchanged.
         """
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        if not solver.replans_after_tiling():
+            return solver, allocation
         choices = self._chosen_tilings(graph, allocation)
         if logger.isEnabledFor(logging.DEBUG):
             for name, spec in choices.items():
