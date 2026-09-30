@@ -115,6 +115,17 @@ def _reduction_op(out_shape, reduction_ranges, name="buf0", reduction_type="sum"
     return op
 
 
+def _counts(options, host_dim):
+    """The single-level counts ``options`` offers for output ``host_dim``."""
+    return [
+        spec.axes[0].count
+        for spec in options
+        if spec.depth == 1
+        and not spec.axes[0].is_reduction
+        and spec.axes[0].host_dim == host_dim
+    ]
+
+
 def _exact_divisor_splits(n, max_split=_MAX_AUTO_TILE_SPLIT_COUNT):
     """Independent reference: exact divisors of ``n`` in ``(1, max_split]``."""
     return sorted(k for k in range(2, min(n, max_split) + 1) if n % k == 0)
@@ -243,6 +254,33 @@ class TestNoBadReductionOptions(unittest.TestCase):
                     self.assertLessEqual(len(red_axes), 1, spec.label)
                     # Never an output axis and a reduction axis together.
                     self.assertFalse(red_axes and out_axes, spec.label)
+
+
+class TestApplyRefusals(unittest.TestCase):
+    """Counts the coarse-tile apply would refuse are not offered."""
+
+    def test_a_folded_device_dim_admits_no_count(self):
+        # The attention output [1, 64, hq, 128] lays heads and head_dim's outer
+        # stick out as one device dim, which ``_resize_device_layout`` cannot
+        # resize for any tile.
+        op = _pointwise_op((1, 64, 40, 128))
+        self.assertNotEqual(enumerate_tile_options(op), [TileSpec()])  # non-vacuity
+        dl = op.layout.device_layout
+        op.layout.device_layout = SpyreTensorLayout(
+            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertEqual(enumerate_tile_options(op), [TileSpec()])
+
+    def test_a_unit_tile_beside_another_unit_dim_is_refused(self):
+        # The tile [1, 1, 2048] has two unit host dims, so growing a copy-out's
+        # full buffer back from it cannot tell which device dim grows.
+        self.assertEqual(
+            _counts(enumerate_tile_options(_pointwise_op((1, 64, 2048))), 1),
+            [2, 4, 8, 16, 32],
+        )
+        self.assertIn(
+            64, _counts(enumerate_tile_options(_pointwise_op((8, 64, 128))), 1)
+        )
 
 
 if __name__ == "__main__":
