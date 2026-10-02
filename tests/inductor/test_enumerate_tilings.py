@@ -61,7 +61,11 @@ def _fixed_tiled_layout(shape, dtype=torch.float16):
 
 
 def _write_dep(name, shape, layout):
-    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    # Integer, as Inductor's index symbols are, so the stick coordinate
+    # simplifies to the form ``_stick_host_dim`` resolves.
+    syms = sympy.symbols(
+        " ".join(f"d{i}" for i in range(len(shape))), integer=True, nonnegative=True
+    )
     if not isinstance(syms, tuple):
         syms = (syms,)
     index = sympy.Integer(0)
@@ -161,6 +165,21 @@ class TestOutputEnumeration(unittest.TestCase):
         for spec in opts:
             for axis in spec.axes:
                 self.assertNotEqual(axis.host_dim, 2, spec.label)
+
+    def test_an_unnamed_stick_dim_offers_no_output_tiling(self):
+        # The size-based resolver would name dim 2 here; it is not consulted.
+        op = _pointwise_op((512, 256, 128))
+        self.assertFalse(build_tiling_space(op).is_empty)  # non-vacuity
+        with patch(
+            "torch_spyre._inductor.wsr.enumerate_tilings._stick_host_dim",
+            return_value=None,
+        ):
+            self.assertTrue(build_tiling_space(op).is_empty)
+
+    def test_no_device_layout_offers_no_output_tiling(self):
+        op = _pointwise_op((512, 256, 128))
+        op.layout.device_layout = None
+        self.assertTrue(build_tiling_space(op).is_empty)
 
     def test_all_output_splits_are_exact_divisors(self):
         shape = (512, 256, 128)
