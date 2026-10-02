@@ -2146,6 +2146,37 @@ class CompanionBufferPricingTest(TestCase):
         self.assertEqual(solver._run_bounds(0), (0, 1))
         self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
 
+    def test_the_search_tiles_a_run_its_output_stays_inside(self):
+        # A feeds B and nothing else. Untiled, no per-core footprint fits beside
+        # the other (8192 / 8 cores = 1024 > 512), so both spill; tiled 4 ways
+        # in one run, both fit and A's output never leaves the run. The search
+        # has to find that on its own, and the objective has to let it pay.
+        bufs = [self._sized_run_buffer("A", 0), self._sized_run_buffer("B", 1)]
+        bufs[1].parents = ["A"]
+        bufs[1].residency_edges = {"A": self._identity_edge()}
+        solver = SaCoOptimizingSolver(bufs, 512, 128)
+        solver.plan_layout_and_core_divisions()
+        self.assertEqual([config.tiling for config in solver.chosen], [_TILE_4] * 2)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertTrue(all(buf.address is not None for buf in bufs))
+        self.assertEqual(solver.best_score, 0)
+
+    @staticmethod
+    def _sized_run_buffer(name, position):
+        buf = _run_buffer(name, position, _two_axis_space(tiling=_tiling_space()))
+        buf.size = 8192
+        return buf
+
+    @staticmethod
+    def _identity_edge():
+        """A residency edge whose consumer reads the producer's view as written,
+        so the two ends agree exactly when their splits do."""
+        edge = mock.MagicMock()
+        edge.compatible.side_effect = lambda parent, child: parent == child
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        return edge
+
     def test_a_resident_buffer_pays_the_copy_out_and_its_outside_readers(self):
         # A tiled, B and C untiled and reading it: A's run is itself alone, so
         # both readers take the full buffer from HBM, and residency of the
