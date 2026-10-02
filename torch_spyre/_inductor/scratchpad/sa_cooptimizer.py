@@ -773,6 +773,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self.packer = self._build_seed_packer()
 
         self._anneal()
+        self._log_tilings()
         self._write_back()
         return list(self._bufs)
 
@@ -1244,7 +1245,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _companion_bytes(self, addresses: Sequence[Optional[int]]) -> int:
         """HBM bytes the apply's companion buffers move that the rest of the
-        objective does not count, under the current state.
+        objective does not count, under the current state: the sum of
+        :meth:`_companion_charges`.
+        """
+        return sum(nbytes for _run, nbytes in self._companion_charges(addresses))
+
+    def _companion_charges(
+        self, addresses: Sequence[Optional[int]]
+    ) -> Iterator[tuple[tuple[int, int], int]]:
+        """``(run, bytes)`` for each escaping buffer of a tiled run: the HBM bytes
+        its companion moves that the rest of the objective does not count.
 
         A tiling shrinks what the buffer holds at once; it does not shrink what
         the buffer moves. For an op whose output escapes its tiling group,
@@ -1287,8 +1297,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         ``full_buf`` cost more than one pass.
         """
         if not self._tilings_are_possible:
-            return 0
-        total = 0
+            return
         # Untiled positions mint no companion.
         tiled = (
             (position, (lo, hi))
@@ -1319,8 +1328,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             copy_read = 0 if addresses[idx] is not None else size
             copy_write = copy_read if is_graph_output else size
             outside_reads = size * outside if addresses[idx] is not None else 0
-            total += copy_read + copy_write + outside_reads
-        return total
+            yield (lo, hi), copy_read + copy_write + outside_reads
 
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
@@ -1834,6 +1842,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._adopt(self._best_snap)
 
     # -- write-back ----------------------------------------------------------
+
+    def _log_tilings(self) -> None:
+        """Report the tiled runs the search kept, each with its companion
+        traffic, or that it kept none although some buffer could tile."""
+        if not self._tilings_are_possible:
+            return
+        charges: dict[tuple[int, int], int] = {}
+        for run, nbytes in self._companion_charges(self.packer.addresses):
+            charges[run] = charges.get(run, 0) + nbytes
+        tiled = [run for run in self._runs() if not self._tiling_at(run[0]).is_untiled]
+        if not tiled:
+            logger.info(
+                "SA co-optimizer kept no coarse tiling; %d buffer(s) could tile",
+                sum(
+                    isinstance(source, _GeneratedDivisions) and source.can_tile()
+                    for source in self._sources
+                ),
+            )
+        for lo, hi in tiled:
+            logger.debug(
+                "SA co-optimizer tiled %s at %s; companion HBM traffic %d bytes",
+                ", ".join(
+                    self._bufs[self._buffer_at[position]].name
+                    for position in range(lo, hi + 1)
+                ),
+                self._tiling_at(lo).label,
+                charges.get((lo, hi), 0),
+            )
 
     def _write_back(self) -> None:
         """Commit the best state to the buffers and record spill causes.
