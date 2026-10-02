@@ -44,6 +44,7 @@ import sympy
 
 from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
@@ -2071,11 +2072,25 @@ class CompanionBufferPricingTest(TestCase):
         bufs[1].parents = ["A"]
         bufs[1].residency_edges = {"A": self._identity_edge()}
         solver = SaCoOptimizingSolver(bufs, 512, 128)
-        solver.plan_layout_and_core_divisions()
+        with self.assertLogs(sa_module.logger, level="DEBUG") as logs:
+            solver.plan_layout_and_core_divisions()
         self.assertEqual([config.tiling for config in solver.chosen], [_TILE_4] * 2)
         self.assertEqual(solver._run_bounds(0), (0, 1))
         self.assertTrue(all(buf.address is not None for buf in bufs))
         self.assertEqual(solver.best_score, 0)
+        self.assertIn(
+            f"tiled A, B at {_TILE_4.label}; companion HBM traffic 0 bytes",
+            "\n".join(logs.output),
+        )
+
+    def test_a_search_that_keeps_no_tiling_says_so(self):
+        # Everything fits untiled, so no tiling pays.
+        solver = _run_solver("AB", parents={"B": ["A"]})
+        with self.assertLogs(sa_module.logger, level="INFO") as logs:
+            solver.plan_layout_and_core_divisions()
+        self.assertIn(
+            "kept no coarse tiling; 2 buffer(s) could tile", "\n".join(logs.output)
+        )
 
     @staticmethod
     def _sized_run_buffer(name, position):
