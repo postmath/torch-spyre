@@ -2531,27 +2531,6 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
-def _menus_carry_tilings() -> bool:
-    """Whether each op's division menu carries its tiled candidates
-    (:meth:`CoOptimizingAllocator._tiling_candidates`).
-
-    Only CP-SAT reads tilings off the menu. The SA co-optimizer chooses
-    tilings too, but generates its own, so a tiled menu would be enumeration it
-    throws away.
-    """
-    return config.auto_coarse_tiling and config.layout_solver == "cpsat"
-
-
-def _tiling_drops_cost_expression() -> bool:
-    """Whether the joint solve goes without the cost expression because it
-    chooses tilings (see ``CoOptimizingAllocator._solve``).
-
-    CP-SAT only: the SA co-optimizer scores by the expression whether or not it
-    tiles.
-    """
-    return config.auto_coarse_tiling and config.layout_solver == "cpsat"
-
-
 def _op_read_span_is_evaluable(op: Operation) -> bool:
     """True when the read-distance filter can compute concrete post-tile spans.
 
@@ -2863,6 +2842,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # symbols to its live ones; read through :meth:`_live_splits`.
         self._tiling_symbol_remaps: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
         self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
+        self._tilings_from_menu = layout_planning.tilings_from_menu()
         if config.lx_planner_relayout and not self._decides_lx_relayouts:
             logger.debug(
                 "%s does not decide LX relayouts; continuing without relayout",
@@ -3016,7 +2996,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
-        if _tiling_drops_cost_expression():
+        if (
+            config.auto_coarse_tiling
+            and solver.chooses_tilings()
+            and solver.linear_cost_only()
+        ):
             # The cost model is flat in both axes the tiling search moves along:
             # it has no term for tile size and none for cut count, so every
             # candidate tiling scores identically and the choice falls to
@@ -3380,7 +3364,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # graph-level facts.
         self._prescribed_ops: frozenset[str] = frozenset()
         self._readers_by_name: dict[str, list[Operation]] = {}
-        if _menus_carry_tilings():
+        if config.auto_coarse_tiling and self._tilings_from_menu:
             from torch_spyre._inductor.scratchpad.coarse_tiling import (
                 prescribed_regions,
             )
@@ -3565,9 +3549,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
 
-        Unless menus carry tilings (:func:`_menus_carry_tilings`) the only
-        option is the untiled ``TileSpec``, so enumeration and every downstream
-        plan stay bit-identical to today. When they do, the op is offered the
+        Unless ``auto_coarse_tiling`` is on and the solver takes its tilings off
+        this menu (``tilings_from_menu()``) the only option is the untiled
+        ``TileSpec``, so enumeration and every downstream plan stay
+        bit-identical to today. When it does, the op is offered the
         output-axis tilings it could take, minus any whose per-core read span
         would still exceed the read-distance limit (``MAX_SPAN_BYTES``); the
         untiled option is dropped too when the op's own full-size read
@@ -3605,7 +3590,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         untiled = [TileSpec()]
         if getattr(self, "_suppress_tiling", False):
             return untiled
-        if not _menus_carry_tilings():
+        if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
@@ -4345,33 +4330,31 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
     @property
     def _solver_generates_divisions(self) -> bool:
-        """Whether the solver this allocator feeds generates divisions at all.
+        """Whether the solver this allocator feeds generates divisions at all
+        (``generates_divisions()``).
 
-        Only :class:`SaCoOptimizingSolver` does; the CP-SAT and DFS engines read
-        ``core_divisions`` and ``cd_parent_matches`` exactly as before and would
-        never look at a space. Building one is not free -- a
+        The others read ``core_divisions`` and ``cd_parent_matches`` exactly as
+        before and would never look at a space. Building one is not free -- a
         ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
         engine that would ignore the answer does not pay for it.
-
-        Which engine runs is what decides whether divisions are generated:
-        ``select_allocator`` reaches this solver from exactly two settings
-        (``co_optimizing_lx_planning`` plus
-        ``layout_solver = "simulated_annealing"``), and a separate flag for it
-        could only ever disagree with them.
         """
-        return self.layout_planning is SaCoOptimizingSolver
+        assert self.layout_planning is not None
+        return self.layout_planning.generates_divisions()
 
     @property
     def _solver_chooses_tilings(self) -> bool:
-        """Whether the solver this allocator feeds picks coarse tilings too.
-
-        Only a generated division carries a ``TileSpec`` this allocator
-        applies: the enumeration offers tilings to CP-SAT alone
-        (:func:`_menus_carry_tilings`), which applies its own through
-        ``_materialize_selection``. Hence :attr:`_solver_generates_divisions`,
-        and ``config.auto_coarse_tiling``.
+        """Whether the solver this allocator feeds picks coarse tilings that
+        this allocator applies: off the split space of a solver that generates
+        its divisions. CP-SAT takes its tilings off the menu instead
+        (``tilings_from_menu()``) and applies them through
+        ``_materialize_selection``.
         """
-        return config.auto_coarse_tiling and self._solver_generates_divisions
+        assert self.layout_planning is not None
+        return (
+            config.auto_coarse_tiling
+            and self.layout_planning.chooses_tilings()
+            and self.layout_planning.generates_divisions()
+        )
 
     def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
         """The op's split space.

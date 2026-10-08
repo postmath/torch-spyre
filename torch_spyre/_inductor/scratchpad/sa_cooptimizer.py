@@ -701,7 +701,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return False
 
     @classmethod
+    def generates_divisions(cls) -> bool:
+        return True
+
+    @classmethod
     def chooses_tilings(cls) -> bool:
+        return True
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
         return False
 
     @classmethod

@@ -1783,7 +1783,9 @@ class TestSolverCapabilities(unittest.TestCase):
         "chooses_core_divisions",
         "supports_paired_buffers",
         "decides_lx_relayouts",
+        "generates_divisions",
         "chooses_tilings",
+        "tilings_from_menu",
         "replans_after_tiling",
         "linear_cost_only",
     )
@@ -1817,10 +1819,17 @@ class TestSolverCapabilities(unittest.TestCase):
             FirstFitLayoutSolver: none,
             BestFitLayoutSolver: none,
             SimulatedAnnealingLayoutSolver: none,
-            SaCoOptimizingSolver: joint,
+            SaCoOptimizingSolver: {
+                **joint,
+                "generates_divisions": True,
+                "chooses_tilings": True,
+            },
             CpSatLayoutSolver: {
                 **joint,
                 "decides_lx_relayouts": True,
+                "chooses_tilings": True,
+                "tilings_from_menu": True,
+                "replans_after_tiling": True,
                 "linear_cost_only": True,
             },
             ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
@@ -1873,21 +1882,33 @@ class TestSolverCapabilities(unittest.TestCase):
         del missing["linear_cost_only"]
         with self.assertRaisesRegex(TypeError, "must answer linear_cost_only"):
             type("Missing", (MemoryPlanSolver,), missing)
-        with self.assertRaisesRegex(TypeError, "requires chooses_core_divisions"):
-            type(
-                "RelayoutsWithoutDivisions",
-                (MemoryPlanSolver,),
-                placement(**{**all_false, "decides_lx_relayouts": True}),
-            )
+        for implied in ("decides_lx_relayouts", "generates_divisions"):
+            with (
+                self.subTest(implied=implied),
+                self.assertRaisesRegex(
+                    TypeError, f"{implied}\\(\\) requires chooses_core_divisions"
+                ),
+            ):
+                type(
+                    "WithoutDivisions",
+                    (MemoryPlanSolver,),
+                    placement(**{**all_false, implied: True}),
+                )
 
         joint = placement(**all_false)
         joint["plan_layout_and_core_divisions"] = lambda self, cost_expr=None: []
-        with self.assertRaisesRegex(TypeError, "requires chooses_tilings"):
-            type(
-                "ReplansWithoutTilings",
-                (CoreDivisionLayoutSolver,),
-                {**joint, "replans_after_tiling": classmethod(lambda cls: True)},
-            )
+        for implied in ("tilings_from_menu", "replans_after_tiling"):
+            with (
+                self.subTest(implied=implied),
+                self.assertRaisesRegex(
+                    TypeError, f"{implied}\\(\\) requires chooses_tilings"
+                ),
+            ):
+                type(
+                    "WithoutTilings",
+                    (CoreDivisionLayoutSolver,),
+                    {**joint, implied: classmethod(lambda cls: True)},
+                )
         with self.assertRaisesRegex(TypeError, "chooses_core_divisions"):
             type(
                 "JointThatDenies",
