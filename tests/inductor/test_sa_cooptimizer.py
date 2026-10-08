@@ -496,6 +496,46 @@ class DeterminismTest(TestCase):
                 )
 
 
+class GoldenSolveTest(TestCase):
+    """Two synthetic solves pinned to recorded results.
+
+    The determinism tests check only that the code agrees with itself; this
+    catches a change in what the search returns. Re-record it when a change to
+    the search is deliberate."""
+
+    # (case, capacity as a fraction of the seed footprint) ->
+    # (chosen_division per buffer, address per buffer, best_score)
+    _GOLDEN = {
+        ("multi_region", 4): (
+            [1, 1, 1, 0, 0, 0, 1, 1, 1],
+            [0, 65536, None, 0, 65536, None, 0, 32768, 65536],
+            1280000,
+        ),
+        ("k_split_consumers", 2): (
+            [0, 0, 1, 0, 0],
+            [None, 0, 65536, 98304, 0],
+            640000,
+        ),
+    }
+
+    def test_solves_match_the_recorded_results(self):
+        graphs = synthetic_graphs()
+        for (case, fraction), expected in self._GOLDEN.items():
+            buffers = copy.deepcopy(graphs[case][0].buffers)
+            cap = _seed_footprint(buffers) // fraction
+            solver = SaCoOptimizingSolver(buffers, cap, 128)
+            out = solver.plan_layout_and_core_divisions()
+            self.assertEqual(
+                (
+                    [b.chosen_division for b in out],
+                    [b.address for b in out],
+                    solver.best_score,
+                ),
+                expected,
+                f"{case} cap=1/{fraction}",
+            )
+
+
 class ImprovementSmokeTest(TestCase):
     """At a tight capacity the search should usually *improve* on the seed for at
     least one captured graph -- evidence the moves actually do something, beyond

@@ -129,6 +129,8 @@ def _canonical_key(division: "CoreDivision") -> tuple:
     are the same choice. The reduction set is carried rather than derived even
     though one op's write index fixes it, because a clone's menu is not one op's
     namespace -- its entries are synthesized from different consumers' symbols.
+    ``tile_splits`` is left out because it is not a further choice: it is the
+    tiling resolved to the op's loop symbols, so within one op the tiling fixes it.
     """
     return (
         tuple(sorted(division.splits.items(), key=lambda item: str(item[0]))),
@@ -159,11 +161,14 @@ class DivisionConfig:
     that generates never needs this.
 
     The key is derived and never supplied, so it cannot disagree with the
-    config it identifies.
+    config it identifies. It is derived once, so ``division``, held by
+    reference, is treated as frozen: nothing mutates a division after the menu
+    is built, and a mutation would leave the key stale.
 
     ``menu_index`` is provenance: the position this config came from in its
     buffer's ``core_divisions``, or ``None`` for a *generated* config. Only the
-    write-back reads it (see :meth:`SaCoOptimizingSolver._write_back`).
+    write-back (see :meth:`SaCoOptimizingSolver._write_back`) and the
+    objective's ``sym_division`` binding read it.
     """
 
     division: "CoreDivision"
@@ -607,7 +612,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 1 if name in resident else 0
             )
             # The division's identity, for table terms over candidates (the
-            # relayout price is one; see RelayoutCopyBuffer.cost_term).
+            # relayout price is one; see RelayoutCopyBuffer.cost_term). It is the
+            # menu position, not the key, so equal configs need not bind alike: a
+            # generated config has no position at all. Sound only while no such
+            # term reaches the annealer, which lx_solver_relayout() ensures (#4425).
             value_of[buf.sym_division] = lambda chosen, resident, idx=idx: (
                 chosen[idx].menu_index
             )
