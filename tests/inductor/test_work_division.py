@@ -3358,8 +3358,8 @@ class TestResidencyEdgeInversion(unittest.TestCase):
             down = captured.pop()
             self.assertTrue(up({self.x: 4, self.y: 1, self.k: 1}))
             self.assertFalse(up({self.x: 4, self.y: 1, self.k: 2}))
-            # The consumer's side has no policy of its own: an unrepresentable
-            # read cannot reproduce the target anyway.
+            # The consumer's side holds a candidate to every read of the
+            # buffer; with one read, that is only representability.
             self.assertTrue(down({self.r: 4, self.c: 2}))
 
     def test_an_illegal_candidate_loses_the_edge_rather_than_being_taken(self):
@@ -3376,3 +3376,161 @@ class TestResidencyEdgeInversion(unittest.TestCase):
             self.assertIsNotNone(
                 edge.consumer_division_for(CoreDivision({self.x: 2}), space)
             )
+
+
+class _TwoReadEdge(NamedTuple):
+    """A producer/consumer edge whose consumer reads the buffer twice."""
+
+    shape: tuple[int, ...]
+    write_index: sympy.Expr
+    read_indices: tuple[sympy.Expr, sympy.Expr]
+    parent_domains: dict
+    consumer_domains: dict
+    consumer_output_axes: frozenset
+
+
+class TestMultiReadEdgeInversion(unittest.TestCase):
+    """Generation agrees with the pair table on an edge whose consumer reads the
+    buffer more than once: for every producer division, ``consumer_division_for``
+    finds a partner exactly when ``match_pairs`` finds one in the consumer's
+    whole space."""
+
+    def _sweep(self, case: _TwoReadEdge) -> set[str]:
+        """Check every producer division; return the labels of those that pair."""
+        parent_syms = list(case.parent_domains)
+        consumer_syms = list(case.consumer_domains)
+        sizes = dict(zip(parent_syms, case.shape))
+        producer = _computed_buffer(case.shape, name="p")
+        consumer = _computed_buffer(case.shape, name="cons")
+        write_dep = MemoryDep("p", case.write_index, tuple(parent_syms), case.shape)
+        consumer_sizes = {sym: max(case.consumer_domains[sym]) for sym in consumer_syms}
+        read_deps = tuple(
+            MemoryDep("p", index, tuple(consumer_syms), tuple(consumer_sizes.values()))
+            for index in case.read_indices
+        )
+        iter_spaces = {"p": sizes, "cons": consumer_sizes}
+        read_writes = {
+            "p": MagicMock(writes=[write_dep], reads=[]),
+            # Only which axes the consumer's write sees matters here.
+            "cons": MagicMock(
+                writes=[
+                    MemoryDep("cons", sympy.Add(*case.consumer_output_axes), (), ())
+                ],
+                reads=list(read_deps),
+            ),
+        }
+        layout = _fixed_tiled_layout(case.shape)
+        graph = SimpleNamespace(
+            _repeat_info={}, get_buffer=lambda name: SimpleNamespace(layout=layout)
+        )
+        parent_space = mock_op_split_space(
+            case.parent_domains, parent_syms, op=producer
+        )
+        consumer_space = mock_op_split_space(
+            case.consumer_domains, case.consumer_output_axes, op=consumer
+        )
+
+        def divisions(space):
+            domains = space.factor_domains
+            return [
+                space.division(dict(zip(domains, factors)))
+                for factors in itertools.product(*domains.values())
+            ]
+
+        with ExitStack() as stack:
+            stack.enter_context(pass_utils_module.V.set_graph_handler(graph))
+            stack.enter_context(
+                patch.object(
+                    pass_utils_module,
+                    "iteration_space_from_op",
+                    side_effect=lambda op: iter_spaces[op.get_name()],
+                )
+            )
+            for module in (pass_utils_module, work_division_module):
+                stack.enter_context(
+                    patch.object(
+                        module,
+                        "op_read_writes",
+                        side_effect=lambda op: read_writes[op.get_name()],
+                    )
+                )
+            edge = work_division_module.ResidencyEdge(
+                buf_name="p",
+                parent_op=producer,
+                consumer_op=consumer,
+                write_dep=write_dep,
+                read_deps=read_deps,
+                prep_cache={},
+            )
+            consumers = divisions(consumer_space)
+            paired_labels = set()
+            for parent in divisions(parent_space):
+                with self.subTest(parent=parent.label):
+                    paired = bool(edge.match_pairs([parent], consumers))
+                    if paired:
+                        paired_labels.add(parent.label)
+                    generated = edge.consumer_division_for(parent, consumer_space)
+                    self.assertEqual(generated is not None, paired)
+                    if generated is not None:
+                        self.assertEqual(
+                            edge.match_pairs([parent], [generated]), [(0, 0)]
+                        )
+        return paired_labels
+
+    def test_a_windowed_read_beside_a_plain_one(self):
+        """``sum_r a[x0 + r, x1] * a[x0, x1]``: ``r0_0`` and ``x0`` both walk
+        rows of the first read, and ``r0_0`` sorts first. Splitting it
+        reproduces the first read's slicing but leaves the second unsliced, so
+        the inversion has to go on to ``x0``."""
+        x, y = _isym("x"), _isym("y")
+        r, x0, x1 = _isym("r0_0"), _isym("x0"), _isym("x1")
+        paired = self._sweep(
+            _TwoReadEdge(
+                shape=(8, 128),
+                write_index=128 * x + y,
+                read_indices=(128 * (x0 + r) + x1, 128 * x0 + x1),
+                parent_domains={x: [1, 2, 4, 8], y: [1, 2]},
+                consumer_domains={r: [1, 2], x0: [1, 2, 4, 8], x1: [1, 2]},
+                consumer_output_axes=frozenset({x0, x1}),
+            )
+        )
+        # Every producer division pairs, through ``x0``.
+        self.assertEqual(
+            paired,
+            {"whole", "sy/2"}
+            | {f"sx/{n}" for n in (2, 4, 8)}
+            | {f"sx/{n},sy/2" for n in (2, 4, 8)},
+        )
+
+    def test_a_transposed_read_beside_a_plain_one(self):
+        """``a + a.permute(1, 0, 2)``: only a split of the dim both reads walk
+        alike has a partner."""
+        x, y, z = _isym("x"), _isym("y"), _isym("z")
+        i, j, k = _isym("i"), _isym("j"), _isym("k")
+        paired = self._sweep(
+            _TwoReadEdge(
+                shape=(4, 4, 128),
+                write_index=512 * x + 128 * y + z,
+                read_indices=(512 * i + 128 * j + k, 512 * j + 128 * i + k),
+                parent_domains={x: [1, 2, 4], y: [1, 2, 4], z: [1, 2]},
+                consumer_domains={i: [1, 2, 4], j: [1, 2, 4], k: [1, 2]},
+                consumer_output_axes=frozenset({i, j, k}),
+            )
+        )
+        self.assertEqual(paired, {"whole", "sz/2"})
+
+    def test_a_gram_matrix_reads_both_ways(self):
+        """``x @ x.T``: each read misses the other's row axis entirely."""
+        x, y = _isym("x"), _isym("y")
+        m, n, k = _isym("m"), _isym("n"), _isym("k")
+        paired = self._sweep(
+            _TwoReadEdge(
+                shape=(8, 128),
+                write_index=128 * x + y,
+                read_indices=(128 * m + k, 128 * n + k),
+                parent_domains={x: [1, 2, 4, 8], y: [1, 2]},
+                consumer_domains={m: [1, 2, 4, 8], n: [1, 2, 4, 8], k: [1, 2]},
+                consumer_output_axes=frozenset({m, n}),
+            )
+        )
+        self.assertEqual(paired, {"whole", "sy/2"})

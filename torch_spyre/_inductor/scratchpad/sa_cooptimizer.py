@@ -28,7 +28,9 @@ Region-recolor floods the residency relation bidirectionally from a splitting
 anchor config, so the region *is* the flood's reach and boundaries emerge for
 free; an edge with no compatible division becomes an accepted internal seam.
 A flip proposes one axis's factor, one step; a recolor draws a splitting
-division outright and floods it, which is the search's long-range move.
+division any number of axes away and floods it, which is the search's
+long-range move. A generated source draws it by redrawing the current one, so
+unlike a menu draw it depends on the state.
 
 Best-seen over ``(pi, W)`` from the seed state (every op at its seed config,
 ``pi`` from FirstFit) keeps every returned state no worse than that baseline.
@@ -354,9 +356,15 @@ class _GeneratedDivisions(_DivisionSource):
         draw and one legality check per axis rather than a walk over the whole
         space. Starting from ``config`` -- which is legal -- means a rejected
         draw simply leaves that axis alone, so the result is always legal.
+
+        The axes go in a random order: a draw is judged against the factors the
+        axes after it still hold, so a fixed order would block raising an early
+        axis wherever a later one holds the core budget.
         """
         splits = self.space.splits(config.division)
-        for axis in self.space.axes:
+        axes = list(self.space.axes)
+        rng.shuffle(axes)
+        for axis in axes:
             candidate = dict(splits)
             candidate[axis] = rng.choice(self.space.factor_domains[axis])
             if self.space.admits(candidate):

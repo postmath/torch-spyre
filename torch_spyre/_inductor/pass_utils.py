@@ -3957,8 +3957,9 @@ def invert_per_core_view(
                     target,
                 )
                 return None
-            if accept is not None and not accept(candidate):
+            if accept is not None and not accept(dict(candidate)):
                 continue
+            # No ``reduction_splits``: they set only the partial flag.
             view, _partial, representable = _per_core_view_from_prep(prep, candidate)
             if representable and view.same_partition(target):
                 return dict(candidate)

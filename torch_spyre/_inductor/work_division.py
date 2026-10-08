@@ -1399,8 +1399,8 @@ class ResidencyEdge:
         target = self.parent_view(parent_division)
         if target is None:
             return None
-        # Inverted through one read; :meth:`compatible` then holds the
-        # candidate to every read of the buffer.
+        # Inverted through one read; :meth:`_inverse` holds each candidate to
+        # the others.
         return self._inverse(
             self.consumer_op, self.read_deps[0], target, consumer_space, parent_division
         )
@@ -1443,8 +1443,11 @@ class ResidencyEdge:
         first solution the geometry offers is regularly one of those (two
         symbols on one device dim, where meeting ``target.num_cores`` forces a
         reduction factor above 1 under one placement and not under the next).
-        Applying them afterwards instead cost the edge outright, and
-        ``_ViewRelation`` memoizes that ``None`` for the whole solve.
+        On the consumer's side it is :meth:`consumer_view`: the inversion sees
+        only ``dep``, and two symbols that walk one device dim of it can slice
+        another read of the buffer differently. Applying either afterwards
+        instead cost the edge outright, and ``_ViewRelation`` memoizes that
+        ``None`` for the whole solve.
 
         The trailing :meth:`compatible` is then a confirmation rather than a
         filter: it re-asks the same question of the pair as a whole, which keeps
@@ -1455,12 +1458,10 @@ class ResidencyEdge:
         def accept(splits: dict) -> bool:
             if not space.admits(splits):
                 return False
-            # Geometry-blind, side-specific policy. The consumer's side has none
-            # -- an unrepresentable read cannot reproduce ``target`` anyway, so
-            # the forward-map confirmation already covers it.
-            if not is_parent_side:
-                return True
-            return self.parent_view(CoreDivision(splits=splits)) is not None
+            candidate = space.division(splits)
+            if is_parent_side:
+                return self.parent_view(candidate) is not None
+            return self.consumer_view(candidate) is not None
 
         splits = invert_per_core_view(
             _prep_for(op, dep, self.buf_name, self.prep_cache),
@@ -1472,7 +1473,9 @@ class ResidencyEdge:
             return None
         division = space.division(splits)
         parent, consumer = (
-            (splits, other.splits) if is_parent_side else (other.splits, splits)
+            (division.splits, other.splits)
+            if is_parent_side
+            else (other.splits, division.splits)
         )
         return division if self.compatible(parent, consumer) else None
 
