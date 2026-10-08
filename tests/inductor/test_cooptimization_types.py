@@ -77,6 +77,10 @@ class _NoOpSolver(CoreDivisionLayoutSolver):
         return False
 
     @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
     def replans_after_tiling(cls) -> bool:
         return False
 

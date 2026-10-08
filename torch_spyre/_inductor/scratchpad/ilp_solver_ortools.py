@@ -1191,11 +1191,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     @classmethod
     def chooses_tilings(cls) -> bool:
-        return False
+        return True
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return True
 
     @classmethod
     def replans_after_tiling(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def linear_cost_only(cls) -> bool:

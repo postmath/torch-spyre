@@ -1780,6 +1780,7 @@ class TestSolverCapabilities(unittest.TestCase):
         "supports_paired_buffers",
         "decides_lx_relayouts",
         "chooses_tilings",
+        "tilings_from_menu",
         "replans_after_tiling",
         "linear_cost_only",
     )
@@ -1817,6 +1818,9 @@ class TestSolverCapabilities(unittest.TestCase):
             CpSatLayoutSolver: {
                 **joint,
                 "decides_lx_relayouts": True,
+                "chooses_tilings": True,
+                "tilings_from_menu": True,
+                "replans_after_tiling": True,
                 "linear_cost_only": True,
             },
             ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver): joint,
@@ -1878,12 +1882,18 @@ class TestSolverCapabilities(unittest.TestCase):
 
         joint = placement(**all_false)
         joint["plan_layout_and_core_divisions"] = lambda self, cost_expr=None: []
-        with self.assertRaisesRegex(TypeError, "requires chooses_tilings"):
-            type(
-                "ReplansWithoutTilings",
-                (CoreDivisionLayoutSolver,),
-                {**joint, "replans_after_tiling": classmethod(lambda cls: True)},
-            )
+        for implied in ("tilings_from_menu", "replans_after_tiling"):
+            with (
+                self.subTest(implied=implied),
+                self.assertRaisesRegex(
+                    TypeError, f"{implied}\\(\\) requires chooses_tilings"
+                ),
+            ):
+                type(
+                    "WithoutTilings",
+                    (CoreDivisionLayoutSolver,),
+                    {**joint, implied: classmethod(lambda cls: True)},
+                )
         with self.assertRaisesRegex(TypeError, "chooses_core_divisions"):
             type(
                 "JointThatDenies",

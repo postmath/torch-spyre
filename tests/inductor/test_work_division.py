@@ -2374,7 +2374,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 return (second_views[index], False, True)
             return self._view_for_div(op, dep, buf_name, division, prep_cache)
 
-        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
         with (
             self._patches(),
             patch.object(
@@ -2432,7 +2432,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         # The update writes through the carry's storage, so a later read of the
         # update's name reads the storage's LX bytes: it needs the storage's
         # ownership, although the update itself is never an LX buffer.
-        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        allocator = CoOptimizingAllocator(_UNBUILT_SOLVER, size=1)
         update_op = self._carry_update()
         x = _isym("x")
         self.rw[self.consumer_op].reads.append(MemoryDep("update", x, (x,), (8,)))

@@ -2457,16 +2457,6 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
-def _solver_picks_tilings() -> bool:
-    """Whether the joint solve chooses a coarse tiling for each op.
-
-    Only the CP-SAT joint solve prices tiled candidates and ranks cuts, so
-    ``auto_coarse_tiling`` is inert on any other solver -- including dropping
-    the cost expression, which the annealing co-optimizer still scores by.
-    """
-    return config.auto_coarse_tiling and config.layout_solver == "cpsat"
-
-
 def _op_read_span_is_evaluable(op: Operation) -> bool:
     """True when the read-distance filter can compute concrete post-tile spans.
 
@@ -2643,6 +2633,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self.prune = prune
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
+        self._tilings_from_menu = layout_planning.tilings_from_menu()
         if config.lx_planner_relayout and not self._decides_lx_relayouts:
             logger.debug(
                 "%s does not decide LX relayouts; continuing without relayout",
@@ -2804,7 +2795,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
-        if _solver_picks_tilings():
+        if (
+            config.auto_coarse_tiling
+            and solver.chooses_tilings()
+            and solver.linear_cost_only()
+        ):
             # The cost model is flat in both axes the tiling search moves along:
             # it has no term for tile size and none for cut count, so every
             # candidate tiling scores identically and the choice falls to
@@ -3190,7 +3185,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # graph-level facts.
         self._prescribed_ops: frozenset[str] = frozenset()
         self._readers_by_name: dict[str, list[Operation]] = {}
-        if _solver_picks_tilings():
+        if config.auto_coarse_tiling and self._tilings_from_menu:
             from torch_spyre._inductor.scratchpad.coarse_tiling import (
                 prescribed_regions,
             )
@@ -3375,9 +3370,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
 
-        Unless the solve picks tilings (:func:`_solver_picks_tilings`) the only
-        option is the untiled ``TileSpec``, so enumeration and every downstream
-        plan stay bit-identical to today. When it does, the op is offered the
+        Unless ``auto_coarse_tiling`` is on and the solver takes its tilings off
+        this menu (``tilings_from_menu()``) the only option is the untiled
+        ``TileSpec``, so enumeration and every downstream plan stay
+        bit-identical to today. When it does, the op is offered the
         output-axis tilings it could take, minus any whose per-core read span
         would still exceed the read-distance limit (``MAX_SPAN_BYTES``); the
         untiled option is dropped too when the op's own full-size read
@@ -3415,7 +3411,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         untiled = [TileSpec()]
         if getattr(self, "_suppress_tiling", False):
             return untiled
-        if not _solver_picks_tilings():
+        if not (config.auto_coarse_tiling and self._tilings_from_menu):
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled

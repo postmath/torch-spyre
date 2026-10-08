@@ -918,27 +918,36 @@ class MemoryPlanSolver(ABC):
     @classmethod
     @abstractmethod
     def chooses_tilings(cls) -> bool:
-        """Chooses each op's coarse tiling jointly with its core division.
-        No reader yet."""
+        """Chooses each op's coarse tiling jointly with its core division. With
+        ``linear_cost_only`` too, the allocator hands it no cost expression
+        while ``auto_coarse_tiling`` is on: the cost model cannot score tile
+        size or cut count."""
+
+    @classmethod
+    @abstractmethod
+    def tilings_from_menu(cls) -> bool:
+        """Takes each op's tiling candidates off the menu the allocator
+        enumerates, rather than generating its own. The allocator enumerates
+        tiled candidates only for such a solver."""
 
     @classmethod
     @abstractmethod
     def replans_after_tiling(cls) -> bool:
         """Needs a second, placement-only solve over the graph once the tilings
-        it chose are applied, rather than its own placement standing. No reader
-        yet."""
+        it chose are applied, rather than its own placement standing
+        (``CoOptimizingAllocator._materialize_selection``)."""
 
     @classmethod
     @abstractmethod
     def linear_cost_only(cls) -> bool:
         """Can only minimize a cost expression that lowers to linear terms, so
-        the objective must avoid the cost model's fractional powers. No reader
-        yet."""
+        the objective must avoid the cost model's fractional powers."""
 
     _CAPABILITIES = (
         "supports_paired_buffers",
         "decides_lx_relayouts",
         "chooses_tilings",
+        "tilings_from_menu",
         "replans_after_tiling",
         "linear_cost_only",
     )
@@ -965,6 +974,7 @@ class MemoryPlanSolver(ABC):
             ("decides_lx_relayouts", "chooses_core_divisions"),
             ("chooses_tilings", "chooses_core_divisions"),
             ("linear_cost_only", "chooses_core_divisions"),
+            ("tilings_from_menu", "chooses_tilings"),
             ("replans_after_tiling", "chooses_tilings"),
         ):
             if getattr(cls, implied)() and not getattr(cls, prerequisite)():
