@@ -2131,6 +2131,34 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
         self.assertEqual(result, expected)
 
+    def test_resize_device_layout_grow_from_singleton_permuted(self):
+        """The grow path on a permuted buffer: a device dim tiled to size 1
+        (stride_map -1) grows back to the full buffer's actual host stride, not
+        the contiguous one."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        order = [1, 0, 2, 3]
+        expected = SpyreTensorLayout(size, stride, torch.float16, order)
+        # The per-tile buffer's compact strides, in the full buffer's dim order.
+        for tile_size, tile_stride in (
+            ([1, 8, 512, 512], [512, 512, 4096, 1]),
+            ([8, 1, 512, 512], [512, 4096, 4096, 1]),
+        ):
+            with self.subTest(tile_size=tile_size):
+                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+                self.assertIn(-1, list(stl.stride_map))
+                result = _resize_device_layout(
+                    stl,
+                    tile_size,
+                    size,
+                    stick_host_dim=3,
+                    old_host_stride=tile_stride,
+                    new_host_stride=stride,
+                )
+                self.assertEqual(result, expected)
+
     def test_resize_device_layout_permuted_same_size_dims(self):
         """A permuted layout whose two size-8 dims both miss the contiguous
         strides: only the buffer's own strides tell which device dim is d0.
@@ -2162,6 +2190,34 @@ class TestDivideRanges(unittest.TestCase):
         self.assertEqual(
             result,
             SpyreTensorLayout(tile_size, tile_stride, torch.float16, [1, 0, 2, 3]),
+        )
+
+    def test_resize_device_layout_ignores_a_coincident_contiguous_stride(self):
+        """[2, 128, 2, 64] with the stick on dim 1, at host strides
+        (16384, 1, 8192, 128): the tile-count dim (size 2, stride_map 64) ties
+        dims 0 and 2 in size and misses both their strides, but equals dim 2's
+        contiguous stride. Given the actual strides, that coincidence must not
+        make it dim 2's."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride, order = [2, 128, 2, 64], [16384, 1, 8192, 128], [0, 2, 3, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, order)
+        self.assertEqual(list(stl.device_size), [2, 64, 2, 2, 64])
+        self.assertEqual(list(stl.stride_map), [8192, 128, 64, 16384, 1])
+
+        tile_size, tile_stride = [2, 128, 2, 32], [8192, 1, 4096, 128]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=1,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(
+            result,
+            SpyreTensorLayout(tile_size, tile_stride, torch.float16, order),
         )
 
     def test_resize_device_layout_refuses_a_tile_count_dim_at_a_foreign_stride(
