@@ -1647,7 +1647,7 @@ def _loop_repeated_read_excess_ns(ops: list, p: "CostParams"):
             continue
         for arg in op.args:
             lf = getattr(arg, "loop_factor", 1) or 1
-            if arg.role != "input" or arg.broadcast or lf <= 1:
+            if arg.role != "input" or arg.broadcast or (not _is_sym(lf) and lf <= 1):
                 continue
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             total += arg.elems * (lf - 1) * op.dtype_bytes * (1 - is_lx) * per_byte
@@ -2053,7 +2053,9 @@ def _matmul_batch_split_ns(ops: list, p: CostParams):
         m_max = max(1, int(m_extent) // max(1, p.mm_batch_split_min_m_rows))
         if m_max <= 1:
             continue
-        trip = max(1, int(getattr(o, "loop_trip", 1) or 1))
+        trip = getattr(o, "loop_trip", 1) or 1
+        if not _is_sym(trip):
+            trip = max(1, int(trip))
 
         def log2(value):
             if isinstance(value, sympy.Basic) and value.free_symbols:
