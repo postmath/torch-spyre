@@ -205,8 +205,8 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         """True once every buffer is fully allocated below capacity.
 
         Quality is then at its upper bound -- each buffer already contributes
-        its full :func:`buffer_quality`, so no rotation or swap can improve it
-        and the search can stop.
+        its full use-weighted size, so no rotation or swap can improve it and
+        the search can stop.
         """
         return self.plan.count_allocated() == len(self.buffers)
 
