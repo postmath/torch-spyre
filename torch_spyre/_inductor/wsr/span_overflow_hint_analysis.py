@@ -367,7 +367,11 @@ def _post_tile_resize_error(
     tile_size[host_dim] //= split_count
     try:
         _resize_device_layout(
-            layout.device_layout, full_size, tile_size, stick_host_dim=stick_host_dim
+            layout.device_layout,
+            full_size,
+            tile_size,
+            stick_host_dim=stick_host_dim,
+            old_host_stride=[concretize_expr(s) for s in layout.stride],
         )
     except RuntimeError as exc:
         return str(exc)
