@@ -43,6 +43,7 @@ from .constants import BATCH_MATMUL_OP
 from .cost_model import (
     ArgTraffic,
     OpFeatures,
+    _is_sym,
     _matmul_axes_for_split_cost,
     explain,
     max,
@@ -1493,7 +1494,12 @@ def extract_op_features(
         mem, dims, in_elems, in_logical = _input_traffic(name)
         operand_geometry = (
             _operand_read_geometry(op, dep, work_slices, candidate_work_slices)
-            if is_matmul and loop_trip > 1 and index is not None
+            # Under a prospective tiling (a symbolic trip count) the op is
+            # still untiled, so it has no per-trip geometry to read.
+            if is_matmul
+            and not _is_sym(loop_trip)
+            and loop_trip > 1
+            and index is not None
             else (None, None)
         )
         if in_elems is None:  # unresolved buffer -> fallback

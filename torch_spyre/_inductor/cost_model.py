@@ -1505,7 +1505,8 @@ def _partitioned_operand_terms(ops: list, p: "CostParams"):
         return
     single_pass = all(_is_single_pass(op) for op in ops)
     for op in ops:
-        if not op.is_matmul:
+        # A symbolic trip count (a prospective tiling) leaves eligibility unknown.
+        if not op.is_matmul or _is_sym(op.loop_trip):
             continue
         looped = op.loop_trip > 1
         for arg in op.args:
@@ -2370,9 +2371,11 @@ def operand_request_cost_available(
     matmul (``loop_trip > 1``) whose read geometry the extractor proved, at a
     calibration the law covers. A single-pass matmul is never priced here, so this
     term is disjoint from any single-pass delivery estimate. Unknown geometry
-    declines (the read keeps its previous price); it is never priced as zero."""
+    declines (the read keeps its previous price); it is never priced as zero, nor
+    is a symbolic trip count (a prospective tiling) taken as looped."""
     return (
         op.is_matmul
+        and not _is_sym(op.loop_trip)
         and op.loop_trip > 1
         and arg.role == "input"
         and _dma_request_law_available(
