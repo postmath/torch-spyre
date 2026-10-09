@@ -4173,6 +4173,29 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         self.assertEqual(symbol_to_dim[s], 1)
         self.assertNotIn(sympy.Integer(0), symbol_to_dim)
 
+    def test_post_tile_layout_follows_permuted_host_strides(self):
+        """The validated tile layout is the one ``_divide_ranges`` applies: on
+        a permuted buffer its strides are ``compute_tile_stride``'s, not the
+        contiguous ones, and its device layout follows them."""
+        dtype = torch.float16
+        size, stride, order = [8, 8, 64, 512], [32768, 262144, 512, 1], [0, 1, 2, 3]
+        layout = FixedTiledLayout(
+            "spyre:0",
+            dtype,
+            [sympy.Integer(s) for s in size],
+            [sympy.Integer(s) for s in stride],
+            SpyreTensorLayout(size, stride, dtype, order),
+        )
+
+        tiled = soha._post_tile_layout_for_splits(layout, {0: 2}, "op", 3)
+
+        tile_size, tile_stride = [4, 8, 64, 512], [32768, 131072, 512, 1]
+        self.assertEqual([int(s) for s in tiled.stride], tile_stride)
+        self.assertEqual(
+            tiled.device_layout,
+            SpyreTensorLayout(tile_size, tile_stride, dtype, order),
+        )
+
     def test_single_reduction_dim_output_controlled_input_span_plans(self):
         op = _reduction_op((4_194_304,), reduction_ranges=(64,))
         m, k = sympy.symbols("m k")
