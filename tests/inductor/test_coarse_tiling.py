@@ -2159,6 +2159,68 @@ class TestDivideRanges(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_resize_device_layout_grow_from_one_stick(self):
+        """The grow path from a tile whose stick dim is one stick long: its
+        tile-count dim has size 1 but a real stride_map, so it is grown, not
+        taken for a placeholder or for a host dim of extent 1."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        # (size, stride, tile_size, tile_stride, dim_order, stick_host_dim)
+        cases = (
+            ([4, 128], [128, 1], [4, 64], [64, 1], [0, 1], 1),
+            # Also a host dim of extent 1, which the tile-count dim must not
+            # be matched to.
+            (
+                [512, 64, 64, 2],
+                [128, 1, 65536, 64],
+                [512, 64, 64, 1],
+                [64, 1, 32768, 64],
+                [0, 2, 3, 1],
+                None,
+            ),
+        )
+        for size, stride, tile_size, tile_stride, order, shd in cases:
+            with self.subTest(size=size):
+                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+                result = _resize_device_layout(
+                    stl,
+                    tile_size,
+                    size,
+                    stick_host_dim=shd,
+                    old_host_stride=tile_stride,
+                    new_host_stride=stride,
+                )
+                self.assertEqual(
+                    result, SpyreTensorLayout(size, stride, torch.float16, order)
+                )
+
+    def test_resize_device_layout_sub_stick_tile_count(self):
+        """A stick host dim shorter than a stick: its size-1 tile-count dim
+        steps the whole dim (stride_map 32 here), not a stick (64), and size-1
+        host dims are left over, so only that stride identifies it."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [1, 20, 1, 32], [640, 32, 32, 1]
+        order = [0, 1, 2, 3]
+        stl = SpyreTensorLayout(size, stride, torch.float16, order)
+        self.assertEqual(list(stl.device_size), [20, 1, 1, 1, 64])
+        self.assertEqual(list(stl.stride_map), [32, -1, 32, -1, 1])
+
+        tile_size, tile_stride = [1, 10, 1, 32], [320, 32, 32, 1]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=3,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(
+            result, SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+        )
+
     def test_resize_device_layout_permuted_same_size_dims(self):
         """A permuted layout whose two size-8 dims both miss the contiguous
         strides: only the buffer's own strides tell which device dim is d0.
@@ -9806,20 +9868,12 @@ class TestPredictFrame(unittest.TestCase):
     def test_unit_extent_level_followed_by_another_level(self):
         """A dim tiled to extent 1 by a *non-final* level.
 
-        The single-level cases above pass under a one-shot full->tile resize;
-        this one does not, which is why ``_predict_output_layout`` resizes once
-        per level. ``_resize_device_layout`` matches size-1 device dims to a
-        size-1 host dim by size alone (ir.py:236) -- no stride tiebreak, no
-        one-to-one constraint -- so once level 1 puts host dim 0 at extent 1,
-        level 2 re-matches the one-stick tile-count dim onto it and collapses
-        its stride to the ``-1`` sentinel.  A single resize never sees that
-        intermediate state and leaves the real stride there, predicting
-        stride_map [64, 64, -1, 1] against an applied [64, -1, -1, 1].
-
-        Needs all three: a dim tiled to extent 1, at a non-final level, with a
-        stick host dim of exactly one stick (64 elems at fp16) so a second
-        size-1 device dim exists to be mis-matched.  Drop any one and a
-        one-shot resize agrees.
+        With a stick host dim of exactly one stick (64 elems at fp16), the
+        tile-count dim has size 1 too. ``_resize_device_layout`` used to match
+        it to host dim 0 by size once level 1 put that at extent 1, collapsing
+        its stride to ``-1`` at level 2, which a one-shot full->tile resize
+        never did; hence ``_predict_output_layout`` resizes once per level,
+        as ``_divide_ranges`` does.
         """
         self._apply_and_compare(
             (2, 512, 64),
