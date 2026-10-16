@@ -87,12 +87,18 @@ logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 # RNG seed; fixes the (deterministic) search trajectory.
 _SEED = 0
 
-# Step budget: min(_STEPS_PER_BUFFER * n, _MAX_STEPS). The ceiling sits above
-# the layout-only annealer's clamp (``SelfCalibratingReheatingSchedule
-# .max_steps``, 5_000) since this engine searches divisions too, and binds only
-# well past the validated corpus. It bounds *steps*, not wall-clock.
+# Step budget, see _step_budget. The ceiling sits above the layout-only
+# annealer's clamp (``SelfCalibratingReheatingSchedule.max_steps``, 5_000) since
+# this engine searches divisions too, and binds only well past the validated
+# corpus. It bounds *steps*, not wall-clock.
 _STEPS_PER_BUFFER = 200
 _MAX_STEPS = 50_000
+
+
+def _step_budget(n: int) -> int:
+    """The anneal's step count for ``n`` buffers that carry a division decision."""
+    return min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
+
 
 # Fixed proposal weights over the three move types. Reorder's weight is
 # effectively 0 while every eligible buffer is resident (see
@@ -1870,8 +1876,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """One geometric cool over the clamped step budget, at fixed proposal
         weights, publishing the best state seen."""
         n = len(self._bufs)
-        steps = min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
-        if _STEPS_PER_BUFFER * n > _MAX_STEPS:
+        steps = _step_budget(n)
+        if steps < _STEPS_PER_BUFFER * n:
             logger.debug(
                 "SA co-optimizer step budget clamped to %d for %d buffers (%d "
                 "steps/buffer would ask for %d); layout quality is traded for "

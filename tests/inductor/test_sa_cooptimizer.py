@@ -56,6 +56,7 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _TableRelation,
     _ViewRelation,
     _one_axis_apart,
+    _step_budget,
     _table_relation,
 )
 from torch_spyre._C import NativePermutationLayoutSolver
@@ -758,6 +759,21 @@ class SnapshotRestoreTest(TestCase):
 
 
 class StepBudgetTest(TestCase):
+    """``min(200 n, 50000)``. The literals pin the tuned constants: a retune
+    has to update them here."""
+
+    def test_no_buffers_get_no_steps(self):
+        self.assertEqual(_step_budget(0), 0)
+
+    def test_rate_applies_below_the_ceiling(self):
+        self.assertEqual(_step_budget(1), 200)
+        # The largest captured graph: the ceiling is inert across the corpus.
+        self.assertEqual(_step_budget(79), 15_800)
+
+    def test_ceiling_caps_large_graphs(self):
+        self.assertEqual(_step_budget(250), 50_000)
+        self.assertEqual(_step_budget(251), 50_000)
+
     def test_ceiling_is_higher_than_the_layout_only_annealer(self):
         """The joint engine searches divisions too, so it wants a larger budget
         at the same buffer count (and must not silently inherit the smaller one).
