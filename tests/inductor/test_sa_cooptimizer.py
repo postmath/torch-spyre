@@ -2259,6 +2259,10 @@ class CompanionBufferPricingTest(TestCase):
         # the other (8192 / 8 cores = 1024 > 512), so both spill; tiled 4 ways
         # in one run, both fit and A's output never leaves the run. The search
         # has to find that on its own, and the objective has to let it pay.
+        # The seeded search depends on _SEED, _MOVE_WEIGHTS and the step budget.
+        # It finds the tiling on seeds 0-19 under several weight mixes with 200
+        # or more steps (it gets 400), but on only 13 of 20 seeds with 80, so a
+        # retune that cuts a two-buffer budget may need to touch this test.
         bufs = [self._sized_run_buffer("A", 0), self._sized_run_buffer("B", 1)]
         bufs[1].parents = ["A"]
         bufs[1].residency_edges = {"A": self._identity_edge()}
