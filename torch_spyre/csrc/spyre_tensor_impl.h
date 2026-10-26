@@ -18,9 +18,11 @@
 
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
+#include <c10/util/safe_numerics.h>
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -134,8 +136,9 @@ class SpyreTensorLayout {
    * that all device layout invariants are satisfied.
    *
    * When valid_elements is omitted, it defaults to {}, meaning the valid
-   * extents are unknown. No consumer reads valid_elements yet, but one that
-   * does must not treat {} as "every device element is valid".
+   * extents are unknown. No consumer uses valid_elements for layout decisions
+   * yet, but one that does must not treat {} as "every device element is
+   * valid".
    *
    * @deprecated Use the overload that takes valid_elements as a required
    * parameter (before element_arrangement) to ensure accurate padding
@@ -247,7 +250,11 @@ class SpyreTensorLayout {
                     device_dim_index);
         seen[device_dim_index] = 1;
 
-        device_space *= device_size[device_dim_index];
+        // On overflow the true product exceeds any int64 count, so saturate.
+        if (c10::mul_overflows(device_space, device_size[device_dim_index],
+                               &device_space)) {
+          device_space = std::numeric_limits<int64_t>::max();
+        }
       }
 
       TORCH_CHECK(element_count >= 0,
