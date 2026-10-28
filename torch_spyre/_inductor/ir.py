@@ -136,17 +136,17 @@ def _resize_device_layout(
 ):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
-    Used in two directions:
+    Works in two directions:
 
     * **shrink** (``_divide_ranges``): the buffer is the same physical
       allocation; coarse tiling narrows the per-tile iteration range.
       ``device_size`` entries for non-stick dims shrink to reflect the smaller
       per-tile extents.
-    * **grow** (``_allocate_full_buffer``): a full-sized scatter-target buffer
-      is allocated to match a per-tile source.  ``device_size`` entries grow
-      back to the full extent.  The stick orientation (transposed vs row-major,
-      ``element_arrangement``) is propagated verbatim so both buffers agree on
-      physical layout and scatter-copy address arithmetic is correct.
+    * **grow**: ``device_size`` entries grow back to a larger extent, with the
+      stick orientation (transposed vs row-major, ``element_arrangement``)
+      propagated verbatim.  No pass grows a layout now:
+      ``_allocate_full_buffer`` takes the layout planning recorded, since
+      growing back is ambiguous where the tile has two host dims of extent 1.
 
     ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
     extent 1 and is never stepped through; its stride is undefined."  When

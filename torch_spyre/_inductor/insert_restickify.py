@@ -639,8 +639,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 )
                 if not all_tiled_rdims_empty:
                     # If accum_full already has a FixedTiledLayout,
-                    # _allocate_full_buffer derived the correct layout via
-                    # _resize_device_layout — nothing to do. Otherwise promote
+                    # _allocate_full_buffer gave it the layout planning
+                    # recorded — nothing to do. Otherwise promote
                     # to FixedTiledLayout using the reduction op's device layout.
                     accum_name = getattr(op, "_tiled_reduction_accum_name", None)
                     if accum_name is not None:
