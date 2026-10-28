@@ -88,6 +88,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index,
     _should_patch_retiled_load_indexes,
     _squeezed_retile_dims,
+    _undivided_ranges,
     coarse_tile_post_stickify,
     plan_coarse_tile_groups,
     reduction_loop_vars,
@@ -1857,6 +1858,15 @@ class TestDivideRanges(unittest.TestCase):
         _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges[0], Integer(16))
 
+    def test_pointwise_non_dividing_count_raises(self):
+        # _undivided_ranges multiplies the count back in, so it is exact only
+        # while this refusal holds.
+        data = _make_pointwise([Integer(100)])
+        op = _make_op(data)
+        with self.assertRaisesRegex(Unsupported, "not divisible"):
+            _divide_ranges(op, Integer(3), tiled_dims=[0])
+        self.assertEqual(data.ranges[0], Integer(100))
+
     def test_pointwise_symbolic_count(self):
         k = Symbol("K", positive=True)
         n = Symbol("N", positive=True)
@@ -2961,6 +2971,28 @@ class TestCoarseTileNested(unittest.TestCase):
         self.assertEqual(per_level[0], {0: Integer(64)})
         # Inner level (count 2): extent = final_extent(32).
         self.assertEqual(per_level[1], {0: Integer(32)})
+
+    def test_planned_tile_extents_per_level_non_dividing_count_raises(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _planned_tile_extents_per_level,
+        )
+
+        data = _make_pointwise([Integer(100)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0),))
+        with self.assertRaisesRegex(Unsupported, "not divisible"):
+            _planned_tile_extents_per_level(op, [[0]], [[]], [(1, Integer(3))])
+
+    def test_undivided_ranges_restores_the_ranges_before_tiling(self):
+        data = _make_pointwise([Integer(256), Integer(128), Integer(16)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0), (3, 1)))
+        coarse_tile_post_stickify(
+            _graph([op]),
+            [([op], [(1, Integer(4)), (2, Integer(2)), (3, Integer(8))])],
+        )
+        self.assertEqual(list(data.ranges), [Integer(32), Integer(16), Integer(16)])
+        self.assertEqual(
+            _undivided_ranges(op), ((Integer(256), Integer(128), Integer(16)), ())
+        )
 
     def test_coarse_tile_plans_before_any_transformation(self):
         """coarse_tile() must fully plan every group before transforming any.
