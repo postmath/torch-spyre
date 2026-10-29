@@ -2225,6 +2225,43 @@ class TestDivideRanges(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only shrinks"):
             _resize_device_layout(stl, [1, 128], [4, 128])
 
+    def test_resize_device_layout_keeps_a_broadcast_stick_sparse(self):
+        """A broadcast stick compacted to stride_map -1 stays -1 when another
+        dim shrinks, so the tile's layout is the one compaction gives the tile.
+        The host stride, 0, would undo the compaction, and
+        _multi_arg_pointwise_layouts recognizes a broadcast stick only by -1.
+        Device coordinates ignore both, so either addresses the same element."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.propagate_layouts import (
+            _compact_broadcast_device_dims,
+        )
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        # (size, stride, tile_size): x[:, :1].expand(4, 64) tiled on dim 0, and
+        # a 3-d broadcast tiled on a non-stick dim with a smaller stride.
+        cases = (
+            ([4, 64], [64, 0], [2, 64]),
+            ([4, 8, 64], [8, 1, 0], [4, 2, 64]),
+        )
+        for size, stride, tile_size in cases:
+            with self.subTest(size=size):
+                order = list(range(len(size)))
+                stl = _compact_broadcast_device_dims(
+                    SpyreTensorLayout(size, stride, torch.float16, order)
+                )
+                self.assertEqual(stl.stride_map[-1], -1)
+                result = _resize_device_layout(
+                    stl,
+                    size,
+                    tile_size,
+                    old_host_stride=stride,
+                    new_host_stride=stride,
+                )
+                expected = _compact_broadcast_device_dims(
+                    SpyreTensorLayout(tile_size, stride, torch.float16, order)
+                )
+                self.assertEqual(result, expected)
+
     def test_resize_device_layout_sub_stick_tile_count(self):
         """A stick host dim shorter than a stick: its size-1 tile-count dim
         steps the whole dim (stride_map 32 here), not a stick (64), and size-1
