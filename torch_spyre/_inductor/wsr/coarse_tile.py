@@ -4678,6 +4678,14 @@ def _propagate_tiled_reduction_op(
             f"{op.get_name()}: a nested reduction is only tiled post-stickify, "
             f"but its layout is {type(op.layout).__name__}"
         )
+        # _divide_ranges has already made op's layout the tile's, so its device
+        # layout is accum_tile's.
+        tile_layout = (tuple(op.layout.size), tuple(op.layout.stride))
+        planned = (tuple(per_tile_ranges), tuple(reduction_plan.per_tile_strides))
+        assert tile_layout == planned, (
+            f"{op.get_name()}: layout (size, stride) {tile_layout} is not the "
+            f"planned tile's {planned}"
+        )
         accum_tile = _allocate_full_buffer(
             op,
             per_tile_ranges,

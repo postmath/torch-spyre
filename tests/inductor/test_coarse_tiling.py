@@ -2215,86 +2215,15 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
         self.assertEqual(layout.device_layout, expected)
 
-    def test_resize_device_layout_grow_from_singleton(self):
-        """The grow path: a device dim tiled to size 1
-        (stride_map != -1) must be grown back.
-
-        [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
-        update to device_size=4, not remain frozen at 1."""
+    def test_resize_device_layout_refuses_to_grow(self):
+        """Growing back is ambiguous where the tile has two host dims of
+        extent 1, so a grow raises rather than return a stale layout."""
         from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
-        # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
-        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
         stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
-        result = _resize_device_layout(stl, [1, 128], [4, 128])
-
-        expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
-        self.assertEqual(result, expected)
-
-    def test_resize_device_layout_grow_from_singleton_permuted(self):
-        """The grow path on a permuted buffer: a device dim tiled to size 1
-        (stride_map -1) grows back to the full buffer's actual host stride, not
-        the contiguous one."""
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
-
-        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
-        order = [1, 0, 2, 3]
-        expected = SpyreTensorLayout(size, stride, torch.float16, order)
-        # The per-tile buffer's compact strides, in the full buffer's dim order.
-        for tile_size, tile_stride in (
-            ([1, 8, 512, 512], [512, 512, 4096, 1]),
-            ([8, 1, 512, 512], [512, 4096, 4096, 1]),
-        ):
-            with self.subTest(tile_size=tile_size):
-                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                self.assertIn(-1, list(stl.stride_map))
-                result = _resize_device_layout(
-                    stl,
-                    tile_size,
-                    size,
-                    stick_host_dim=3,
-                    old_host_stride=tile_stride,
-                    new_host_stride=stride,
-                )
-                self.assertEqual(result, expected)
-
-    def test_resize_device_layout_grow_from_one_stick(self):
-        """The grow path from a tile whose stick dim is one stick long: its
-        tile-count dim has size 1 but a real stride_map, so it is grown, not
-        taken for a placeholder or for a host dim of extent 1."""
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
-
-        # (size, stride, tile_size, tile_stride, dim_order, stick_host_dim)
-        cases = (
-            ([4, 128], [128, 1], [4, 64], [64, 1], [0, 1], 1),
-            # Also a host dim of extent 1, which the tile-count dim must not
-            # be matched to.
-            (
-                [512, 64, 64, 2],
-                [128, 1, 65536, 64],
-                [512, 64, 64, 1],
-                [64, 1, 32768, 64],
-                [0, 2, 3, 1],
-                None,
-            ),
-        )
-        for size, stride, tile_size, tile_stride, order, shd in cases:
-            with self.subTest(size=size):
-                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                result = _resize_device_layout(
-                    stl,
-                    tile_size,
-                    size,
-                    stick_host_dim=shd,
-                    old_host_stride=tile_stride,
-                    new_host_stride=stride,
-                )
-                self.assertEqual(
-                    result, SpyreTensorLayout(size, stride, torch.float16, order)
-                )
+        with self.assertRaisesRegex(ValueError, "only shrinks"):
+            _resize_device_layout(stl, [1, 128], [4, 128])
 
     def test_resize_device_layout_sub_stick_tile_count(self):
         """A stick host dim shorter than a stick: its size-1 tile-count dim
