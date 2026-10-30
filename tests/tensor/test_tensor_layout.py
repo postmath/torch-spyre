@@ -1084,6 +1084,7 @@ class TestComputeValidElements(TestCase):
             ([4, 512, 64], {(0, 2): 0, (1,): 0}),
             ([4, 0, 64], {(0, 2): 256, (1,): 0}),
             ([2**62, 4, 64], {(0, 1): 1}),
+            ([2**62, 4, 64], {(0, 1): 2**63 - 1}),
         ],
     )
     def test_valid_elements_accepted(self, device_size, valid_elements):
@@ -1127,6 +1128,16 @@ class TestComputeValidElements(TestCase):
         self.assertEqual(stl.valid_elements, valid_elements)
         with self.assertRaisesRegex(RuntimeError, "exceeds the 256 positions"):
             SpyreTensorLayout(*args, ElementArrangement.STANDARD, {(0, 2): 257})
+
+    def test_valid_elements_defaults_to_empty(self):
+        # {} means the valid extents are unknown, not that all elements are valid.
+        stl = SpyreTensorLayout(
+            [4, 512, 64],
+            [64, 256, 1],
+            get_device_dtype(torch.float16),
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(stl.valid_elements, {})
 
 
 if __name__ == "__main__":
