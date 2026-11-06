@@ -1092,6 +1092,9 @@ def work_division_context_for_op(
         op,
         _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
     )
+    if tiling is None or tiling.is_untiled:
+        # Unlike the stick adjustment below, nothing needs the unpadded extents.
+        it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
         it_space, input_tds + [output_td], symbol_meta
@@ -2028,6 +2031,8 @@ def span_reduction_pass(
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
+    # Unlike the stick adjustment below, nothing needs the unpadded extents.
+    it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
 
     # Symbolic-dim bucket metadata for the iteration vars in this op. Built
     # before stick adjustment so the stick-dim guard inside
@@ -2174,6 +2179,8 @@ def work_distribution_pass(
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
+    # Unlike the stick adjustment below, nothing needs the unpadded extents.
+    it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
 
     symbol_meta = _collect_symbol_metadata(it_space)
 
