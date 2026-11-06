@@ -15,6 +15,7 @@
 
 import builtins
 import dataclasses
+import functools
 import itertools
 import sympy
 import logging
@@ -576,6 +577,96 @@ def adjust_it_space_for_padding(
     return adjusted_it_space
 
 
+@dataclasses.dataclass(frozen=True)
+class OpIterationSpace:
+    """An op's iteration space with its tensor deps, padded and stick-adjusted.
+
+    Attributes:
+        input_tds: The op's input tensor deps, one per read.
+        output_td: The op's output tensor dep.
+        it_space: Extent of each iteration var, in elements: the write ranges
+            plus any reduction ranges. A padded output dim has its padded
+            device extent (see :func:`adjust_it_space_for_padding`).
+        it_space_adjusted: ``it_space`` with each stick var counted in sticks
+            instead of elements (see :func:`adjust_it_space_for_sticks`).
+        stick_vars: Maps each stick var to its largest elements-per-stick
+            count across the tensor deps.
+        symbol_meta: ``(max_size, granularity)`` for each opted-in symbolic
+            iteration var; concrete vars are absent (see
+            :func:`_collect_symbol_metadata`).
+    """
+
+    input_tds: list[TensorDep]
+    output_td: TensorDep
+    it_space: dict[Symbol, Expr]
+    it_space_adjusted: dict[Symbol, Expr]
+    stick_vars: dict[Symbol, int]
+    symbol_meta: SymbolMeta
+
+    @property
+    def tensor_deps(self) -> list[TensorDep]:
+        return self.input_tds + [self.output_td]
+
+    @functools.cached_property
+    def coord_vars(self) -> set[Symbol]:
+        return {
+            v
+            for e in self.output_td.device_coords[:-1]
+            for v in e.free_symbols
+            if isinstance(v, Symbol)
+        }
+
+    @functools.cached_property
+    def reduction_vars(self) -> list[Symbol]:
+        return [v for v in self.it_space_adjusted if v not in self.coord_vars]
+
+
+def make_op_iteration_space(
+    op: ComputedBuffer,
+    args: list[SchedNodeArg],
+    it_space: dict[Symbol, Expr] | None = None,
+) -> OpIterationSpace:
+    """Build ``op``'s iteration space and tensor deps for work division.
+
+    The extents are padded first (see :func:`adjust_it_space_for_padding`), so
+    every later step sees the padded extents, and the stick-adjusted space is
+    derived from them.
+
+    Args:
+        op: The operation to divide.
+        args: ``op``'s memory dependencies, one per input.
+        it_space: (Optional) precomputed extents, such as a tiled frame's; used
+            as-is, without padding.
+
+    Raises:
+        Unsupported: if a tensor's stick dim has a symbolic extent (see
+            :func:`adjust_it_space_for_sticks`).
+    """
+    input_tds, output_td = collect_tensor_deps(op, args)
+    if it_space is None:
+        it_space = iteration_space_from_op(op)
+        # Unlike the stick adjustment below, nothing needs the unpadded extents.
+        it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
+
+    # Symbolic-dim bucket metadata for the iteration vars in this op. Built
+    # before stick adjustment so the stick-dim guard inside
+    # adjust_it_space_for_sticks can raise on symbolic stick dims.
+    symbol_meta = _collect_symbol_metadata(it_space)
+
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, input_tds + [output_td], symbol_meta
+    )
+
+    return OpIterationSpace(
+        input_tds=input_tds,
+        output_td=output_td,
+        it_space=it_space,
+        it_space_adjusted=it_space_adjusted,
+        symbol_meta=symbol_meta,
+        stick_vars=stick_vars,
+    )
+
+
 def _is_indirectly_accessed(td: TensorDep) -> bool:
     """Return whether td has a data-dependent indirect coordinate."""
     return any(coord.has(IndirectAccess) for coord in td.device_coords[:-1])
@@ -1080,53 +1171,38 @@ def work_division_context_for_op(
     rejects by value, and would silently disagree with the frame the allocator
     prices the same candidate on.
     """
-    it_space = iteration_space_from_op(op)
+    frame_it_space = None
     if tiling is not None and not tiling.is_untiled:
         from .wsr.tile_prediction import predict_frame
 
         frame = predict_frame(op, tiling)
         if frame is None:
             return None
-        it_space = frame.iter_space
-    input_tds, output_td = collect_tensor_deps(
-        op,
-        _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
-    )
-    if tiling is None or tiling.is_untiled:
-        # Unlike the stick adjustment below, nothing needs the unpadded extents.
-        it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
-    symbol_meta = _collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, input_tds + [output_td], symbol_meta
-    )
-    coord_vars = {
-        v
-        for e in output_td.device_coords[:-1]
-        for v in e.free_symbols
-        if isinstance(v, Symbol)
-    }
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+        frame_it_space = frame.iter_space
+    args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op)))
+    oi_space = make_op_iteration_space(op, args, frame_it_space)
+
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            output_td=oi_space.output_td,
+            input_tds=oi_space.input_tds,
+            stick_vars=oi_space.stick_vars,
+            reduction_vars=oi_space.reduction_vars,
             committed_splits={},
         )
     )
     return WorkDivisionContext(
         op=op,
         max_cores=max_cores,
-        it_space=it_space,
-        it_space_adjusted=it_space_adjusted,
-        stick_vars=stick_vars,
-        symbol_meta=symbol_meta,
-        tensor_deps=input_tds + [output_td],
-        reduction_vars=reduction_vars,
+        it_space=oi_space.it_space,
+        it_space_adjusted=oi_space.it_space_adjusted,
+        stick_vars=oi_space.stick_vars,
+        symbol_meta=oi_space.symbol_meta,
+        tensor_deps=oi_space.tensor_deps,
+        reduction_vars=oi_space.reduction_vars,
         constraints=constraint_result,
         span_min_splits=_span_min_splits(op),
     )
@@ -2028,64 +2104,46 @@ def span_reduction_pass(
     into the shared table, producing wrong results. If the memory span cannot be
     reduced within the hard domains, the pass raises `Unsupported`.
     """
-    it_space = iteration_space_from_op(op)
-    input_tds, output_td = collect_tensor_deps(op, args)
-    all_tds = input_tds + [output_td]
-    # Unlike the stick adjustment below, nothing needs the unpadded extents.
-    it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
-
-    # Symbolic-dim bucket metadata for the iteration vars in this op. Built
-    # before stick adjustment so the stick-dim guard inside
-    # adjust_it_space_for_sticks can raise on symbolic stick dims.
-    symbol_meta = _collect_symbol_metadata(it_space)
-
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
-    )
-    coord_vars = {
-        v
-        for e in output_td.device_coords[:-1]
-        for v in e.free_symbols
-        if isinstance(v, Symbol)
-    }
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    oi_space = make_op_iteration_space(op, args)
     constraints = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            output_td=oi_space.output_td,
+            input_tds=oi_space.input_tds,
+            stick_vars=oi_space.stick_vars,
+            reduction_vars=oi_space.reduction_vars,
             committed_splits={},
         )
     )
     min_splits = must_split_vars(
-        all_tds,
-        it_space,
-        it_space_adjusted,
-        stick_vars,
+        oi_space.tensor_deps,
+        oi_space.it_space,
+        oi_space.it_space_adjusted,
+        oi_space.stick_vars,
         max_cores,
-        symbol_meta,
+        oi_space.symbol_meta,
         constraints.allowed_splits,
         constraints.blocked,
     )
     collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            output_td=oi_space.output_td,
+            input_tds=oi_space.input_tds,
+            stick_vars=oi_space.stick_vars,
+            reduction_vars=oi_space.reduction_vars,
             committed_splits=min_splits,
         )
     )
 
     reduction_vars_to_split = {
-        v for v, split in min_splits.items() if split > 1 and v not in coord_vars
+        v
+        for v, split in min_splits.items()
+        if split > 1 and v not in oi_space.coord_vars
     }
     # Each entry in Reduction.reduction_ranges maps to at most one Symbol via
     # index_vars_squeeze (size-1 entries are squeezed away). So len > 1 means
@@ -2101,7 +2159,7 @@ def span_reduction_pass(
     op._work_division_span_min_splits = dict(min_splits)
     apply_splits(op, min_splits)
 
-    if symbol_meta and math.prod(min_splits.values()) > 1:
+    if oi_space.symbol_meta and math.prod(min_splits.values()) > 1:
         logger.info(
             f"[work_division/symbolic] span_reduction {op.get_name()}: "
             f"committed min_splits={ {str(k): v for k, v in min_splits.items()} }, "
@@ -2110,8 +2168,8 @@ def span_reduction_pass(
     if logger.isEnabledFor(logging.DEBUG) and math.prod(min_splits.values()) > 1:
         logger.debug(
             f"span_reduction work_division {op.get_name()}: cores={math.prod(min_splits.values())}, "
-            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"symbol_meta={symbol_meta}, priorities=[], min_splits={min_splits}"
+            f"iteration_space={oi_space.it_space}, it_space_adjusted={oi_space.it_space_adjusted}, "
+            f"symbol_meta={oi_space.symbol_meta}, priorities=[], min_splits={min_splits}"
         )
 
 
@@ -2176,17 +2234,7 @@ def work_distribution_pass(
     Reads symbol-keyed ownership written by span_reduction_pass (if any), then
     fills remaining cores by priority.
     """
-    it_space = iteration_space_from_op(op)
-    input_tds, output_td = collect_tensor_deps(op, args)
-    all_tds = input_tds + [output_td]
-    # Unlike the stick adjustment below, nothing needs the unpadded extents.
-    it_space = adjust_it_space_for_padding(it_space, input_tds, output_td)
-
-    symbol_meta = _collect_symbol_metadata(it_space)
-
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
-    )
+    oi_space = make_op_iteration_space(op, args)
 
     ownership = getattr(op, "iteration_space_ownership", None)
     committed_splits = (
@@ -2195,22 +2243,15 @@ def work_distribution_pass(
         else {}
     )
 
-    coord_vars = {
-        v
-        for e in output_td.device_coords[:-1]
-        for v in e.free_symbols
-        if isinstance(v, Symbol)
-    }
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            output_td=oi_space.output_td,
+            input_tds=oi_space.input_tds,
+            stick_vars=oi_space.stick_vars,
+            reduction_vars=oi_space.reduction_vars,
             committed_splits=committed_splits,
         )
     )
@@ -2231,13 +2272,15 @@ def work_distribution_pass(
                 shard_splits,
             )
     if shard_splits or not config.ignore_work_division_hints:
-        user_splits = shard_splits or _resolve_work_div_hint(op, it_space_adjusted)
+        user_splits = shard_splits or _resolve_work_div_hint(
+            op, oi_space.it_space_adjusted
+        )
         if user_splits is not None:
             user_splits = _apply_user_hint(
                 op,
                 user_splits,
-                it_space_adjusted,
-                output_td,
+                oi_space.it_space_adjusted,
+                oi_space.output_td,
                 max_cores,
                 blocked,
                 allowed_splits,
@@ -2248,28 +2291,33 @@ def work_distribution_pass(
                 logger.debug(
                     f"work_distribution(user-hint) work_division {op.get_name()}: "
                     f"cores={math.prod(user_splits.values())}, "
-                    f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+                    f"iteration_space={oi_space.it_space}, "
+                    f"it_space_adjusted={oi_space.it_space_adjusted}, "
                     f"min_splits={committed_splits}, user_splits={user_splits}"
                 )
             raise_if_per_core_overflow(
-                all_tds, it_space, user_splits, op.get_name(), symbol_meta
+                oi_space.tensor_deps,
+                oi_space.it_space,
+                user_splits,
+                op.get_name(),
+                oi_space.symbol_meta,
             )
             return
 
     splits, output_dims, reduction_dims = _default_split(
         op,
-        it_space_adjusted,
-        output_td,
+        oi_space.it_space_adjusted,
+        oi_space.output_td,
         committed_splits,
         max_cores,
-        symbol_meta,
+        oi_space.symbol_meta,
         blocked,
         allowed_splits,
     )
 
     apply_splits(op, splits)
 
-    if symbol_meta and math.prod(splits.values()) > 1:
+    if oi_space.symbol_meta and math.prod(splits.values()) > 1:
         logger.info(
             f"[work_division/symbolic] work_distribution {op.get_name()}: "
             f"final splits={ {str(k): v for k, v in splits.items()} }, "
@@ -2279,12 +2327,18 @@ def work_distribution_pass(
     if logger.isEnabledFor(logging.DEBUG) and math.prod(splits.values()) > 1:
         logger.debug(
             f"work_distribution work_division {op.get_name()}: cores={math.prod(splits.values())}, "
-            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"symbol_meta={symbol_meta}, "
+            f"iteration_space={oi_space.it_space}, it_space_adjusted={oi_space.it_space_adjusted}, "
+            f"symbol_meta={oi_space.symbol_meta}, "
             f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}"
         )
 
-    raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    raise_if_per_core_overflow(
+        oi_space.tensor_deps,
+        oi_space.it_space,
+        splits,
+        op.get_name(),
+        oi_space.symbol_meta,
+    )
 
 
 def _minmax(sympy_fn, builtin_fn, args, kwargs):
