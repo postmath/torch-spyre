@@ -98,7 +98,8 @@ from .op_spec import (
     is_lx_relayout_identity,
 )
 from .op_spec_validation import validate_op_specs
-from torch_spyre._inductor.provenance import build_debug_handle
+from .provenance import build_debug_handle
+from .work_division import pad_iteration_space
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -1052,6 +1053,17 @@ class SpyreKernel(Kernel[CSEVariable]):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 
         it_space = iteration_space(self.current_node)
+
+        output_args = [arg for arg in args if not arg.is_input]
+        # The enclosing_loops guard is unreachable today: _resize_device_layout
+        # refuses to tile a padded buffer, and it shrinks device_size to the
+        # per-tile extent, so a tiled op never sees device_size > extent.
+        if len(output_args) == 1 and not enclosing_loops(self.current_node.node):
+            it_space = pad_iteration_space(
+                it_space,
+                output_args[0].device_coordinates,
+                [(arg.device_coordinates, arg.device_size) for arg in args],
+            )
 
         ir_node = self.current_node.node  # ComputedBuffer
         it_space_extended = iteration_space_with_splits(
