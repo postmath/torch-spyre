@@ -1044,6 +1044,38 @@ class WorkDivisionContext:
         default_factory=dict, init=False, repr=False, compare=False
     )
 
+    @classmethod
+    def from_op_iteration_space(
+        cls,
+        op: ComputedBuffer,
+        oi_space: OpIterationSpace,
+        max_cores: int | None = None,
+    ) -> "WorkDivisionContext":
+        """The context for dividing ``op`` over ``oi_space``.
+
+        ``oi_space``'s extents are the ones divided, whether padded or a tiled
+        frame's. The op's constraints are collected against them with nothing
+        committed yet, and the span floors are those ``span_reduction_pass``
+        recorded on ``op``.
+        """
+        constraints = collect_work_division_constraints(
+            WorkDivConstraintContext.from_op_iteration_space(
+                op, oi_space, committed_splits={}
+            )
+        )
+        return cls(
+            op=op,
+            max_cores=max_cores,
+            it_space=oi_space.it_space,
+            it_space_adjusted=oi_space.it_space_adjusted,
+            stick_vars=oi_space.stick_vars,
+            symbol_meta=oi_space.symbol_meta,
+            tensor_deps=oi_space.tensor_deps,
+            reduction_vars=oi_space.reduction_vars,
+            constraints=constraints,
+            span_min_splits=_span_min_splits(op),
+        )
+
     @property
     def axes(self) -> list[Symbol]:
         """The divisible axes, in the order a candidate split is keyed by."""
@@ -1181,31 +1213,7 @@ def work_division_context_for_op(
         frame_it_space = frame.iter_space
     args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op)))
     oi_space = make_op_iteration_space(op, args, frame_it_space)
-
-    constraint_result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=oi_space.it_space,
-            it_space_adjusted=oi_space.it_space_adjusted,
-            output_td=oi_space.output_td,
-            input_tds=oi_space.input_tds,
-            stick_vars=oi_space.stick_vars,
-            reduction_vars=oi_space.reduction_vars,
-            committed_splits={},
-        )
-    )
-    return WorkDivisionContext(
-        op=op,
-        max_cores=max_cores,
-        it_space=oi_space.it_space,
-        it_space_adjusted=oi_space.it_space_adjusted,
-        stick_vars=oi_space.stick_vars,
-        symbol_meta=oi_space.symbol_meta,
-        tensor_deps=oi_space.tensor_deps,
-        reduction_vars=oi_space.reduction_vars,
-        constraints=constraint_result,
-        span_min_splits=_span_min_splits(op),
-    )
+    return WorkDivisionContext.from_op_iteration_space(op, oi_space, max_cores)
 
 
 def enumerate_work_division_candidates(
@@ -2106,15 +2114,8 @@ def span_reduction_pass(
     """
     oi_space = make_op_iteration_space(op, args)
     constraints = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=oi_space.it_space,
-            it_space_adjusted=oi_space.it_space_adjusted,
-            output_td=oi_space.output_td,
-            input_tds=oi_space.input_tds,
-            stick_vars=oi_space.stick_vars,
-            reduction_vars=oi_space.reduction_vars,
-            committed_splits={},
+        WorkDivConstraintContext.from_op_iteration_space(
+            op, oi_space, committed_splits={}
         )
     )
     min_splits = must_split_vars(
@@ -2128,15 +2129,8 @@ def span_reduction_pass(
         constraints.blocked,
     )
     collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=oi_space.it_space,
-            it_space_adjusted=oi_space.it_space_adjusted,
-            output_td=oi_space.output_td,
-            input_tds=oi_space.input_tds,
-            stick_vars=oi_space.stick_vars,
-            reduction_vars=oi_space.reduction_vars,
-            committed_splits=min_splits,
+        WorkDivConstraintContext.from_op_iteration_space(
+            op, oi_space, committed_splits=min_splits
         )
     )
 
@@ -2244,15 +2238,8 @@ def work_distribution_pass(
     )
 
     constraint_result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=oi_space.it_space,
-            it_space_adjusted=oi_space.it_space_adjusted,
-            output_td=oi_space.output_td,
-            input_tds=oi_space.input_tds,
-            stick_vars=oi_space.stick_vars,
-            reduction_vars=oi_space.reduction_vars,
-            committed_splits=committed_splits,
+        WorkDivConstraintContext.from_op_iteration_space(
+            op, oi_space, committed_splits=committed_splits
         )
     )
     blocked = constraint_result.blocked
